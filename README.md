@@ -2,26 +2,6 @@
 
 AI-powered navigation assistant for web applications. Acts as GPS for software by providing step-by-step visual guidance directly inside any webpage.
 
-## Status: MVP Complete ✅
-
-The first working end-to-end workflow is implemented and ready for testing.
-
-## What Works
-
-- ✅ Floating widget UI injected into any webpage
-- ✅ Goal input and workflow initiation
-- ✅ Screenshot capture of visible page
-- ✅ Gemini Vision API integration for page understanding
-- ✅ Intelligent DOM element matching (exact, fuzzy, synonym)
-- ✅ Visual highlight overlay with instructions
-- ✅ Automatic page change detection (MutationObserver)
-- ✅ Input/focus/change event detection for dynamic content
-- ✅ Multi-step workflow loop
-- ✅ State persistence across page transitions
-- ✅ Confidence scoring and user confirmation
-- ✅ Progress tracking and history
-- ✅ Error recovery with lenient parsing
-
 ## Quick Start
 
 ### 1. Install Extension
@@ -158,13 +138,6 @@ Check console for detailed logs:
 [PageObserver] Reanalysis triggered: ...
 [VisionService] result — step: ...
 ```
-
-## Limitations
-
-- Rate limiting from Gemini API (429 errors)
-- Large DOMs may be slow (10,000+ elements)
-- Shadow DOM elements not detected
-- Canvas-rendered text not matched
 
 ## License
 
