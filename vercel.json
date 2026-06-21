@@ -1,6 +1,5 @@
 {
   "buildCommand": "cd screenpilot-landing && npm install && npm run build",
-  "outputDirectory": "screenpilot-landing/.next",
-  "installCommand": "cd screenpilot-landing && npm install",
-  "framework": "nextjs"
+  "outputDirectory": "screenpilot-landing/out",
+  "installCommand": "echo 'installed in build step'"
 }
