@@ -1,0 +1,12 @@
+# deps
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# env files
+.env*
+
+# OS
+.DS_Store
