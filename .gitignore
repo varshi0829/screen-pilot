@@ -1,1 +1,7 @@
 .aider*
+node_modules/
+.next/
+out/
+.env*
+.DS_Store
+tsconfig.tsbuildinfo

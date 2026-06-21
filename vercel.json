@@ -1,5 +1,0 @@
-{
-  "buildCommand": "cd screenpilot-landing && npm install && npm run build",
-  "outputDirectory": "screenpilot-landing/out",
-  "installCommand": "echo 'installed in build step'"
-}
