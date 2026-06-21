@@ -14,18 +14,19 @@ The first working end-to-end workflow is implemented and ready for testing.
 - ✅ Gemini Vision API integration for page understanding
 - ✅ Intelligent DOM element matching (exact, fuzzy, synonym)
 - ✅ Visual highlight overlay with instructions
-- ✅ Automatic page change detection
+- ✅ Automatic page change detection (MutationObserver)
+- ✅ Input/focus/change event detection for dynamic content
 - ✅ Multi-step workflow loop
 - ✅ State persistence across page transitions
 - ✅ Confidence scoring and user confirmation
 - ✅ Progress tracking and history
+- ✅ Error recovery with lenient parsing
 
 ## Quick Start
 
 ### 1. Install Extension
 
-```bash
-# Load in Chrome
+```
 chrome://extensions/
 → Enable "Developer mode"
 → Click "Load unpacked"
@@ -40,13 +41,11 @@ chrome://extensions/
 
 ### 3. Test on Gmail
 
-```
 1. Open https://mail.google.com
 2. Click extension → "Open ScreenPilot"
-3. Enter goal: "Schedule an email"
-4. Click "Go →"
+3. Enter goal: "how do i compose a mail"
+4. Click "Go"
 5. Follow highlighted elements
-```
 
 ## Architecture
 
@@ -61,119 +60,112 @@ Screenshot Service → Gemini Vision API
     ↓
 State Manager (Workflow Tracking)
     ↓
-DOM Matcher (Element Locator)
+UniversalPlanner + DOM Matcher
     ↓
 Highlight Renderer (Visual Overlay)
     ↓
-Page Change Detection → Loop
+Page Change Detection → Re-analysis Loop
 ```
 
 ## Components
 
 ### Content Script (`content.js`)
-- Renders floating widget
-- Highlights target elements
-- Detects page changes (MutationObserver)
-- Manages UI state
+- Floating widget UI
+- UniversalPlanner for candidate ranking
+- DOM matching with fuzzy/synonym support
+- MutationObserver for page changes
+- Input/focus/change event detection
+- Highlighting engine with animations
 
 ### Background Service (`background.js`)
-- Orchestrates workflow
-- Manages screenshot capture
-- Calls Gemini API
-- Persists state across pages
+- Message handling (Manifest V3)
+- Vision cycle orchestration
+- Screenshot capture
+- Gemini API calls
+- State persistence
 
 ### DOM Matcher (`lib/dom-matcher.js`)
 - Finds elements from AI descriptions
 - Supports exact, fuzzy, synonym matching
 - Handles ARIA labels and accessibility
+- Levenshtein distance for fuzzy matching
 
 ### Services
-- `screenshot-service.js` - Captures visible tab
-- `vision-service.js` - Gemini Vision integration
+- `vision-service.js` - Gemini 2.5 Flash Vision API
+- `screenshot-service.js` - Visible tab capture
 - `state-manager.js` - Workflow state persistence
 
 ### Popup
 - API key configuration
 - Widget activation
 
-## Test Results
-
-Latest automated test run: **100% success rate**
-
-- Total workflows: 10
-- Total steps: 12
-- Successful: 12/12
-- Average confidence: 0.89
-- Match types: 92% exact, 8% synonym
-
 ## Files
 
 ```
 screen-pilot/
-├── manifest.json          # Extension configuration
-├── content.js             # Main content script (19KB)
-├── background.js          # Service worker
+├── manifest.json              # Extension manifest (MV3)
+├── content.js               # Main content script
+├── background.js           # Service worker
 ├── lib/
-│   └── dom-matcher.js     # Element matching engine
+│   └── dom-matcher.js      # Element matching engine
 ├── services/
+│   ├── vision-service.js   # Gemini Vision API
 │   ├── screenshot-service.js
-│   ├── vision-service.js
-│   └── state-manager.js
+│   └── state-manager.js   # State persistence
 ├── popup/
 │   ├── popup.html
 │   └── popup.js
 ├── styles/
-│   └── widget.css
-├── tests/
-│   ├── workflow-fixtures.js
-│   └── run-workflow-tests.js
-├── test-results/
-│   └── workflow-report.md
-└── docs/                  # 26 architecture documents
+│   └── widget.css         # Widget styling
+├── icons/
+│   ├── icon16.png
+│   ├── icon48.png
+│   └── icon128.png
+├── docs/                   # Design documentation
+└── README.md
 ```
 
-## Dependencies
+## Usage
 
-- `jsdom` ^24.1.0 (dev/testing only)
-- Chrome Extensions API (Manifest V3)
-- Gemini 2.0 Flash API
+### Starting a Workflow
 
-## Next Steps
+1. Open any webpage
+2. Click the ScreenPilot extension icon
+3. Enter your goal (e.g., "compose a mail", "search for...")
+4. Click "Go"
+5. Follow the highlighted instructions
 
-1. ✅ **Validate Gmail workflow** (current objective)
-2. Test on additional websites
-3. Measure success rates across patterns
-4. Refine prompts for accuracy
-5. Add error recovery
-6. Handle edge cases (modals, SPAs, dynamic content)
+### During a Workflow
 
-## Documentation
+- **Click** highlighted elements to advance
+- **Type** in highlighted input fields (auto-detected)
+- **Focus/blur** on fields triggers re-analysis
+- **Page changes** automatically detected
 
-See `/docs` for comprehensive architecture documentation:
-- Executive summary
-- Technical architecture
-- System components
-- Implementation plans
-- Risk analysis
+### Ending a Workflow
 
-## Testing
-
-```bash
-# Run automated tests
-npm run test:workflows
-
-# Manual testing
-See TESTING.md for step-by-step guide
-```
+- Click "Done" when task is complete
+- Click "Cancel" to abort
+- Workflow auto-completes when goal is reached
 
 ## Debug Mode
 
-Enable detailed logging:
-```javascript
-// In content.js and background.js
-const DEBUG = true;
+Check console for detailed logs:
+
 ```
+[UniversalPlanner] Goal: ...
+[UniversalPlanner] Target: ...
+[PageObserver] Reanalysis triggered: ...
+[VisionService] result — step: ...
+```
+
+## Limitations
+
+- Rate limiting from Gemini API (429 errors)
+- Large DOMs may be slow (10,000+ elements)
+- Shadow DOM elements not detected
+- Canvas-rendered text not matched
 
 ## License
 
-Internal project - Architecture validation phase
+MIT License
