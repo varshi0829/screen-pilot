@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ScreenPilot</title>
+  <style>
+    body {
+      width: 300px;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0 0 16px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status {
+      padding: 12px;
+      background: #f3f4f6;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .status.ready { background: #ecfdf5; color: #059669; }
+    .status.error { background: #fef2f2; color: #dc2626; }
+    button {
+      width: 100%;
+      padding: 10px;
+      background: #111827;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button:hover { background: #374151; }
+  </style>
+</head>
+<body>
+  <h1>📍 ScreenPilot</h1>
+  <div class="status ready" id="status">Ready - Open ScreenPilot on the current page</div>
+  <button id="openWidget">Open ScreenPilot</button>
+  <script src="popup.js"></script>
+</body>
+</html>
