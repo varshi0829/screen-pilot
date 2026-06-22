@@ -139,12 +139,133 @@
       color: #9ca3af;
       font-size: 12px;
     }
+
+    /* ── Validation panel ── */
+    .sp-score-card {
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .sp-score-ring {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      border: 4px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 700;
+      color: #9ca3af;
+      flex-shrink: 0;
+    }
+    .sp-score-ring.green  { border-color: #10b981; color: #059669; }
+    .sp-score-ring.amber  { border-color: #f59e0b; color: #d97706; }
+    .sp-score-ring.orange { border-color: #f97316; color: #ea580c; }
+    .sp-score-ring.red    { border-color: #ef4444; color: #dc2626; }
+    .sp-score-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: #111827;
+    }
+    .sp-score-sub {
+      font-size: 11px;
+      color: #6b7280;
+      margin-top: 2px;
+    }
+    .sp-val-section { margin-bottom: 12px; }
+    .sp-val-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .sp-val-select {
+      flex: 1;
+      font-size: 12px;
+      padding: 5px 8px;
+      border: 1px solid #d1d5db;
+      border-radius: 5px;
+      background: white;
+      color: #111827;
+    }
+    .sp-btn-small {
+      font-size: 12px;
+      padding: 5px 10px;
+      background: #111827;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .sp-btn-small:hover { background: #374151; }
+    .sp-btn-small.outline {
+      background: white;
+      color: #374151;
+      border: 1px solid #d1d5db;
+    }
+    .sp-btn-small.outline:hover { background: #f9fafb; }
+    .sp-btn-small.active {
+      background: #059669;
+    }
+    .sp-val-runs {
+      max-height: 150px;
+      overflow-y: auto;
+    }
+    .sp-val-run-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 0;
+      border-bottom: 1px solid #f3f4f6;
+      font-size: 11px;
+    }
+    .sp-val-run-row:last-child { border-bottom: none; }
+    .sp-val-run-goal {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #374151;
+    }
+    .sp-val-run-meta { color: #9ca3af; white-space: nowrap; }
+    .sp-breakdown {
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+    }
+    .sp-breakdown-row {
+      display: flex;
+      align-items: center;
+      font-size: 11px;
+      padding: 3px 0;
+      gap: 6px;
+    }
+    .sp-breakdown-name { flex: 1; color: #6b7280; }
+    .sp-breakdown-bar-wrap {
+      width: 60px;
+      height: 5px;
+      background: #e5e7eb;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .sp-breakdown-bar { height: 100%; background: #3b82f6; border-radius: 3px; }
+    .sp-breakdown-pts { width: 36px; text-align: right; color: #111827; font-weight: 600; }
   </style>
 </head>
 <body>
   <div class="sp-tabs">
     <button class="sp-tab active" data-tab="launch">Launch</button>
     <button class="sp-tab" data-tab="analytics">Analytics</button>
+    <button class="sp-tab" data-tab="validation">Validation</button>
   </div>
 
   <div class="sp-panel active" id="panel-launch">
@@ -197,6 +318,47 @@
     </div>
     <div class="sp-tasks-list" id="tasksList">
       <div class="sp-no-data">No tasks recorded yet</div>
+    </div>
+  </div>
+
+  <div class="sp-panel" id="panel-validation">
+    <!-- Readiness score -->
+    <div class="sp-score-card">
+      <div class="sp-score-ring" id="val-score-ring">—</div>
+      <div>
+        <div class="sp-score-label" id="val-score-label">No data yet</div>
+        <div class="sp-score-sub" id="val-score-sub">Run tasks to generate a report</div>
+      </div>
+    </div>
+
+    <!-- Score breakdown (hidden until report loaded) -->
+    <div class="sp-breakdown" id="val-breakdown" style="display:none"></div>
+
+    <!-- Benchmark runner -->
+    <div class="sp-val-section">
+      <div class="sp-section-header">
+        <span class="sp-section-title">Run Benchmark</span>
+      </div>
+      <div class="sp-val-row">
+        <select class="sp-val-select" id="val-benchmark-select"></select>
+        <button class="sp-btn-small" id="val-run-btn">Run</button>
+      </div>
+      <div id="val-hint" style="font-size:11px;color:#9ca3af;margin-bottom:6px"></div>
+    </div>
+
+    <!-- Toolbox row -->
+    <div class="sp-val-row" style="margin-bottom:12px">
+      <button class="sp-btn-small outline" id="val-overlay-btn">Debug Overlay: Off</button>
+      <button class="sp-btn-small outline" id="val-report-btn">Generate Report</button>
+      <button class="sp-btn-small outline" id="val-clear-btn">Clear</button>
+    </div>
+
+    <!-- Recent validation runs -->
+    <div class="sp-section-header">
+      <span class="sp-section-title">Recent Runs</span>
+    </div>
+    <div class="sp-val-runs" id="val-runs-list">
+      <div class="sp-no-data">No validation runs yet</div>
     </div>
   </div>
 

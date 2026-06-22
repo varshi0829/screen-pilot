@@ -137,7 +137,17 @@
     restoreTriggered: false,
     confidenceLevel: 'normal',
     enterpriseContext: null,   // populated before each Gemini call
+    geminiCallCount:  0,       // incremented each time a Gemini round-trip fires (not cache)
   };
+
+  // Debug event emitter — dispatches a CustomEvent that debug-overlay.js listens to.
+  // No-ops if the debug overlay is not loaded (window.__SP_DEBUG__ is falsy).
+  function _emitDebug(type, detail = {}) {
+    if (!window.__SP_DEBUG__) return;
+    try {
+      window.dispatchEvent(new CustomEvent('sp-debug', { detail: { type, ...detail } }));
+    } catch (_) {}
+  }
 
   // ─── HIGHLIGHTER ────────────────────────────────────────────────────────────
 
@@ -321,6 +331,8 @@
     // Primary match: high-confidence DOM hit
     if (match?.element && match.score >= PLAN_STEP_MIN_SCORE) {
       console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
+      _emitDebug('PLAN_STEP_PRIMARY', { stepIndex: nextIdx, score: match.score, description: step.description });
+      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
       return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
     }
 
@@ -329,7 +341,8 @@
       for (const alt of match.alternatives) {
         if (alt?.element && alt.score >= PLAN_RECOVERY_MIN_SCORE) {
           console.log(`[Plan] Step ${nextIdx} recovered via alternative: score=${alt.score}`);
-          chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
+          _emitDebug('PLAN_STEP_RECOVERY_1', { stepIndex: nextIdx, score: alt.score, description: step.description });
+          chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED', detail: { stepIndex: nextIdx, score: alt.score, description: step.description, recoveryTier: 'alternatives' } }).catch(() => {});
           return { element: alt.element, step, stepIndex: nextIdx, matchScore: alt.score };
         }
       }
@@ -339,13 +352,15 @@
     const recovered = findBySemanticSearch(step.description, step.expectedElement?.type);
     if (recovered) {
       console.log(`[Plan] Step ${nextIdx} recovered via semantic search: "${recovered.textContent?.trim().slice(0, 40)}"`);
-      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
+      _emitDebug('PLAN_STEP_RECOVERY_2', { stepIndex: nextIdx, score: PLAN_RECOVERY_MIN_SCORE, description: step.description });
+      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED', detail: { stepIndex: nextIdx, score: PLAN_RECOVERY_MIN_SCORE, description: step.description, recoveryTier: 'semantic' } }).catch(() => {});
       return { element: recovered, step, stepIndex: nextIdx, matchScore: PLAN_RECOVERY_MIN_SCORE };
     }
 
     // All recovery paths exhausted — Gemini fallback
     console.log(`[Plan] Step ${nextIdx} not found — score ${match?.score ?? 'n/a'}, falling back to Gemini`);
-    chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_FAILED' }).catch(() => {});
+    _emitDebug('PLAN_STEP_FAILED', { stepIndex: nextIdx, score: match?.score ?? null, description: step.description, recoveryTier: 'exhausted' });
+    chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_FAILED', detail: { stepIndex: nextIdx, score: match?.score ?? null, description: step.description, recoveryTier: 'exhausted' } }).catch(() => {});
     return null;
   }
 
@@ -1002,6 +1017,8 @@
 
     // Show staged progress — advance immediately, no artificial delays
     if (messageType === 'ANALYZE_GOAL') {
+      state.geminiCallCount = 0;
+      _emitDebug('TASK_START', { goal: state.goal });
       setGoButtonLoading(true);
       showStages();
       advanceStage('understanding');
@@ -1021,6 +1038,7 @@
         if (cached) {
           response = cached;
           PerfTracer.mark('cache_hit');
+          _emitDebug('CACHE_HIT', {});
           chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'CACHE_HIT' }).catch(() => {});
         }
       }
@@ -1030,6 +1048,16 @@
         if (typeof EnterpriseContextService !== 'undefined') {
           try { state.enterpriseContext = EnterpriseContextService.detect(); } catch (_) {}
         }
+        if (state.enterpriseContext?.application) {
+          _emitDebug('ENTERPRISE_CONTEXT', {
+            application: state.enterpriseContext.application,
+            module:      state.enterpriseContext.module,
+            confidence:  state.enterpriseContext.confidence,
+          });
+        }
+
+        state.geminiCallCount++;
+        _emitDebug('GEMINI_CALL', { callNumber: state.geminiCallCount, mode: messageType === 'ANALYZE_GOAL' ? 'navigate' : 'reanalyze' });
 
         const t0Gemini = performance.now();
         response = await chrome.runtime.sendMessage({
@@ -1040,8 +1068,16 @@
           reason,
           enterpriseContext: state.enterpriseContext || null,
         });
+        const geminiMs = Math.round(performance.now() - t0Gemini);
         PerfTracer.mark('gemini_roundtrip');
-        console.log(`[Perf] Gemini+screenshot: ${Math.round(performance.now() - t0Gemini)}ms`);
+        console.log(`[Perf] Gemini+screenshot: ${geminiMs}ms`);
+
+        _emitDebug('GEMINI_RESPONSE', {
+          latencyMs:  geminiMs,
+          success:    !!response?.success,
+          fromMemory: !!response?.fromMemory,
+          stepCount:  response?.state?.taskPlan?.steps?.length ?? 0,
+        });
 
         // Store successful response in cache for reuse if page state unchanged
         if (messageType === 'ANALYZE_GOAL' && response?.success) {
@@ -1050,6 +1086,9 @@
       }
 
       console.log('[UniversalPlanner] Target:', response?.targetElement?.text, '|', response?.instruction);
+
+      if (response?.fromMemory) _emitDebug('MEMORY_HIT', { confidence: response.confidence });
+      else if (response?.success && messageType === 'ANALYZE_GOAL') _emitDebug('MEMORY_MISS', {});
 
       if (requestToken !== state.activeRequestToken) return;
 
@@ -1389,6 +1428,7 @@
   // ─── COMPLETE WORKFLOW ──────────────────────────────────────────────────────
 
   function completeWorkflow(message) {
+    _emitDebug('TASK_END', { status: 'complete', message });
     if (state.currentTaskState) {
       const prev = state.currentTaskState;
       state.currentTaskState = {
@@ -1659,6 +1699,27 @@
     // Do NOT call sendResponse for other types — background responses must not be intercepted.
     if (message.type === 'OPEN_WIDGET')  { openWidget();  sendResponse({ success: true }); return false; }
     if (message.type === 'CLOSE_WIDGET') { closeWidget(); sendResponse({ success: true }); return false; }
+    if (message.type === 'RUN_GOAL') {
+      // Benchmark injection: open the widget and trigger analysis for the given goal.
+      const goalInput = document.querySelector('#screenpilot-widget .sp-goal-input');
+      if (!goalInput) {
+        // Widget not yet open — open it first, then let the user interact,
+        // or attempt to open + set goal after a brief delay.
+        openWidget();
+        setTimeout(() => {
+          const inp = document.querySelector('#screenpilot-widget .sp-goal-input');
+          if (inp && message.goal) {
+            inp.value = message.goal;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }, 200);
+      } else {
+        goalInput.value = message.goal || '';
+        goalInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      sendResponse({ success: true });
+      return false;
+    }
     // Unknown type — do not respond, let the message pass through to the background.
     return false;
   });

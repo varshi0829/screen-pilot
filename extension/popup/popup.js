@@ -7,7 +7,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const target = tab.dataset.tab;
       document.querySelectorAll('.sp-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === target));
       document.querySelectorAll('.sp-panel').forEach(p => p.classList.toggle('active', p.id === `panel-${target}`));
-      if (target === 'analytics') loadAnalytics();
+      if (target === 'analytics')  loadAnalytics();
+      if (target === 'validation') loadValidation();
     });
   });
 

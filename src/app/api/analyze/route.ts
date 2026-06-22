@@ -50,6 +50,8 @@ export async function POST(req: NextRequest) {
     console.error(`[analyze] ${reqId} GEMINI_API_KEY not set`);
     return json({ error: "Service not configured." }, 500);
   }
+  // Debug: log key fingerprint (first 8 + last 4 chars)
+  console.log(`[analyze] ${reqId} key_fingerprint=${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`);
 
   const sessionId = req.headers.get("x-session-id") ?? "anon";
   if (!allowRequest(sessionId, reqId)) {

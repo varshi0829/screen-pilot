@@ -2,8 +2,9 @@ import { ScreenshotService }  from './services/screenshot-service.js';
 import { StateManager }       from './services/state-manager.js';
 import { VisionService }      from './services/vision-service.js';
 import { TelemetryService }   from './services/telemetry-service.js';
-import { MemoryService }      from './services/memory-service.js';
-import { RateLimiterService } from './services/rate-limiter-service.js';
+import { MemoryService }       from './services/memory-service.js';
+import { RateLimiterService }  from './services/rate-limiter-service.js';
+import { ValidationService }   from './services/validation-service.js';
 
 const DEBUG = false;
 
@@ -36,9 +37,13 @@ async function handleMessage(message, sender) {
     case 'TELEMETRY_EVENT':        return handleTelemetryEvent(message);
     case 'GET_ANALYTICS':          return { success: true, analytics: await TelemetryService.getAnalytics() };
     case 'CLEAR_ANALYTICS':        await TelemetryService.clear(); return { success: true };
-    case 'GET_MEMORY_STATS':       return { success: true, stats: await MemoryService.getStats() };
-    case 'CLEAR_MEMORY':           await MemoryService.clear(); return { success: true };
-    case 'GET_RATE_USAGE':         return { success: true, usage: await RateLimiterService.getUsage() };
+    case 'GET_MEMORY_STATS':         return { success: true, stats: await MemoryService.getStats() };
+    case 'CLEAR_MEMORY':             await MemoryService.clear(); return { success: true };
+    case 'GET_RATE_USAGE':           return { success: true, usage: await RateLimiterService.getUsage() };
+    case 'GET_VALIDATION_REPORT':    return { success: true, report: await ValidationService.generateReport() };
+    case 'GET_BENCHMARKS':           return { success: true, benchmarks: ValidationService.getBenchmarks() };
+    case 'CLEAR_VALIDATION':         await ValidationService.clear(); return { success: true };
+    case 'RUN_BENCHMARK':            return runBenchmark(message, sender);
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
@@ -50,6 +55,7 @@ async function analyzeGoal(message, sender) {
   await StateManager.createTask(message.goal);
   const taskId = StateManager.getState().taskId;
   TelemetryService.startTask(taskId, message.goal);
+  ValidationService.startRun(taskId, message.goal, { url: message.url || '' });
 
   // Record enterprise context detection (sent by content.js)
   const ec = message.enterpriseContext || null;
@@ -58,6 +64,7 @@ async function analyzeGoal(message, sender) {
       application: ec.application,
       detected:    !!ec.application && ec.confidence >= 0.5,
     });
+    ValidationService.recordEvent('ENTERPRISE_CONTEXT', { application: ec.application, module: ec.module, confidence: ec.confidence });
   }
 
   // Phase 3: Predictive Navigation — check memory before calling Gemini
@@ -65,9 +72,11 @@ async function analyzeGoal(message, sender) {
   if (memHit && memHit.confidence >= 0.85) {
     log(`[Memory] Hit — confidence=${memHit.confidence.toFixed(2)} type=${memHit.matchType}`);
     TelemetryService.recordMemoryHit(taskId);
+    ValidationService.recordEvent('MEMORY_HIT', { confidence: memHit.confidence, matchType: memHit.matchType });
     activeAnalysis = null;
     return _buildMemoryResponse(memHit.workflow, memHit.confidence, message, sender);
   }
+  ValidationService.recordEvent('MEMORY_MISS', {});
 
   activeAnalysis = null;
   return queueVisionCycle({
@@ -142,6 +151,7 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   // Record the request in the persistent rate limiter
   await RateLimiterService.recordRequest();
 
+  ValidationService.recordEvent('GEMINI_CALL', { mode: 'navigate' });
   const tAnalyze  = Date.now();
   const analysis  = await VisionService.analyzeScreenshot({
     screenshot,
@@ -154,15 +164,18 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   log(`analysis: ${latencyMs}ms | success: ${analysis.success}`);
 
   if (taskId) TelemetryService.recordGeminiCall(taskId, { latencyMs, success: analysis.success });
+  ValidationService.recordEvent('GEMINI_RESPONSE', { latencyMs, success: analysis.success });
 
   if (!analysis.success) {
     await StateManager.fail(analysis.error);
     if (taskId) TelemetryService.completeTask(taskId, 'failed', analysis.error);
+    ValidationService.endRun('failed', analysis.error).catch(() => {});
     return { success: false, error: analysis.error, retryable: analysis.retryable, state: StateManager.getState() };
   }
 
   if (taskId && analysis.taskPlan?.steps?.length) {
     TelemetryService.recordPlanGenerated(taskId, analysis.taskPlan.steps.length);
+    ValidationService.recordEvent('PLAN_GENERATED', { stepCount: analysis.taskPlan.steps.length });
   }
 
   if (analysis.complete) {
@@ -273,6 +286,7 @@ async function completeTask(message) {
 
   await StateManager.complete(message.message || 'Task complete');
   if (taskState?.taskId) TelemetryService.completeTask(taskState.taskId, 'completed', 'user-marked-complete');
+  ValidationService.endRun('completed').catch(() => {});
   return { success: true, state: StateManager.getState() };
 }
 
@@ -280,6 +294,7 @@ async function abortTask(message) {
   const taskState = StateManager.getState();
   await StateManager.abort(message.reason || 'User cancelled');
   if (taskState?.taskId) TelemetryService.completeTask(taskState.taskId, 'aborted', message.reason || 'user-cancelled');
+  ValidationService.endRun('aborted', message.reason || 'user-cancelled').catch(() => {});
   activeAnalysis = null;
   return { success: true, state: StateManager.getState() };
 }
@@ -357,22 +372,56 @@ function tryLocalAnswer(question, ctx) {
 
 function handleTelemetryEvent(message) {
   const taskId = StateManager.getState()?.taskId;
+  const detail = message.detail || {};
   switch (message.event) {
     case 'CACHE_HIT':
       TelemetryService.recordCacheHit().catch(() => {});
+      ValidationService.recordEvent('CACHE_HIT', {});
       break;
     case 'PLAN_STEP_FAILED':
       if (taskId) TelemetryService.recordPlanStep(taskId, false);
+      ValidationService.recordEvent('PLAN_STEP_FAILED', detail);
       break;
-    case 'PLAN_STEP_RECOVERED':
+    case 'PLAN_STEP_RECOVERED': {
       if (taskId) TelemetryService.recordPlanStep(taskId, true);
       if (taskId) TelemetryService.recordRecovery(taskId, true);
+      const tier = detail.recoveryTier === 'alternatives' ? 'PLAN_STEP_RECOVERY_1'
+        : detail.recoveryTier === 'semantic'              ? 'PLAN_STEP_RECOVERY_2'
+        : 'PLAN_STEP_PRIMARY';
+      ValidationService.recordEvent(tier, detail);
       break;
+    }
     case 'RECOVERY_ATTEMPTED':
       if (taskId) TelemetryService.recordRecovery(taskId, false);
       break;
   }
   return { success: true };
+}
+
+// ─── BENCHMARK ───────────────────────────────────────────────────────────────
+
+async function runBenchmark(message, sender) {
+  const benchmarks = ValidationService.getBenchmarks();
+  const benchmark  = benchmarks.find(b => b.id === message.benchmarkId);
+  if (!benchmark) return { success: false, error: `Unknown benchmark: ${message.benchmarkId}` };
+
+  const tabId = message.tabId || sender.tab?.id;
+  if (!tabId) return { success: false, error: 'No target tab specified.' };
+
+  // Inject content script if not already present, then trigger goal
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'RUN_GOAL', goal: benchmark.goal });
+  } catch {
+    // Content script not injected — inject it first
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['services/enterprise-context-service.js'] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['lib/dom-matcher.js'] });
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    await chrome.scripting.insertCSS({ target: { tabId }, files: ['styles/widget.css'] });
+    await new Promise(r => setTimeout(r, 200));
+    await chrome.tabs.sendMessage(tabId, { type: 'RUN_GOAL', goal: benchmark.goal });
+  }
+
+  return { success: true, benchmark };
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
