@@ -15,6 +15,8 @@
   // Minimum DOM match score to trust a plan step without a Gemini call.
   // Higher than MATCH_HARD_FLOOR — we're skipping Gemini so we need more confidence.
   const PLAN_STEP_MIN_SCORE = 70;
+  // Secondary threshold: use DOMMatcher alternatives before falling back to Gemini.
+  const PLAN_RECOVERY_MIN_SCORE = 50;
 
   // Stage definitions for progressive loading UI
   const STAGES = ['understanding', 'capturing', 'analyzing', 'matching'];
@@ -314,14 +316,62 @@
     if (step.status === 'done') return null;
 
     const match = DOMMatcher.matchElement(step.expectedElement);
-    if (!match?.element || match.score < PLAN_STEP_MIN_SCORE) {
-      console.log(`[Plan] Step ${nextIdx} not found — score ${match?.score ?? 'n/a'} < ${PLAN_STEP_MIN_SCORE}, falling back to Gemini`);
-      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_FAILED' }).catch(() => {});
-      return null;
+
+    // Primary match: high-confidence DOM hit
+    if (match?.element && match.score >= PLAN_STEP_MIN_SCORE) {
+      console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
+      return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
     }
 
-    console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
-    return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
+    // Recovery tier 1: try ranked alternatives from the same matchElement call
+    if (Array.isArray(match?.alternatives)) {
+      for (const alt of match.alternatives) {
+        if (alt?.element && alt.score >= PLAN_RECOVERY_MIN_SCORE) {
+          console.log(`[Plan] Step ${nextIdx} recovered via alternative: score=${alt.score}`);
+          chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
+          return { element: alt.element, step, stepIndex: nextIdx, matchScore: alt.score };
+        }
+      }
+    }
+
+    // Recovery tier 2: semantic token search on visible interactive elements
+    const recovered = findBySemanticSearch(step.description, step.expectedElement?.type);
+    if (recovered) {
+      console.log(`[Plan] Step ${nextIdx} recovered via semantic search: "${recovered.textContent?.trim().slice(0, 40)}"`);
+      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
+      return { element: recovered, step, stepIndex: nextIdx, matchScore: PLAN_RECOVERY_MIN_SCORE };
+    }
+
+    // All recovery paths exhausted — Gemini fallback
+    console.log(`[Plan] Step ${nextIdx} not found — score ${match?.score ?? 'n/a'}, falling back to Gemini`);
+    chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_FAILED' }).catch(() => {});
+    return null;
+  }
+
+  // Lightweight semantic token search — splits the step description into tokens and looks
+  // for a visible interactive element whose accessible text contains all significant tokens.
+  function findBySemanticSearch(description, elementType) {
+    if (!description) return null;
+    const INTERACTIVE = 'button,a,input,select,textarea,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="option"]';
+    const stopWords   = new Set(['the','a','an','to','in','on','at','of','and','or','for','with','click','press','open','select','choose','go']);
+
+    const tokens = description.toLowerCase().replace(/['"]/g, '').split(/\s+/).filter(t => t.length > 1 && !stopWords.has(t));
+    if (!tokens.length) return null;
+
+    const candidates = Array.from(document.querySelectorAll(INTERACTIVE)).filter(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) return false;
+      if (window.getComputedStyle(el).display === 'none') return false;
+      return true;
+    });
+
+    let best = null, bestScore = 0;
+    for (const el of candidates) {
+      const text  = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || '').toLowerCase();
+      const score = tokens.filter(t => text.includes(t)).length / tokens.length;
+      if (score > bestScore && score >= 0.5) { best = el; bestScore = score; }
+    }
+    return best;
   }
 
   async function executePlanStep({ element, step, stepIndex, matchScore }) {
@@ -647,6 +697,25 @@
 
         <div class="sp-footer-actions">
           <button class="sp-btn-cancel">Cancel</button>
+          <button class="sp-btn-secondary sp-btn-explain" title="Explain this screen">Explain</button>
+          <button class="sp-btn-secondary sp-btn-ask" title="Ask a question about this screen">Ask</button>
+        </div>
+
+        <div class="sp-explain-panel" hidden>
+          <div class="sp-explain-header">
+            <span class="sp-explain-title">Screen Explanation</span>
+            <button class="sp-explain-close" title="Close">✕</button>
+          </div>
+          <div class="sp-explain-body sp-explain-content"></div>
+        </div>
+
+        <div class="sp-qa-bar" hidden>
+          <input class="sp-qa-input" type="text" placeholder="Ask about this screen…" maxlength="200" />
+          <button class="sp-qa-submit" title="Ask">→</button>
+        </div>
+        <div class="sp-qa-answer" hidden>
+          <div class="sp-qa-answer-label">Answer</div>
+          <div class="sp-qa-answer-text"></div>
         </div>
 
         <div class="sp-complete-overlay" hidden>
@@ -718,6 +787,56 @@
         goButton.click();
       }
     });
+
+    // Explain My Screen
+    widget.querySelector('.sp-btn-explain').addEventListener('click', () => {
+      const panel  = widget.querySelector('.sp-explain-panel');
+      const qaBar  = widget.querySelector('.sp-qa-bar');
+      const qaAns  = widget.querySelector('.sp-qa-answer');
+      const isOpen = !panel.hidden;
+      if (isOpen) {
+        panel.setAttribute('hidden', '');
+        widget.querySelector('.sp-btn-explain').classList.remove('sp-active');
+      } else {
+        qaBar.setAttribute('hidden', '');
+        qaAns.setAttribute('hidden', '');
+        widget.querySelector('.sp-btn-ask').classList.remove('sp-active');
+        panel.removeAttribute('hidden');
+        widget.querySelector('.sp-btn-explain').classList.add('sp-active');
+        explainScreen(widget);
+      }
+    });
+
+    widget.querySelector('.sp-explain-close').addEventListener('click', () => {
+      widget.querySelector('.sp-explain-panel').setAttribute('hidden', '');
+      widget.querySelector('.sp-btn-explain').classList.remove('sp-active');
+    });
+
+    // Screen Q&A
+    widget.querySelector('.sp-btn-ask').addEventListener('click', () => {
+      const qaBar  = widget.querySelector('.sp-qa-bar');
+      const panel  = widget.querySelector('.sp-explain-panel');
+      const isOpen = !qaBar.hidden;
+      if (isOpen) {
+        qaBar.setAttribute('hidden', '');
+        widget.querySelector('.sp-btn-ask').classList.remove('sp-active');
+      } else {
+        panel.setAttribute('hidden', '');
+        widget.querySelector('.sp-btn-explain').classList.remove('sp-active');
+        widget.querySelector('.sp-qa-answer').setAttribute('hidden', '');
+        qaBar.removeAttribute('hidden');
+        widget.querySelector('.sp-btn-ask').classList.add('sp-active');
+        widget.querySelector('.sp-qa-input').focus();
+      }
+    });
+
+    const qaInput  = widget.querySelector('.sp-qa-input');
+    const qaSubmit = widget.querySelector('.sp-qa-submit');
+
+    qaSubmit.addEventListener('click', () => handleQuestion(widget));
+    qaInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); handleQuestion(widget); }
+    });
   }
 
   // ─── STAGE UI ───────────────────────────────────────────────────────────────
@@ -784,6 +903,89 @@
       label.textContent = 'Go';
       if (arrow) arrow.style.display = '';
     }
+  }
+
+  // ─── EXPLAIN MY SCREEN ──────────────────────────────────────────────────────
+
+  async function explainScreen(widget) {
+    const body = widget.querySelector('.sp-explain-content');
+    body.innerHTML = '<div class="sp-explain-row"><span class="sp-explain-row-value" style="color:var(--sp-text-3)">Analyzing screen…</span></div>';
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type:  'GET_SCREEN_EXPLANATION',
+        url:   window.location.href,
+        title: document.title,
+      });
+      if (!response?.success) {
+        body.innerHTML = `<div class="sp-explain-row"><span class="sp-explain-row-value" style="color:var(--sp-red)">${escHtml(response?.error || 'Could not analyze screen.')}</span></div>`;
+        return;
+      }
+      body.innerHTML = formatScreenContext(response.screenContext);
+    } catch (err) {
+      body.innerHTML = `<div class="sp-explain-row"><span class="sp-explain-row-value" style="color:var(--sp-red)">Failed: ${escHtml(err?.message || 'Unknown error')}</span></div>`;
+    }
+  }
+
+  function formatScreenContext(ctx) {
+    if (!ctx) return '<div class="sp-explain-row"><span class="sp-explain-row-value">No screen data available.</span></div>';
+    const rows = [];
+    if (ctx.application) rows.push(row('Application', ctx.application));
+    if (ctx.pageType)    rows.push(row('Page Type',    ctx.pageType));
+    if (ctx.screenSummary) rows.push(row('Summary',     ctx.screenSummary));
+    if (ctx.visibleActions?.length)
+      rows.push(row('Available Actions', ctx.visibleActions.join(', ')));
+    if (ctx.importantElements?.length) {
+      const items = ctx.importantElements.map(e => `<strong>${escHtml(e.label)}</strong>: ${escHtml(e.description)}`).join('<br>');
+      rows.push(row('Key Elements', items, true));
+    }
+    return rows.join('') || '<div class="sp-explain-row"><span class="sp-explain-row-value">Screen analyzed — no structured data returned.</span></div>';
+  }
+
+  function row(label, value, raw = false) {
+    return `<div class="sp-explain-row">
+      <span class="sp-explain-row-label">${escHtml(label)}</span>
+      <span class="sp-explain-row-value">${raw ? value : escHtml(value)}</span>
+    </div>`;
+  }
+
+  // ─── SCREEN Q&A ─────────────────────────────────────────────────────────────
+
+  async function handleQuestion(widget) {
+    const input    = widget.querySelector('.sp-qa-input');
+    const submit   = widget.querySelector('.sp-qa-submit');
+    const ansPanel = widget.querySelector('.sp-qa-answer');
+    const ansText  = widget.querySelector('.sp-qa-answer-text');
+    const question = input.value.trim();
+    if (!question) return;
+
+    submit.disabled = true;
+    ansPanel.removeAttribute('hidden');
+    ansText.textContent = 'Thinking…';
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type:     'ASK_QUESTION',
+        question,
+        url:      window.location.href,
+        title:    document.title,
+      });
+      if (!response?.success) {
+        ansText.textContent = response?.error || 'Could not answer that question.';
+        return;
+      }
+      ansText.textContent = response.answer;
+    } catch (err) {
+      ansText.textContent = 'Failed: ' + (err?.message || 'Unknown error');
+    } finally {
+      submit.disabled = false;
+    }
+  }
+
+  function escHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   // ─── CORE REQUEST FLOW ──────────────────────────────────────────────────────
@@ -1279,7 +1481,14 @@
     chrome.runtime.sendMessage({ type: 'ABORT_TASK', reason: 'User cancelled' }).catch(() => {});
 
     const widget = document.getElementById('screenpilot-widget');
-    if (widget) widget.querySelector('.sp-goal-input').value = '';
+    if (widget) {
+      widget.querySelector('.sp-goal-input').value = '';
+      widget.querySelector('.sp-explain-panel')?.setAttribute('hidden', '');
+      widget.querySelector('.sp-qa-bar')?.setAttribute('hidden', '');
+      widget.querySelector('.sp-qa-answer')?.setAttribute('hidden', '');
+      widget.querySelector('.sp-btn-explain')?.classList.remove('sp-active');
+      widget.querySelector('.sp-btn-ask')?.classList.remove('sp-active');
+    }
 
     renderProgressPanel();
   }

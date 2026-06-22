@@ -6,9 +6,11 @@ import { ScreenContextService } from './screen-context.js';
 export const VisionService = (() => {
   'use strict';
 
-  const BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
+  const BACKEND_URL       = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
-  const MAX_ATTEMPTS = 2;
+  const MAX_ATTEMPTS       = 2;
+
+  // ─── PUBLIC ────────────────────────────────────────────────────────────────
 
   async function analyzeScreenshot({ screenshot, goal, pageContext = {}, taskState = null }) {
     if (!goal?.trim()) {
@@ -17,12 +19,32 @@ export const VisionService = (() => {
     if (!screenshot?.success) {
       return buildError(screenshot?.error || 'No screenshot available for analysis.');
     }
+    return _callWithRetry({ screenshot, goal, pageContext, taskState, mode: 'navigate' }, parseVisionResponse);
+  }
 
+  // Returns { success, screenContext } — uses existing ScreenContext if caller passes one.
+  async function explainScreen({ screenshot, pageContext = {} }) {
+    if (!screenshot?.success) {
+      return buildError(screenshot?.error || 'No screenshot available.');
+    }
+    return _callWithRetry({ screenshot, goal: 'Explain what is visible on this screen', pageContext, taskState: null, mode: 'explain' }, parseExplainResponse);
+  }
+
+  // Returns { success, answer, confidence, elementHint }
+  async function askQuestion({ screenshot, question, pageContext = {} }) {
+    if (!question?.trim()) return buildError('Question is required.', false);
+    if (!screenshot?.success) return buildError(screenshot?.error || 'No screenshot available.');
+    return _callWithRetry({ screenshot, goal: question, pageContext, taskState: null, mode: 'ask' }, parseQAResponse);
+  }
+
+  // ─── PRIVATE ───────────────────────────────────────────────────────────────
+
+  async function _callWithRetry(params, parser) {
     let lastError = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const raw = await callBackend({ screenshot, goal, pageContext, taskState });
-        const parsed = parseVisionResponse(raw);
+        const raw    = await callBackend(params);
+        const parsed = parser(raw);
         if (parsed.success) parsed.attempts = attempt;
         return parsed;
       } catch (err) {
@@ -34,7 +56,7 @@ export const VisionService = (() => {
     return buildError(normalizeError(lastError), isRetryable(lastError));
   }
 
-  async function callBackend({ screenshot, goal, pageContext, taskState }) {
+  async function callBackend({ screenshot, goal, pageContext, taskState, mode = 'navigate' }) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -43,21 +65,22 @@ export const VisionService = (() => {
       const res = await fetch(BACKEND_URL, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'X-Session-ID': sessionId,
+          'Content-Type':  'application/json',
+          'X-Session-ID':  sessionId,
         },
         body: JSON.stringify({
           screenshot: { image: screenshot.image, mimeType: screenshot.mimeType },
           goal,
           pageContext,
           taskState,
+          mode,
         }),
         signal: controller.signal,
       });
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({ error: `Server error ${res.status}` }));
-        const err = new Error(body.error || `HTTP ${res.status}`);
+        const err  = new Error(body.error || `HTTP ${res.status}`);
         err.status = res.status;
         throw err;
       }
@@ -76,12 +99,11 @@ export const VisionService = (() => {
     return id;
   }
 
+  // ─── RESPONSE PARSERS ──────────────────────────────────────────────────────
+
   function parseVisionResponse(data) {
     try {
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      const textPart = parts.find((p) => p.text && !p.thought);
-      const rawText = textPart?.text || '';
-      const parsed = JSON.parse(extractJson(rawText));
+      const parsed = _extractParsedJSON(data);
       const normalized = normalizeResult(parsed);
 
       if (!normalized.screenSummary && !normalized.currentStep && !normalized.instruction) {
@@ -97,12 +119,43 @@ export const VisionService = (() => {
       }
 
       const screenContext = ScreenContextService.buildScreenContext(parsed);
-      const taskPlan = buildTaskPlan(parsed);
+      const taskPlan      = buildTaskPlan(parsed);
 
       return { success: true, ...normalized, screenContext, taskPlan, raw: parsed };
     } catch (err) {
       return buildError(`Could not parse response: ${err.message}`);
     }
+  }
+
+  function parseExplainResponse(data) {
+    try {
+      const parsed      = _extractParsedJSON(data);
+      const screenContext = ScreenContextService.buildScreenContext(parsed);
+      return { success: true, screenContext };
+    } catch (err) {
+      return buildError(`Could not parse explanation: ${err.message}`);
+    }
+  }
+
+  function parseQAResponse(data) {
+    try {
+      const parsed = _extractParsedJSON(data);
+      return {
+        success:     true,
+        answer:      typeof parsed.answer === 'string' ? parsed.answer.trim() : 'I could not answer that question.',
+        confidence:  Number.isFinite(parsed.confidence) ? Math.max(0, Math.min(1, parsed.confidence)) : 0,
+        elementHint: typeof parsed.elementHint === 'string' ? parsed.elementHint.trim() : '',
+      };
+    } catch (err) {
+      return buildError(`Could not parse answer: ${err.message}`);
+    }
+  }
+
+  function _extractParsedJSON(data) {
+    const parts   = data.candidates?.[0]?.content?.parts || [];
+    const textPart = parts.find(p => p.text && !p.thought);
+    const rawText  = textPart?.text || '';
+    return JSON.parse(extractJson(rawText));
   }
 
   function extractJson(rawText) {
@@ -112,6 +165,8 @@ export const VisionService = (() => {
     if (!match) throw new Error('No JSON found in response.');
     return match[0];
   }
+
+  // ─── NORMALIZERS ───────────────────────────────────────────────────────────
 
   function normalizeResult(result) {
     const targetElement = {
@@ -123,8 +178,8 @@ export const VisionService = (() => {
       : 0;
     const candidates = Array.isArray(result?.candidates)
       ? result.candidates
-          .filter((c) => typeof c?.text === 'string' && c.text.trim())
-          .map((c) => ({
+          .filter(c => typeof c?.text === 'string' && c.text.trim())
+          .map(c => ({
             text:        c.text.trim(),
             actionType:  normalizeActionType(c.actionType),
             elementType: normalizeElementType(c.elementType),
@@ -137,10 +192,10 @@ export const VisionService = (() => {
     return {
       screenSummary: typeof result?.screenSummary === 'string' ? result.screenSummary.trim() : '',
       currentRegion: normalizeRegion(result?.currentRegion),
-      currentStep:   typeof result?.currentStep === 'string' ? result.currentStep.trim() : '',
+      currentStep:   typeof result?.currentStep === 'string'   ? result.currentStep.trim() : '',
       targetElement,
       candidates,
-      instruction:   typeof result?.instruction === 'string' ? result.instruction.trim() : '',
+      instruction:   typeof result?.instruction === 'string'   ? result.instruction.trim() : '',
       confidence,
       complete: result?.currentStep === 'Task complete' || result?.instruction === 'Task complete',
     };
@@ -165,16 +220,10 @@ export const VisionService = (() => {
         },
         status: 'pending',
       }))
-      .filter(s => s.expectedElement.text);  // drop steps with no matchable element
+      .filter(s => s.expectedElement.text);
 
     if (!steps.length) return null;
-
-    return {
-      steps,
-      currentStepIndex: 0,
-      planVersion:      1,
-      createdAt:        Date.now(),
-    };
+    return { steps, currentStepIndex: 0, planVersion: 1, createdAt: Date.now() };
   }
 
   function normalizeElementType(t) {
@@ -196,8 +245,8 @@ export const VisionService = (() => {
   function normalizeError(err) {
     if (!err) return 'Unknown error.';
     if (err.name === 'AbortError') return 'Request timed out. Please try again.';
-    if (err.status === 429) return 'Too many requests — please wait a moment and try again.';
-    if (err.status >= 500) return 'ScreenPilot service is temporarily unavailable.';
+    if (err.status === 429)        return 'Too many requests — please wait a moment and try again.';
+    if (err.status >= 500)         return 'ScreenPilot service is temporarily unavailable.';
     return `Analysis failed: ${err.message}`;
   }
 
@@ -210,7 +259,7 @@ export const VisionService = (() => {
     return { success: false, error, retryable };
   }
 
-  return { analyzeScreenshot };
+  return { analyzeScreenshot, explainScreen, askQuestion };
 })();
 
 if (typeof module !== 'undefined' && module.exports) {

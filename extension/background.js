@@ -1,11 +1,11 @@
 import { ScreenshotService } from './services/screenshot-service.js';
-import { StateManager } from './services/state-manager.js';
-import { VisionService } from './services/vision-service.js';
+import { StateManager }     from './services/state-manager.js';
+import { VisionService }    from './services/vision-service.js';
 import { TelemetryService } from './services/telemetry-service.js';
 
 const DEBUG = false;
 
-let initPromise = null;
+let initPromise    = null;
 let activeAnalysis = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -20,35 +20,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleMessage(message, sender) {
   await ensureInitialized();
-
-  if (!StateManager.getState()) {
-    await StateManager.restore();
-  }
+  if (!StateManager.getState()) await StateManager.restore();
 
   switch (message.type) {
-    case 'ANALYZE_GOAL':
-      return analyzeGoal(message, sender);
-    case 'REANALYZE':
-      return reanalyzeGoal(message, sender);
-    case 'ADVANCE_PLAN_STEP':
-      return advancePlanStep(message);
-    case 'GET_STATE':
-      return { success: true, state: StateManager.getState() };
-    case 'COMPLETE_TASK':
-      return completeTask(message);
-    case 'ABORT_TASK':
-      return abortTask(message);
-    case 'TELEMETRY_EVENT':
-      return handleTelemetryEvent(message);
-    case 'GET_ANALYTICS':
-      return { success: true, analytics: await TelemetryService.getAnalytics() };
-    case 'CLEAR_ANALYTICS':
-      await TelemetryService.clear();
-      return { success: true };
+    case 'ANALYZE_GOAL':          return analyzeGoal(message, sender);
+    case 'REANALYZE':             return reanalyzeGoal(message, sender);
+    case 'ADVANCE_PLAN_STEP':     return advancePlanStep(message);
+    case 'GET_STATE':             return { success: true, state: StateManager.getState() };
+    case 'COMPLETE_TASK':         return completeTask(message);
+    case 'ABORT_TASK':            return abortTask(message);
+    case 'GET_SCREEN_EXPLANATION':return getScreenExplanation(message, sender);
+    case 'ASK_QUESTION':          return askQuestion(message, sender);
+    case 'TELEMETRY_EVENT':       return handleTelemetryEvent(message);
+    case 'GET_ANALYTICS':         return { success: true, analytics: await TelemetryService.getAnalytics() };
+    case 'CLEAR_ANALYTICS':       await TelemetryService.clear(); return { success: true };
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
 }
+
+// ─── NAVIGATION ─────────────────────────────────────────────────────────────
 
 async function analyzeGoal(message, sender) {
   await StateManager.createTask(message.goal);
@@ -57,10 +48,10 @@ async function analyzeGoal(message, sender) {
   activeAnalysis = null;
   return queueVisionCycle({
     sender,
-    goal: message.goal,
+    goal:        message.goal,
     pageContext: buildPageContext(message),
-    reason: 'initial-analysis',
-    forceNew: true,
+    reason:      'initial-analysis',
+    forceNew:    true,
   });
 }
 
@@ -69,17 +60,14 @@ async function reanalyzeGoal(message, sender) {
   if (!taskState?.goal || taskState.status !== 'ACTIVE') {
     return { success: false, error: 'No active ScreenPilot task to continue.' };
   }
-  // Detect plan fallbacks: plan step failed in DOM and fell through to Gemini
   const isPlanFallback = typeof message.reason === 'string' && message.reason.startsWith('plan-');
-  if (isPlanFallback && taskState.taskId) {
-    TelemetryService.recordFallback(taskState.taskId);
-  }
+  if (isPlanFallback && taskState.taskId) TelemetryService.recordFallback(taskState.taskId);
   return queueVisionCycle({
     sender,
-    goal: taskState.goal,
-    pageContext: buildPageContext(message, taskState.currentPage),
-    reason: message.reason || 'reanalyze',
-    forceNew: false,
+    goal:        taskState.goal,
+    pageContext:  buildPageContext(message, taskState.currentPage),
+    reason:       message.reason || 'reanalyze',
+    forceNew:     false,
   });
 }
 
@@ -94,7 +82,6 @@ function queueVisionCycle({ sender, goal, pageContext, reason, forceNew }) {
   const promise = runVisionCycle({ goal, sender, pageContext, reason }).finally(() => {
     if (activeAnalysis?.promise === promise) activeAnalysis = null;
   });
-
   activeAnalysis = { signature, promise, taskState };
   return promise;
 }
@@ -105,7 +92,7 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
   log('cycle start — reason:', reason);
 
   const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
-  log(`screenshot: ${Date.now() - t0}ms | ${Math.round((screenshot.image?.length || 0) / 1024)}KB`);
+  log(`screenshot: ${Date.now() - t0}ms`);
 
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) {
@@ -114,19 +101,12 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
     return { success: false, error: validation.error, state: StateManager.getState() };
   }
 
-  const tAnalyze = Date.now();
-  const analysis = await VisionService.analyzeScreenshot({
-    screenshot,
-    goal,
-    pageContext,
-    taskState: StateManager.getState(),
-  });
-  const geminiLatencyMs = Date.now() - tAnalyze;
-  log(`analysis: ${geminiLatencyMs}ms | success: ${analysis.success}`);
+  const tAnalyze   = Date.now();
+  const analysis   = await VisionService.analyzeScreenshot({ screenshot, goal, pageContext, taskState: StateManager.getState() });
+  const latencyMs  = Date.now() - tAnalyze;
+  log(`analysis: ${latencyMs}ms | success: ${analysis.success}`);
 
-  if (taskId) {
-    TelemetryService.recordGeminiCall(taskId, { latencyMs: geminiLatencyMs, success: analysis.success });
-  }
+  if (taskId) TelemetryService.recordGeminiCall(taskId, { latencyMs, success: analysis.success });
 
   if (!analysis.success) {
     await StateManager.fail(analysis.error);
@@ -151,7 +131,7 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
 
 function buildSuccessResponse(analysis, complete) {
   return {
-    success: true,
+    success:      true,
     complete,
     screenSummary:  analysis.screenSummary,
     currentRegion:  analysis.currentRegion,
@@ -171,7 +151,6 @@ async function advancePlanStep(message) {
     return { success: false, error: 'No active task.' };
   }
   const state = await StateManager.advancePlanStep(message.stepIndex, message.instruction);
-  // Succeeded: counts as one attempt + one success
   if (taskState.taskId) TelemetryService.recordPlanStep(taskState.taskId, true);
   return { success: true, state };
 }
@@ -179,21 +158,96 @@ async function advancePlanStep(message) {
 async function completeTask(message) {
   const taskState = StateManager.getState();
   await StateManager.complete(message.message || 'Task complete');
-  if (taskState?.taskId) {
-    TelemetryService.completeTask(taskState.taskId, 'completed', 'user-marked-complete');
-  }
+  if (taskState?.taskId) TelemetryService.completeTask(taskState.taskId, 'completed', 'user-marked-complete');
   return { success: true, state: StateManager.getState() };
 }
 
 async function abortTask(message) {
   const taskState = StateManager.getState();
   await StateManager.abort(message.reason || 'User cancelled');
-  if (taskState?.taskId) {
-    TelemetryService.completeTask(taskState.taskId, 'aborted', message.reason || 'user-cancelled');
-  }
+  if (taskState?.taskId) TelemetryService.completeTask(taskState.taskId, 'aborted', message.reason || 'user-cancelled');
   activeAnalysis = null;
   return { success: true, state: StateManager.getState() };
 }
+
+// ─── EXPLAIN MY SCREEN ──────────────────────────────────────────────────────
+
+async function getScreenExplanation(message, sender) {
+  // Prefer cached ScreenContext if it's < 30s old — zero Gemini calls
+  const taskState = StateManager.getState();
+  const ctx       = taskState?.screenContext;
+  const age       = taskState?.updatedAt ? Date.now() - taskState.updatedAt : Infinity;
+
+  if (ctx && age < 30_000) {
+    log('getScreenExplanation: serving from cache');
+    return { success: true, screenContext: ctx, fromCache: true };
+  }
+
+  // Need a fresh screenshot + Gemini call
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const validation = ScreenshotService.validateScreenshot(screenshot);
+  if (!validation.valid) return { success: false, error: validation.error };
+
+  const result = await VisionService.explainScreen({
+    screenshot,
+    pageContext: buildPageContext(message),
+  });
+  if (!result.success) return { success: false, error: result.error };
+  return { success: true, screenContext: result.screenContext, fromCache: false };
+}
+
+// ─── SCREEN Q&A ─────────────────────────────────────────────────────────────
+
+async function askQuestion(message, sender) {
+  const question  = message.question?.trim();
+  if (!question) return { success: false, error: 'Question is required.' };
+
+  // Attempt local answer from existing ScreenContext first — no Gemini
+  const taskState = StateManager.getState();
+  const ctx       = taskState?.screenContext;
+  if (ctx) {
+    const local = tryLocalAnswer(question, ctx);
+    if (local) {
+      log('askQuestion: answered locally from ScreenContext');
+      return { success: true, answer: local, confidence: 0.85, fromCache: true };
+    }
+  }
+
+  // Need Gemini
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const validation = ScreenshotService.validateScreenshot(screenshot);
+  if (!validation.valid) return { success: false, error: validation.error };
+
+  return VisionService.askQuestion({
+    screenshot,
+    question,
+    pageContext: buildPageContext(message),
+  });
+}
+
+function tryLocalAnswer(question, ctx) {
+  const q = question.toLowerCase();
+
+  if (/what.*(app|application|site|website|tool|software|platform)/.test(q)) {
+    return ctx.application ? `You are on ${ctx.application}.` : null;
+  }
+  if (/what.*(page|screen|view).*is this|what am i looking at|where am i/.test(q) || q === 'what is this?') {
+    return ctx.screenSummary || null;
+  }
+  if (/what.*(can i do|do here|available|options|actions)/.test(q)) {
+    return ctx.visibleActions?.length
+      ? 'Available actions: ' + ctx.visibleActions.join(', ') + '.'
+      : null;
+  }
+  if (/what.*(type|kind).*(page|screen|view)/.test(q)) {
+    const app = ctx.application ? ` in ${ctx.application}` : '';
+    return ctx.pageType ? `This is a ${ctx.pageType} page${app}.` : null;
+  }
+
+  return null;
+}
+
+// ─── TELEMETRY ──────────────────────────────────────────────────────────────
 
 function handleTelemetryEvent(message) {
   const taskId = StateManager.getState()?.taskId;
@@ -204,9 +258,14 @@ function handleTelemetryEvent(message) {
     case 'PLAN_STEP_FAILED':
       if (taskId) TelemetryService.recordPlanStep(taskId, false);
       break;
+    case 'PLAN_STEP_RECOVERED':
+      if (taskId) TelemetryService.recordPlanStep(taskId, true);
+      break;
   }
   return { success: true };
 }
+
+// ─── HELPERS ────────────────────────────────────────────────────────────────
 
 function buildPageContext(message, fallback = {}) {
   return {

@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const GEMINI_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const MODELS = {
+  navigate: "gemini-2.5-flash",
+  explain:  "gemini-2.0-flash",
+  ask:      "gemini-2.0-flash",
+} as const;
+type Mode = keyof typeof MODELS;
 
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 100; // DEV: raised from 12 — restore before public launch
+const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
 
-// In-memory store — resets on cold start, sufficient for hackathon
+// In-memory store — resets on cold start, sufficient for current scale
 const sessions = new Map<string, { count: number; resetAt: number }>();
 
 function allowRequest(sessionId: string, reqId: string): boolean {
@@ -14,11 +19,11 @@ function allowRequest(sessionId: string, reqId: string): boolean {
   const s = sessions.get(sessionId);
   if (!s || now > s.resetAt) {
     sessions.set(sessionId, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=1/${RATE_MAX} window_resets=${new Date(now + RATE_WINDOW_MS).toISOString()}`);
+    console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=1/${RATE_MAX}`);
     return true;
   }
   if (s.count >= RATE_MAX) {
-    console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX} resets_at=${new Date(s.resetAt).toISOString()}`);
+    console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX}`);
     return false;
   }
   s.count++;
@@ -34,10 +39,7 @@ const CORS_HEADERS = {
 export async function OPTIONS() {
   return new NextResponse(null, {
     status: 204,
-    headers: {
-      ...CORS_HEADERS,
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-    },
+    headers: { ...CORS_HEADERS, "Access-Control-Allow-Methods": "POST, OPTIONS" },
   });
 }
 
@@ -59,6 +61,7 @@ export async function POST(req: NextRequest) {
     goal: string;
     pageContext?: Record<string, string>;
     taskState?: { completedSteps?: string[]; currentInstruction?: string } | null;
+    mode?: string;
   };
   try {
     body = await req.json();
@@ -66,14 +69,29 @@ export async function POST(req: NextRequest) {
     return json({ error: "Invalid JSON body." }, 400);
   }
 
-  const { screenshot, goal, pageContext = {}, taskState = null } = body;
+  const { screenshot, goal, pageContext = {}, taskState = null, mode: rawMode = "navigate" } = body;
+  const mode: Mode = (["navigate", "explain", "ask"] as const).includes(rawMode as Mode)
+    ? (rawMode as Mode)
+    : "navigate";
+
   if (!goal?.trim()) return json({ error: "goal is required." }, 400);
   if (!screenshot?.image) return json({ error: "screenshot.image is required." }, 400);
 
-  const prompt = buildPrompt(goal, pageContext, taskState);
+  // Payload size guard — reject oversized screenshots before sending to Gemini
+  if (screenshot.image.length > MAX_SCREENSHOT_BYTES) {
+    console.warn(`[analyze] ${reqId} screenshot too large: ${screenshot.image.length} bytes`);
+    return json({ error: "Screenshot too large. Please zoom out or reduce browser zoom level." }, 413);
+  }
+
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mode]}:generateContent`;
+  const prompt = mode === "ask"
+    ? buildQAPrompt(goal, pageContext)
+    : buildNavigatePrompt(goal, pageContext, taskState);
+
+  console.log(`[analyze] ${reqId} mode=${mode} model=${MODELS[mode]} session=${sessionId}`);
 
   try {
-    const upstream = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+    const upstream = await fetch(`${geminiUrl}?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -81,18 +99,13 @@ export async function POST(req: NextRequest) {
           {
             parts: [
               { text: prompt },
-              {
-                inlineData: {
-                  mimeType: screenshot.mimeType ?? "image/jpeg",
-                  data: screenshot.image,
-                },
-              },
+              { inlineData: { mimeType: screenshot.mimeType ?? "image/jpeg", data: screenshot.image } },
             ],
           },
         ],
         generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 2048,
+          temperature: mode === "ask" ? 0.3 : 0.2,
+          maxOutputTokens: mode === "ask" ? 512 : 2048,
           thinkingConfig: { thinkingBudget: 0 },
         },
       }),
@@ -101,7 +114,7 @@ export async function POST(req: NextRequest) {
 
     if (!upstream.ok) {
       const errBody = await upstream.json().catch(() => null);
-      console.error(`[analyze] ${reqId} gemini_status=${upstream.status} session=${sessionId} body=${JSON.stringify(errBody)}`);
+      console.error(`[analyze] ${reqId} gemini_status=${upstream.status} body=${JSON.stringify(errBody)}`);
       if (upstream.status === 429) {
         return json({ error: "Service busy — please retry in a moment.", source: "gemini" }, 429);
       }
@@ -109,7 +122,7 @@ export async function POST(req: NextRequest) {
     }
 
     const data = await upstream.json();
-    console.log(`[analyze] ${reqId} gemini_status=200 session=${sessionId}`);
+    console.log(`[analyze] ${reqId} gemini_ok mode=${mode}`);
     return NextResponse.json(data, { headers: CORS_HEADERS });
   } catch (err: unknown) {
     const name = (err as Error).name;
@@ -117,7 +130,7 @@ export async function POST(req: NextRequest) {
       console.error(`[analyze] ${reqId} gemini_timeout session=${sessionId}`);
       return json({ error: "Analysis timed out — please try again." }, 504);
     }
-    console.error(`[analyze] ${reqId} internal_error session=${sessionId}`, err);
+    console.error(`[analyze] ${reqId} internal_error`, err);
     return json({ error: "Internal server error." }, 500);
   }
 }
@@ -126,14 +139,39 @@ function json(body: object, status: number) {
   return NextResponse.json(body, { status, headers: CORS_HEADERS });
 }
 
-function buildPrompt(
+function buildQAPrompt(question: string, pageContext: Record<string, string>): string {
+  const ctx = [
+    pageContext.url   ? `URL: ${pageContext.url}` : "",
+    pageContext.title ? `Page: ${pageContext.title}` : "",
+  ].filter(Boolean).join("\n");
+
+  return `${ctx}
+
+The user is looking at this browser screenshot and asking:
+"${question}"
+
+Analyze the screenshot and answer accurately. Return ONLY valid JSON (no markdown):
+{
+  "answer": "1–3 sentence answer referencing what you actually see",
+  "confidence": 0.95,
+  "elementHint": "text of the most relevant element, or empty string if not applicable"
+}
+
+Rules:
+- Be specific; reference visible text, buttons, menus, or sections in your answer
+- Never assume features that aren't visible in the screenshot
+- If you cannot see enough to answer, say so in the answer field
+- Return JSON only, no extra text`;
+}
+
+function buildNavigatePrompt(
   goal: string,
   pageContext: Record<string, string>,
   taskState: { completedSteps?: string[]; currentInstruction?: string } | null
 ): string {
   const context = [
     `Goal: ${goal}`,
-    pageContext.url ? `URL: ${pageContext.url}` : "",
+    pageContext.url   ? `URL: ${pageContext.url}` : "",
     pageContext.title ? `Page title: ${pageContext.title}` : "",
     taskState?.completedSteps?.length
       ? `Completed: ${taskState.completedSteps.join(" → ")}`
@@ -141,9 +179,7 @@ function buildPrompt(
     taskState?.currentInstruction
       ? `Last instruction: ${taskState.currentInstruction}`
       : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  ].filter(Boolean).join("\n");
 
   return `${context}
 
@@ -165,10 +201,10 @@ Classify each element's UI region using ONLY these generic region types:
 
 Return ONLY valid JSON (no markdown fences, no extra text):
 {
-  "application": "name of the application or website visible (e.g. GitHub, Gmail, Notion, VS Code Web, Jira, Google Docs). Use 'Unknown' if unclear.",
+  "application": "name of the application or website visible (e.g. GitHub, Gmail, Notion). Use 'Unknown' if unclear.",
   "pageType": "one of: list|detail|form|dashboard|editor|settings|login|search|media|conversation|empty|error|other",
   "screenSummary": "1-2 sentence description of what is currently visible and the application state",
-  "visibleActions": ["up to 5 short labels of the most prominent actions a user could take on this screen, regardless of the current goal"],
+  "visibleActions": ["up to 5 short labels of the most prominent actions a user could take on this screen"],
   "importantElements": [
     { "label": "visible label or name of a notable UI area", "description": "one sentence on its purpose" }
   ],
