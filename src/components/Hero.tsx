@@ -57,23 +57,38 @@ export default function Hero() {
             exactly what to click next.
           </p>
 
-          {/* CTAs */}
-          <div className="flex flex-wrap items-center gap-3">
-            <a
-              href="#demo"
-              className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-sm font-semibold rounded-lg transition-colors shadow-lg shadow-blue-200"
-            >
-              <Play className="w-4 h-4 fill-current" />
-              See a Demo
-            </a>
-            <a
-              href="/screenpilot-extension.zip"
-              download="screenpilot-extension.zip"
-              className="inline-flex items-center gap-2 px-5 py-2.5 border border-black/[0.1] text-[#0F172A] text-sm font-semibold rounded-lg hover:bg-black/[0.03] transition-colors"
-            >
-              <Github className="w-4 h-4" />
-              Install Extension
-            </a>
+          {/* 3-step install flow */}
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <a
+                href="/screenpilot-extension.zip"
+                download="screenpilot-extension.zip"
+                className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-sm font-semibold rounded-lg transition-colors shadow-lg shadow-blue-200"
+              >
+                <Github className="w-4 h-4" />
+                1. Install Extension
+              </a>
+              <a
+                href="#demo"
+                className="inline-flex items-center gap-2 px-5 py-2.5 border border-black/[0.1] text-[#0F172A] text-sm font-semibold rounded-lg hover:bg-black/[0.03] transition-colors"
+              >
+                <Play className="w-4 h-4 fill-current text-[#2563EB]" />
+                See a Demo
+              </a>
+            </div>
+            <div className="flex items-start gap-6 pt-1">
+              <div className="flex items-center gap-2 text-xs text-[#64748B]">
+                <span className="w-5 h-5 rounded-full bg-[#F1F5F9] border border-black/[0.07] flex items-center justify-center text-[10px] font-bold text-[#2563EB]">2</span>
+                Open ScreenPilot on any tab
+              </div>
+              <div className="flex items-center gap-2 text-xs text-[#64748B]">
+                <span className="w-5 h-5 rounded-full bg-[#F1F5F9] border border-black/[0.07] flex items-center justify-center text-[10px] font-bold text-[#2563EB]">3</span>
+                Type your goal — done
+              </div>
+            </div>
+            <p className="text-[11px] text-[#10B981] font-medium">
+              No API key needed. No account. Works instantly.
+            </p>
           </div>
 
           {/* Trust indicators */}

@@ -61,7 +61,8 @@ export default function Navbar() {
         </nav>
 
         {/* Desktop CTA */}
-        <div className="hidden md:block">
+        <div className="hidden md:flex items-center gap-2">
+          <span className="text-xs text-[#10B981] font-medium">No API key needed</span>
           <a
             href="/screenpilot-extension.zip"
             download="screenpilot-extension.zip"
