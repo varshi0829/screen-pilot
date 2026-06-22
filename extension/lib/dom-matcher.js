@@ -4,13 +4,20 @@
 const DOMMatcher = (() => {
   'use strict';
 
+  // Generic UI synonyms — no application names, no site-specific phrases.
+  // Covers common action labels that mean the same thing across different UIs.
   const SYNONYM_GROUPS = [
-    ['upload', 'attach'],
-    ['file upload', 'upload file'],
-    ['new', 'create'],
-    ['new issue', 'create issue'],
-    ['profile', 'me'],
-    ['settings', 'preferences']
+    ['upload', 'attach', 'import'],
+    ['file upload', 'upload file', 'attach file'],
+    ['new', 'create', 'add'],
+    ['settings', 'preferences', 'options', 'configuration'],
+    ['submit', 'send', 'confirm', 'apply', 'save'],
+    ['cancel', 'dismiss', 'close', 'discard'],
+    ['search', 'find', 'filter', 'query', 'lookup'],
+    ['edit', 'modify', 'update', 'change'],
+    ['delete', 'remove', 'trash', 'discard'],
+    ['next', 'continue', 'proceed', 'forward'],
+    ['back', 'previous', 'return', 'go back']
   ];
 
   function matchElement(targetElement) {

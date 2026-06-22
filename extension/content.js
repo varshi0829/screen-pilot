@@ -16,6 +16,102 @@
   // Stage definitions for progressive loading UI
   const STAGES = ['understanding', 'capturing', 'analyzing', 'matching'];
 
+  // ─── PERF TRACER ────────────────────────────────────────────────────────────
+  // Measures each phase of an analysis cycle and prints a structured table.
+  // Phases: screenshot → gemini → dom_match → highlight
+  // Identifies the largest bottleneck without guessing.
+
+  const PerfTracer = (() => {
+    let _t0 = 0, _prev = 0, _goal = '';
+    const _phases = [];
+
+    function begin(goal) {
+      _t0 = _prev = performance.now();
+      _goal = goal;
+      _phases.length = 0;
+    }
+
+    function mark(label) {
+      const now = performance.now();
+      _phases.push({ label, fromStart: Math.round(now - _t0), delta: Math.round(now - _prev) });
+      _prev = now;
+    }
+
+    function report() {
+      if (!_phases.length) return;
+      const total = Math.round(performance.now() - _t0);
+      console.groupCollapsed(`[ScreenPilot Perf] ${total}ms — "${_goal.slice(0, 50)}"`);
+      console.table(Object.fromEntries(
+        _phases.map(p => [p.label, { 'ms (cumulative)': p.fromStart, 'ms (this phase)': p.delta }])
+      ));
+      console.groupEnd();
+    }
+
+    return { begin, mark, report };
+  })();
+
+  // ─── PAGE STATE CACHE ────────────────────────────────────────────────────────
+  // Caches the last Gemini response keyed by URL + goal + DOM fingerprint.
+  // Cache is invalidated when the DOM changes significantly (PageObserver fires)
+  // or when 25s have elapsed — whichever comes first.
+  // This prevents redundant API calls when the user presses Go on an unchanged page.
+  // Cache is based on observable page state, never on application identity.
+
+  const PageStateCache = (() => {
+    const TTL_MS = 25_000;
+    let _entry = null;
+
+    function domSignature() {
+      // Sample visible interactive elements — lightweight, no crypto API needed.
+      // Covers up to 60 elements; text is truncated to avoid length explosions.
+      const els = document.querySelectorAll(
+        'button,a,input,select,textarea,[role="button"],[role="link"],[role="menuitem"],[role="tab"]'
+      );
+      let s = '';
+      let n = 0;
+      for (const el of els) {
+        if (!DOMMatcher.isVisible(el)) continue;
+        s += (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || '').trim().slice(0, 20) + '|';
+        if (++n >= 60) break;
+      }
+      return fnv32a(s);
+    }
+
+    function fnv32a(str) {
+      // FNV-1a 32-bit — fast, low collision rate for typical DOM samples
+      let h = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return h.toString(36);
+    }
+
+    function makeKey(goal) {
+      return `${window.location.href}::${goal}::${domSignature()}`;
+    }
+
+    function get(goal) {
+      if (!_entry) return null;
+      if (Date.now() - _entry.at > TTL_MS) { _entry = null; return null; }
+      if (_entry.key !== makeKey(goal)) return null;
+      console.log('[Cache] HIT — returning cached analysis (same URL + goal + DOM)');
+      return _entry.response;
+    }
+
+    function set(goal, response) {
+      _entry = { key: makeKey(goal), response, at: Date.now() };
+      console.log('[Cache] SET —', _entry.key.slice(0, 80));
+    }
+
+    function invalidate(reason) {
+      if (_entry) console.log('[Cache] INVALIDATE —', reason);
+      _entry = null;
+    }
+
+    return { get, set, invalidate };
+  })();
+
   let state = {
     isOpen: false,
     status: 'IDLE',
@@ -171,18 +267,15 @@
 
     queueChange(reason) {
       if (!state.goal || state.awaitingUpdate || state.requestInFlight) return;
-      if (state.status === 'COMPLETE') {
-        console.log('[PageObserver] Ignoring change because workflow is complete');
-        return;
-      }
-      if (state.status === 'ERROR') {
-        console.log('[PageObserver] Ignoring change because workflow has an error');
-        return;
-      }
+      if (state.status === 'COMPLETE' || state.status === 'ERROR') return;
       if (state.status === 'HIGHLIGHTING' && reason === 'Page updated') return;
 
       const now = Date.now();
       if (now - state.lastReanalysisAt < REANALYZE_DEBOUNCE_MS) return;
+
+      // Invalidate cached response — the DOM changed, so the previous plan may
+      // no longer match the current UI state. Re-planning is required.
+      PageStateCache.invalidate(reason);
 
       clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => {
@@ -610,10 +703,9 @@
 
     const requestToken = ++state.activeRequestToken;
     state.requestInFlight  = true;
-    console.log('[Request] requestInFlight set TRUE');
     state.awaitingUpdate   = messageType === 'REANALYZE';
 
-    const perfTotal = perf();
+    PerfTracer.begin(state.goal);
 
     // Show staged progress — advance immediately, no artificial delays
     if (messageType === 'ANALYZE_GOAL') {
@@ -627,17 +719,36 @@
         advanceStage('capturing');
       }
 
-      const perfGemini = perf();
-      console.log('[UniversalPlanner] Goal:', state.goal);
+      // ── Cache check (ANALYZE_GOAL only) ───────────────────────────────────
+      // If the URL, goal, and DOM fingerprint are all identical to the last
+      // successful response, skip the Gemini round-trip entirely.
+      let response;
+      if (messageType === 'ANALYZE_GOAL') {
+        const cached = PageStateCache.get(state.goal);
+        if (cached) {
+          response = cached;
+          PerfTracer.mark('cache_hit');
+        }
+      }
 
-      const response = await chrome.runtime.sendMessage({
-        type:  messageType,
-        goal:  state.goal,
-        url:   window.location.href,
-        title: document.title,
-        reason
-      });
-      console.log(`[Perf] Gemini round-trip: ${perfGemini()}ms`);
+      if (!response) {
+        const t0Gemini = performance.now();
+        response = await chrome.runtime.sendMessage({
+          type:  messageType,
+          goal:  state.goal,
+          url:   window.location.href,
+          title: document.title,
+          reason
+        });
+        PerfTracer.mark('gemini_roundtrip');
+        console.log(`[Perf] Gemini+screenshot: ${Math.round(performance.now() - t0Gemini)}ms`);
+
+        // Store successful response in cache for reuse if page state unchanged
+        if (messageType === 'ANALYZE_GOAL' && response?.success) {
+          PageStateCache.set(state.goal, response);
+        }
+      }
+
       console.log('[UniversalPlanner] Target:', response?.targetElement?.text, '|', response?.instruction);
 
       if (requestToken !== state.activeRequestToken) return;
@@ -673,7 +784,6 @@
 
       // DOM matching — UniversalPlanner (candidates[]) with DOM-matcher fallback
       if (messageType === 'ANALYZE_GOAL') advanceStage('matching');
-      const perfDOM = perf();
 
       let finalElement     = null;
       let finalText        = '';
@@ -766,7 +876,7 @@
         }
       }
 
-      console.log(`[Perf] DOM match: ${perfDOM()}ms`);
+      PerfTracer.mark('dom_match');
 
       if (!finalElement) {
         console.log('[UniversalPlanner] No element found for:', response.targetElement?.text);
@@ -776,10 +886,9 @@
       }
 
       // ── Highlight ────────────────────────────────────────────────────────
-      const perfHighlight = perf();
       state.highlightedElement = finalElement;
       const highlighted = await Highlighter.show(finalElement, finalInstruction);
-      console.log(`[Perf] Highlight: ${perfHighlight()}ms`);
+      PerfTracer.mark('highlight');
 
       if (!highlighted) {
         hideStages();
@@ -797,8 +906,7 @@
       setStatus('HIGHLIGHTING', finalInstruction);
       state.lastReanalysisAt = Date.now();
       PageObserver.start();
-
-      console.log(`[Perf] Total cycle: ${perfTotal()}ms`);
+      PerfTracer.report();
     } catch (error) {
       hideStages();
       setStatus('ERROR', error?.message?.includes('Extension context invalidated')
@@ -807,15 +915,9 @@
     } finally {
       state.requestInFlight = false;
       state.awaitingUpdate  = false;
-      console.log('[Request] requestInFlight reset FALSE');
       setGoButtonLoading(false);
       renderProgressPanel();
     }
-  }
-
-  function perf() {
-    const start = Date.now();
-    return () => Date.now() - start;
   }
 
   // ─── TRIGGER REANALYSIS ─────────────────────────────────────────────────────
@@ -1208,7 +1310,6 @@
 
   // ─── INPUT EVENT HANDLERS ─────────────────────────────────────────────
   function handleInputEvent(event) {
-    console.log("[INPUT DETECTED]", event.type, event.target);
     if (!state.goal || !state.highlightedElement) return;
     // Check if user typed in the highlighted element
     if (state.highlightedElement.contains(event.target)) {
@@ -1218,7 +1319,6 @@
   }
 
   function handleFocusEvent(event) {
-    console.log("[INPUT DETECTED]", event.type, event.target);
     if (!state.goal || !state.highlightedElement) return;
     // Check if user focused/blurred the highlighted element
     if (state.highlightedElement.contains(event.target)) {

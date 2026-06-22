@@ -1,144 +1,195 @@
 # ScreenPilot
 
-AI-powered navigation assistant for web applications. Acts as GPS for software by providing step-by-step visual guidance directly inside any webpage.
+A Chrome extension that guides users through any web software step by step. Click the icon on any tab, type what you want to do, and ScreenPilot captures the page, sends it to Gemini 2.5 Flash, and puts a pulsing highlight on exactly what to click next.
 
-## Quick Start
+No API key required. No per-site configuration. No hardcoded workflows.
 
-### 1. Install Extension
+---
+
+## How it works
 
 ```
-chrome://extensions/
-→ Enable "Developer mode"
-→ Click "Load unpacked"
-→ Select this directory
+User types goal
+      ↓
+Content script captures visible tab (captureVisibleTab)
+      ↓
+Background worker sends screenshot + URL + goal to backend
+      ↓
+Backend (Next.js API route on Vercel) calls Gemini 2.5 Flash
+      ↓
+Gemini returns: candidates[], targetElement, instruction, confidence
+      ↓
+UniversalPlanner ranks candidates by 8 generic DOM signals
+      ↓
+DOMMatcher resolves best candidate against live DOM
+      ↓
+Highlight ring + arrow + instruction bubble appear over the element
+      ↓
+MutationObserver watches for DOM changes → re-plans automatically
 ```
 
-### 2. Configure API Key
+---
 
-- Click ScreenPilot extension icon
-- Get free API key: https://aistudio.google.com/app/apikey
-- Paste and save
+## Install the extension (for users)
 
-### 3. Test on Gmail
+1. Download `screenpilot-extension.zip` from the landing page
+2. Go to `chrome://extensions/`
+3. Enable **Developer mode** (top right)
+4. Click **Load unpacked**
+5. Select the extracted `extension/` folder — the one containing `manifest.json`
+6. Open any webpage, click the ScreenPilot icon, type your goal
 
-1. Open https://mail.google.com
-2. Click extension → "Open ScreenPilot"
-3. Enter goal: "how do i compose a mail"
-4. Click "Go"
-5. Follow highlighted elements
+---
+
+## Run locally (for developers)
+
+### Backend
+
+```bash
+# Clone the repo
+git clone https://github.com/varshi0829/screen-pilot.git
+cd screen-pilot
+
+# Install dependencies
+npm install
+
+# Create .env.local with your Gemini key
+# Get a free key at: https://aistudio.google.com/apikey
+echo "GEMINI_API_KEY=your_key_here" > .env.local
+
+# Start dev server
+npm run dev
+# Landing page: http://localhost:3000
+# API endpoint: http://localhost:3000/api/analyze
+```
+
+### Extension
+
+Point the extension at your local backend while developing:
+
+In `extension/services/vision-service.js`, change:
+```js
+const BACKEND_URL = 'https://screen-pilot.vercel.app/api/analyze';
+// → 
+const BACKEND_URL = 'http://localhost:3000/api/analyze';
+```
+
+Then load the `extension/` folder via `chrome://extensions/ → Load unpacked`.
+
+---
+
+## Deploy to Vercel
+
+1. Push to GitHub
+2. Import the repo in Vercel (no Root Directory setting needed — Next.js is at the repo root)
+3. Add environment variable: `GEMINI_API_KEY = your_key`
+4. Deploy
+
+---
 
 ## Architecture
 
+### Application-agnostic design
+
+ScreenPilot has no built-in knowledge of any website or application. Every decision is derived from:
+
+- The current screenshot (what Gemini sees)
+- The DOM state (what elements are actually present)
+- The user's goal (plain English)
+- The history of completed steps
+
+There are no `if (url.includes('gmail'))` branches. No per-site element selectors. No hardcoded step sequences.
+
+### Backend (`src/app/api/analyze/route.ts`)
+
+- Receives `{ screenshot, goal, pageContext, taskState }` from the extension
+- Builds the Gemini prompt server-side (never exposes the API key)
+- Rate-limits to 12 requests per minute per session UUID
+- Returns Gemini's raw response; parsing stays in the extension
+
+### Content script (`extension/content.js`)
+
+- **Widget**: Floating UI injected into the active tab
+- **PerfTracer**: Measures each phase of a cycle (cache hit / Gemini round-trip / DOM match / highlight) and prints a structured table in DevTools
+- **PageStateCache**: Caches the last Gemini response keyed by `URL + goal + DOM fingerprint`. Invalidated when the DOM changes or after 25 seconds. Prevents redundant API calls on repeated `Go` with identical page state.
+- **UniversalPlanner**: Ranks Gemini's `candidates[]` using 8 generic signals: Gemini confidence, DOM match score, clickability, semantic similarity, visibility, action type weight, region weight, visual prominence
+- **PageObserver**: `MutationObserver` + popstate/hashchange — triggers re-analysis on DOM changes, automatically invalidating the cache
+
+### DOM Matcher (`extension/lib/dom-matcher.js`)
+
+Resolves an element description to a live DOM node using:
+
+- Exact text match (score 110)
+- Synonym match via generic synonym table (score 102)
+- Token similarity / reordering (score 72–98)
+- Substring containment (score 70)
+- Levenshtein distance ≤ 2 (score 48–64)
+- Semantic container context bonus (+10–18)
+- Element type affinity bonus (+10)
+
+Synonym table contains only generic UI verbs (`upload/attach`, `submit/send/confirm`, `cancel/dismiss`, etc.) — no application names.
+
+### Performance profile
+
+Open Chrome DevTools → Console on any page where ScreenPilot runs and look for:
+
 ```
-User Input (Goal)
-    ↓
-Content Script (Widget + Observer)
-    ↓
-Background Worker (Orchestrator)
-    ↓
-Screenshot Service → Gemini Vision API
-    ↓
-State Manager (Workflow Tracking)
-    ↓
-UniversalPlanner + DOM Matcher
-    ↓
-Highlight Renderer (Visual Overlay)
-    ↓
-Page Change Detection → Re-analysis Loop
+[ScreenPilot Perf] 3842ms — "schedule an email for tomorrow"
+┌─────────────────────┬──────────────────┬──────────────────┐
+│ phase               │ ms (cumulative)  │ ms (this phase)  │
+├─────────────────────┼──────────────────┼──────────────────┤
+│ gemini_roundtrip    │ 3761             │ 3761             │
+│ dom_match           │ 3798             │ 37               │
+│ highlight           │ 3842             │ 44               │
+└─────────────────────┴──────────────────┴──────────────────┘
 ```
 
-## Components
+Typical breakdown: Gemini latency is ~95% of total time. Screenshot capture and compression are ~100–200ms (inside the Gemini phase). DOM matching and highlighting are negligible.
 
-### Content Script (`content.js`)
-- Floating widget UI
-- UniversalPlanner for candidate ranking
-- DOM matching with fuzzy/synonym support
-- MutationObserver for page changes
-- Input/focus/change event detection
-- Highlighting engine with animations
+The `cache_hit` phase appears instead of `gemini_roundtrip` when the page state hasn't changed:
+```
+[Cache] HIT — returning cached analysis (same URL + goal + DOM)
+[ScreenPilot Perf] 41ms — "schedule an email for tomorrow"
+```
 
-### Background Service (`background.js`)
-- Message handling (Manifest V3)
-- Vision cycle orchestration
-- Screenshot capture
-- Gemini API calls
-- State persistence
+---
 
-### DOM Matcher (`lib/dom-matcher.js`)
-- Finds elements from AI descriptions
-- Supports exact, fuzzy, synonym matching
-- Handles ARIA labels and accessibility
-- Levenshtein distance for fuzzy matching
-
-### Services
-- `vision-service.js` - Gemini 2.5 Flash Vision API
-- `screenshot-service.js` - Visible tab capture
-- `state-manager.js` - Workflow state persistence
-
-### Popup
-- API key configuration
-- Widget activation
-
-## Files
+## Project structure
 
 ```
 screen-pilot/
-├── manifest.json              # Extension manifest (MV3)
-├── content.js               # Main content script
-├── background.js           # Service worker
-├── lib/
-│   └── dom-matcher.js      # Element matching engine
-├── services/
-│   ├── vision-service.js   # Gemini Vision API
-│   ├── screenshot-service.js
-│   └── state-manager.js   # State persistence
-├── popup/
-│   ├── popup.html
-│   └── popup.js
-├── styles/
-│   └── widget.css         # Widget styling
-├── icons/
-│   ├── icon16.png
-│   ├── icon48.png
-│   └── icon128.png
-├── docs/                   # Design documentation
-└── README.md
+├── extension/                  ← Chrome extension (load this folder in Chrome)
+│   ├── manifest.json           ← MV3
+│   ├── background.js           ← Service worker: orchestration
+│   ├── content.js              ← Widget, UniversalPlanner, PageStateCache, PerfTracer
+│   ├── lib/
+│   │   └── dom-matcher.js      ← DOM element resolution
+│   ├── services/
+│   │   ├── vision-service.js   ← Backend API caller
+│   │   ├── screenshot-service.js
+│   │   └── state-manager.js
+│   ├── popup/
+│   │   ├── popup.html
+│   │   └── popup.js
+│   ├── styles/widget.css
+│   └── icons/
+├── src/                        ← Next.js landing page
+│   ├── app/
+│   │   ├── api/analyze/
+│   │   │   └── route.ts        ← Gemini proxy endpoint
+│   │   ├── layout.tsx
+│   │   └── page.tsx
+│   └── components/
+├── public/
+│   ├── demo.mp4
+│   └── screenpilot-extension.zip
+├── next.config.ts
+├── package.json
+└── .env.example                ← Copy to .env.local, add GEMINI_API_KEY
 ```
 
-## Usage
-
-### Starting a Workflow
-
-1. Open any webpage
-2. Click the ScreenPilot extension icon
-3. Enter your goal (e.g., "compose a mail", "search for...")
-4. Click "Go"
-5. Follow the highlighted instructions
-
-### During a Workflow
-
-- **Click** highlighted elements to advance
-- **Type** in highlighted input fields (auto-detected)
-- **Focus/blur** on fields triggers re-analysis
-- **Page changes** automatically detected
-
-### Ending a Workflow
-
-- Click "Done" when task is complete
-- Click "Cancel" to abort
-- Workflow auto-completes when goal is reached
-
-## Debug Mode
-
-Check console for detailed logs:
-
-```
-[UniversalPlanner] Goal: ...
-[UniversalPlanner] Target: ...
-[PageObserver] Reanalysis triggered: ...
-[VisionService] result — step: ...
-```
+---
 
 ## License
 
-MIT License
+MIT

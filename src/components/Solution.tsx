@@ -9,7 +9,7 @@ const steps = [
     icon: MousePointer2,
     title: "Click the extension icon on any tab",
     description:
-      "You're already on the page — Gmail, Jira, GitHub, wherever. Click the ScreenPilot icon in your Chrome toolbar. A small widget slides in from the bottom-right corner.",
+      "You're already on the page — any page. Click the ScreenPilot icon in your Chrome toolbar. A small widget slides in from the bottom-right corner of the tab you're on.",
     color: "#2563EB",
   },
   {
@@ -17,7 +17,7 @@ const steps = [
     icon: MessageSquare,
     title: "Tell it what you want to do",
     description:
-      "Type your goal in plain English. \"Create a GitHub issue about the login bug.\" \"Schedule an email for tomorrow.\" No special syntax. Just what you're trying to accomplish.",
+      "Type your goal in plain English. \"Submit the expense report.\" \"Find the filter and set it to last 30 days.\" No special syntax — just what you're trying to accomplish.",
     color: "#2563EB",
   },
   {
