@@ -56,6 +56,11 @@ export const TelemetryService = (() => {
       // Recovery mode
       recoveryAttempts:     0,
       recoverySuccesses:    0,
+      // Navigation planning
+      navigationTransitions: [],
+      successfulTransitions: [],
+      failedTransitions: [],
+      replanningEvents: [],
       // Lifecycle
       completionStatus:     'active',
       completionReason:     '',
@@ -118,6 +123,38 @@ export const TelemetryService = (() => {
     if (!r) return;
     r.recoveryAttempts++;
     if (succeeded) r.recoverySuccesses++;
+  }
+
+  /** Record navigation transition between states. */
+  function recordNavigationTransition(taskId, fromState, toState) {
+    const r = _buf.get(taskId);
+    if (!r) return;
+    if (!r.navigationTransitions) r.navigationTransitions = [];
+    r.navigationTransitions.push({ from: fromState, to: toState, at: Date.now() });
+  }
+
+  /** Record successful navigation transition. */
+  function recordNavigationSuccess(taskId, fromState, toState) {
+    const r = _buf.get(taskId);
+    if (!r) return;
+    if (!r.successfulTransitions) r.successfulTransitions = [];
+    r.successfulTransitions.push({ from: fromState, to: toState, at: Date.now() });
+  }
+
+  /** Record failed navigation transition. */
+  function recordNavigationFailed(taskId, fromState, toState) {
+    const r = _buf.get(taskId);
+    if (!r) return;
+    if (!r.failedTransitions) r.failedTransitions = [];
+    r.failedTransitions.push({ from: fromState, to: toState, at: Date.now() });
+  }
+
+  /** Record replanning event. */
+  function recordReplanning(taskId, reason) {
+    const r = _buf.get(taskId);
+    if (!r) return;
+    if (!r.replanningEvents) r.replanningEvents = [];
+    r.replanningEvents.push({ reason, at: Date.now() });
   }
 
   /** Increments global cache-hit counter (separate from per-task data). */

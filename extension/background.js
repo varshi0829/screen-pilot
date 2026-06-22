@@ -5,6 +5,7 @@ import { TelemetryService }   from './services/telemetry-service.js';
 import { MemoryService }       from './services/memory-service.js';
 import { RateLimiterService }  from './services/rate-limiter-service.js';
 import { ValidationService }   from './services/validation-service.js';
+import { NavigationPlanner }  from './services/navigation-planner.js';
 
 const DEBUG = false;
 
@@ -176,6 +177,25 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   if (taskId && analysis.taskPlan?.steps?.length) {
     TelemetryService.recordPlanGenerated(taskId, analysis.taskPlan.steps.length);
     ValidationService.recordEvent('PLAN_GENERATED', { stepCount: analysis.taskPlan.steps.length });
+  }
+
+  // Phase 5: Navigation Planning - analyze if goal requires navigation
+  const stateModel = NavigationPlanner.modelState(analysis);
+  const goalGap = NavigationPlanner.analyzeGoalGap(goal, stateModel);
+
+  if (goalGap.navigationNeeded) {
+    log(`[Navigation] gap detected: ${goalGap.reason}`);
+    TelemetryService.recordNavigationTransition(taskId, goalGap.currentState, goalGap.targetState);
+
+    // Create multi-step plan with navigation
+    const navPlan = NavigationPlanner.createNavigationPlan(goal, stateModel, goalGap);
+    if (navPlan.steps?.length > (analysis.taskPlan?.steps?.length || 0)) {
+      analysis.taskPlan = navPlan;
+      log(`[Navigation] multi-step plan: ${navPlan.steps.length} steps`);
+    }
+  } else {
+    // Direct achievement - no navigation needed
+    TelemetryService.recordNavigationSuccess(taskId, stateModel.pageType, 'target');
   }
 
   if (analysis.complete) {
