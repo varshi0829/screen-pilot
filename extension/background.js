@@ -183,15 +183,20 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   const stateModel = NavigationPlanner.modelState(analysis);
   const goalGap = NavigationPlanner.analyzeGoalGap(goal, stateModel);
 
+  log(`[Navigation] stateModel: pageType=${stateModel.pageType}, confidence=${stateModel.confidence}`);
+  log(`[Navigation] goalGap: current=${goalGap.currentState}, target=${goalGap.targetState}, needed=${goalGap.navigationNeeded}`);
+
   if (goalGap.navigationNeeded) {
     log(`[Navigation] gap detected: ${goalGap.reason}`);
     TelemetryService.recordNavigationTransition(taskId, goalGap.currentState, goalGap.targetState);
 
     // Create multi-step plan with navigation
     const navPlan = NavigationPlanner.createNavigationPlan(goal, stateModel, goalGap);
-    if (navPlan.steps?.length > (analysis.taskPlan?.steps?.length || 0)) {
+    // Always use navigation plan when navigation is needed - don't check length
+    if (navPlan?.steps?.length) {
       analysis.taskPlan = navPlan;
       log(`[Navigation] multi-step plan: ${navPlan.steps.length} steps`);
+      log(`[Navigation] plan injected: taskPlan.steps = ${JSON.stringify(navPlan.steps.map(s => s.description))}`);
     }
   } else {
     // Direct achievement - no navigation needed
