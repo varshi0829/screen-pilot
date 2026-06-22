@@ -331,6 +331,7 @@
     // Primary match: high-confidence DOM hit
     if (match?.element && match.score >= PLAN_STEP_MIN_SCORE) {
       console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
+      console.log(`[Transition] Chosen: "${step.expectedElement.text}", Score: ${match.score}, State: ${step.state}`);
       _emitDebug('PLAN_STEP_PRIMARY', { stepIndex: nextIdx, score: match.score, description: step.description });
       chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
       return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
@@ -1277,6 +1278,7 @@
     if (reason === 'Click detected') {
       const planStep = tryPlanStep();
       if (planStep) {
+        console.log(`[Transition] SUCCESS: Next step found, executing: "${planStep.step.description}"`);
         state.awaitingUpdate     = true;
         state.requestInFlight    = true;
         state.highlightedElement = null;
@@ -1285,6 +1287,8 @@
         setStatus('ANALYZING', 'Following plan…');
         executePlanStep(planStep);
         return;
+      } else {
+        console.log(`[Transition] FALLBACK: No plan step found, calling Gemini`);
       }
     }
 
@@ -1308,6 +1312,9 @@
     if (!state.goal || !state.highlightedElement || isScreenPilotNode(event.target)) return;
 
     if (state.highlightedElement.contains(event.target)) {
+      const clickedElement = state.currentAction?.targetElement?.text || 'unknown';
+      const currentState = state.currentTaskState?.taskPlan?.steps?.[state.currentTaskState?.taskPlan?.currentStepIndex]?.state || 'unknown';
+      console.log(`[Transition] CLICK: "${clickedElement}", From: ${currentState}`);
       triggerRipple(event.clientX, event.clientY);
       state.lastUserInteractionAt = Date.now();
       triggerReanalysis('Click detected');
