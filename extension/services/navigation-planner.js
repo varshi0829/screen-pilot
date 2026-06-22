@@ -220,14 +220,30 @@ export const NavigationPlanner = (() => {
     // Check if any action directly achieves the goal
     for (const action of actions) {
       if (matchesGoal(goalNorm, action.text)) {
-        return true;
+        // Must be a primary action, not just any navigation element
+        if (action.actionType === 'primary_action' || action.actionType === 'content_item') {
+          return true;
+        }
       }
     }
 
-    // Check if any navigation element leads to goal
+    // For navigation elements, only consider them direct if they're create buttons
+    // and we're on a compatible page type
     for (const nav of navElements) {
       if (matchesGoal(goalNorm, nav.text)) {
-        return true;
+        // Only "create_button" type can directly achieve creation goals
+        if (nav.navType === NAVIGATION_PRIMITIVES.CREATE_BUTTON) {
+          // But only if page type supports creation
+          // REPOSITORY page type is for viewing files - cannot create new repos here
+          const compatiblePageTypes = [PAGE_TYPES.LIST, PAGE_TYPES.DASHBOARD, PAGE_TYPES.DETAIL];
+          const incompatiblePageTypes = [PAGE_TYPES.REPOSITORY, PAGE_TYPES.EDITOR];
+          if (incompatiblePageTypes.includes(state.pageType)) {
+            return false; // Needs navigation
+          }
+          if (compatiblePageTypes.includes(state.pageType)) {
+            return true;
+          }
+        }
       }
     }
 
@@ -237,11 +253,25 @@ export const NavigationPlanner = (() => {
   function matchesGoal(goal, elementText) {
     if (!elementText || !goal) return false;
     const text = elementText.toLowerCase();
-    return (
-      goal.includes(text) ||
-      text.includes(goal) ||
-      fuzzyMatch(goal, text)
-    );
+
+    // For creation goals ("create new X"), require more specific matches
+    if (goal.includes('create') || goal.includes('new repository') || goal.includes('new repo')) {
+      // Must match "new repository" or "create new" explicitly
+      const goalHasRepo = goal.includes('repository') || goal.includes('repo');
+      if (goalHasRepo) {
+        // For "create new repository", only match if element mentions repo
+        return text.includes('repository') || text.includes('repo') || text.includes('create');
+      }
+      // For generic "create new", match "new" or "create"
+      return text === 'new' || text.includes('create');
+    }
+
+    // Exact match or substring match (for non-creation goals)
+    if (goal.includes(text) || text.includes(goal)) {
+      return true;
+    }
+
+    return fuzzyMatch(goal, text);
   }
 
   function fuzzyMatch(a, b) {
