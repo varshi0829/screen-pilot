@@ -1,7 +1,9 @@
-import { ScreenshotService } from './services/screenshot-service.js';
-import { StateManager }     from './services/state-manager.js';
-import { VisionService }    from './services/vision-service.js';
-import { TelemetryService } from './services/telemetry-service.js';
+import { ScreenshotService }  from './services/screenshot-service.js';
+import { StateManager }       from './services/state-manager.js';
+import { VisionService }      from './services/vision-service.js';
+import { TelemetryService }   from './services/telemetry-service.js';
+import { MemoryService }      from './services/memory-service.js';
+import { RateLimiterService } from './services/rate-limiter-service.js';
 
 const DEBUG = false;
 
@@ -23,35 +25,58 @@ async function handleMessage(message, sender) {
   if (!StateManager.getState()) await StateManager.restore();
 
   switch (message.type) {
-    case 'ANALYZE_GOAL':          return analyzeGoal(message, sender);
-    case 'REANALYZE':             return reanalyzeGoal(message, sender);
-    case 'ADVANCE_PLAN_STEP':     return advancePlanStep(message);
-    case 'GET_STATE':             return { success: true, state: StateManager.getState() };
-    case 'COMPLETE_TASK':         return completeTask(message);
-    case 'ABORT_TASK':            return abortTask(message);
-    case 'GET_SCREEN_EXPLANATION':return getScreenExplanation(message, sender);
-    case 'ASK_QUESTION':          return askQuestion(message, sender);
-    case 'TELEMETRY_EVENT':       return handleTelemetryEvent(message);
-    case 'GET_ANALYTICS':         return { success: true, analytics: await TelemetryService.getAnalytics() };
-    case 'CLEAR_ANALYTICS':       await TelemetryService.clear(); return { success: true };
+    case 'ANALYZE_GOAL':           return analyzeGoal(message, sender);
+    case 'REANALYZE':              return reanalyzeGoal(message, sender);
+    case 'ADVANCE_PLAN_STEP':      return advancePlanStep(message);
+    case 'GET_STATE':              return { success: true, state: StateManager.getState() };
+    case 'COMPLETE_TASK':          return completeTask(message);
+    case 'ABORT_TASK':             return abortTask(message);
+    case 'GET_SCREEN_EXPLANATION': return getScreenExplanation(message, sender);
+    case 'ASK_QUESTION':           return askQuestion(message, sender);
+    case 'TELEMETRY_EVENT':        return handleTelemetryEvent(message);
+    case 'GET_ANALYTICS':          return { success: true, analytics: await TelemetryService.getAnalytics() };
+    case 'CLEAR_ANALYTICS':        await TelemetryService.clear(); return { success: true };
+    case 'GET_MEMORY_STATS':       return { success: true, stats: await MemoryService.getStats() };
+    case 'CLEAR_MEMORY':           await MemoryService.clear(); return { success: true };
+    case 'GET_RATE_USAGE':         return { success: true, usage: await RateLimiterService.getUsage() };
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
 }
 
-// ─── NAVIGATION ─────────────────────────────────────────────────────────────
+// ─── NAVIGATION ──────────────────────────────────────────────────────────────
 
 async function analyzeGoal(message, sender) {
   await StateManager.createTask(message.goal);
   const taskId = StateManager.getState().taskId;
   TelemetryService.startTask(taskId, message.goal);
+
+  // Record enterprise context detection (sent by content.js)
+  const ec = message.enterpriseContext || null;
+  if (ec) {
+    TelemetryService.recordEnterpriseContext(taskId, {
+      application: ec.application,
+      detected:    !!ec.application && ec.confidence >= 0.5,
+    });
+  }
+
+  // Phase 3: Predictive Navigation — check memory before calling Gemini
+  const memHit = await MemoryService.findWorkflow(message.goal);
+  if (memHit && memHit.confidence >= 0.85) {
+    log(`[Memory] Hit — confidence=${memHit.confidence.toFixed(2)} type=${memHit.matchType}`);
+    TelemetryService.recordMemoryHit(taskId);
+    activeAnalysis = null;
+    return _buildMemoryResponse(memHit.workflow, memHit.confidence, message, sender);
+  }
+
   activeAnalysis = null;
   return queueVisionCycle({
     sender,
-    goal:        message.goal,
-    pageContext: buildPageContext(message),
-    reason:      'initial-analysis',
-    forceNew:    true,
+    goal:             message.goal,
+    pageContext:      buildPageContext(message),
+    enterpriseContext: ec,
+    reason:           'initial-analysis',
+    forceNew:         true,
   });
 }
 
@@ -64,14 +89,15 @@ async function reanalyzeGoal(message, sender) {
   if (isPlanFallback && taskState.taskId) TelemetryService.recordFallback(taskState.taskId);
   return queueVisionCycle({
     sender,
-    goal:        taskState.goal,
-    pageContext:  buildPageContext(message, taskState.currentPage),
-    reason:       message.reason || 'reanalyze',
-    forceNew:     false,
+    goal:             taskState.goal,
+    pageContext:      buildPageContext(message, taskState.currentPage),
+    enterpriseContext: message.enterpriseContext || null,
+    reason:           message.reason || 'reanalyze',
+    forceNew:         false,
   });
 }
 
-function queueVisionCycle({ sender, goal, pageContext, reason, forceNew }) {
+function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason, forceNew }) {
   const taskState = StateManager.getState();
   const signature = `${taskState?.goal || goal}|${pageContext.url || ''}|${pageContext.title || ''}`;
 
@@ -79,17 +105,29 @@ function queueVisionCycle({ sender, goal, pageContext, reason, forceNew }) {
     return activeAnalysis.promise;
   }
 
-  const promise = runVisionCycle({ goal, sender, pageContext, reason }).finally(() => {
+  const promise = runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }).finally(() => {
     if (activeAnalysis?.promise === promise) activeAnalysis = null;
   });
   activeAnalysis = { signature, promise, taskState };
   return promise;
 }
 
-async function runVisionCycle({ goal, sender, pageContext, reason }) {
+async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }) {
   const t0     = Date.now();
   const taskId = StateManager.getState()?.taskId;
   log('cycle start — reason:', reason);
+
+  // Phase 4: Check extension-side rate limit before capturing screenshot
+  const canProceed = await RateLimiterService.canProceed();
+  if (!canProceed) {
+    const usage = await RateLimiterService.getUsage();
+    const msg   = usage.perMinute.remaining === 0
+      ? `Rate limit: ${usage.perMinute.limit} requests/minute reached. Try again in a moment.`
+      : `Daily limit of ${usage.perDay.limit} requests reached for today.`;
+    await StateManager.fail(msg);
+    if (taskId) TelemetryService.completeTask(taskId, 'failed', 'rate-limit-extension');
+    return { success: false, error: msg, state: StateManager.getState() };
+  }
 
   const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
   log(`screenshot: ${Date.now() - t0}ms`);
@@ -101,9 +139,18 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
     return { success: false, error: validation.error, state: StateManager.getState() };
   }
 
-  const tAnalyze   = Date.now();
-  const analysis   = await VisionService.analyzeScreenshot({ screenshot, goal, pageContext, taskState: StateManager.getState() });
-  const latencyMs  = Date.now() - tAnalyze;
+  // Record the request in the persistent rate limiter
+  await RateLimiterService.recordRequest();
+
+  const tAnalyze  = Date.now();
+  const analysis  = await VisionService.analyzeScreenshot({
+    screenshot,
+    goal,
+    pageContext,
+    enterpriseContext,
+    taskState: StateManager.getState(),
+  });
+  const latencyMs = Date.now() - tAnalyze;
   log(`analysis: ${latencyMs}ms | success: ${analysis.success}`);
 
   if (taskId) TelemetryService.recordGeminiCall(taskId, { latencyMs, success: analysis.success });
@@ -129,19 +176,65 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
   return buildSuccessResponse(analysis, false);
 }
 
+// ─── MEMORY: SYNTHETIC RESPONSE ──────────────────────────────────────────────
+
+async function _buildMemoryResponse(workflow, confidence, message, sender) {
+  const taskId    = StateManager.getState()?.taskId;
+  const firstStep = workflow.steps[0];
+  if (!firstStep) return analyzeGoal({ ...message, _skipMemory: true }, sender);
+
+  // Construct a taskPlan from the remembered workflow
+  const taskPlan = {
+    steps: workflow.steps.map(s => ({
+      id:              s.id || 0,
+      description:     s.description,
+      expectedElement: s.expectedElement || s.element || { text: s.description, type: 'button', region: 'main_content' },
+      status:          'pending',
+      fromMemory:      true,
+    })),
+    currentStepIndex: 0,
+    planVersion:      1,
+    createdAt:        Date.now(),
+    fromMemory:       true,
+  };
+
+  // Build a synthetic analysis object for StateManager.updateFromAnalysis
+  const syntheticAnalysis = {
+    instruction:    firstStep.description,
+    screenSummary:  `Executing remembered workflow (${workflow.completionCount} previous completions): "${workflow.goal}"`,
+    screenContext:  null,
+    currentRegion:  firstStep.expectedElement?.region || firstStep.element?.region || 'main_content',
+    currentStep:    firstStep.description,
+    targetElement:  firstStep.expectedElement || firstStep.element || { text: firstStep.description, type: 'button' },
+    candidates:     [],
+    confidence,
+    taskPlan,
+    complete:       false,
+  };
+
+  const pageContext = buildPageContext(message);
+  await StateManager.updateFromAnalysis(syntheticAnalysis, Date.now(), pageContext);
+
+  log(`[Memory] Synthetic plan: ${taskPlan.steps.length} steps`);
+  return buildSuccessResponse(syntheticAnalysis, false);
+}
+
+// ─── PLAN ADVANCEMENT ─────────────────────────────────────────────────────────
+
 function buildSuccessResponse(analysis, complete) {
   return {
-    success:      true,
+    success:       true,
     complete,
-    screenSummary:  analysis.screenSummary,
-    currentRegion:  analysis.currentRegion,
-    currentStep:    analysis.currentStep,
-    targetElement:  analysis.targetElement,
-    candidates:     analysis.candidates || [],
-    instruction:    analysis.instruction,
-    confidence:     analysis.confidence,
-    screenContext:  analysis.screenContext || null,
-    state:          StateManager.getState(),
+    fromMemory:    analysis.taskPlan?.fromMemory || false,
+    screenSummary: analysis.screenSummary,
+    currentRegion: analysis.currentRegion,
+    currentStep:   analysis.currentStep,
+    targetElement: analysis.targetElement,
+    candidates:    analysis.candidates || [],
+    instruction:   analysis.instruction,
+    confidence:    analysis.confidence,
+    screenContext: analysis.screenContext || null,
+    state:         StateManager.getState(),
   };
 }
 
@@ -157,6 +250,27 @@ async function advancePlanStep(message) {
 
 async function completeTask(message) {
   const taskState = StateManager.getState();
+
+  // Phase 2: Save workflow to memory on successful completion
+  if (taskState?.goal && taskState?.taskPlan?.steps?.length) {
+    const steps = taskState.taskPlan.steps
+      .filter(s => s.status === 'done' || s.expectedElement?.text)
+      .map(s => ({
+        id:              s.id,
+        description:     s.description,
+        expectedElement: s.expectedElement,
+        urlPattern:      taskState.currentPage?.url || '',
+      }));
+
+    MemoryService.saveWorkflow({
+      goal:             taskState.goal,
+      steps,
+      geminiCalls:      0,    // will be filled by telemetry on flush
+      completionStatus: 'completed',
+      application:      taskState.screenContext?.application || null,
+    }).catch(() => {});
+  }
+
   await StateManager.complete(message.message || 'Task complete');
   if (taskState?.taskId) TelemetryService.completeTask(taskState.taskId, 'completed', 'user-marked-complete');
   return { success: true, state: StateManager.getState() };
@@ -170,10 +284,9 @@ async function abortTask(message) {
   return { success: true, state: StateManager.getState() };
 }
 
-// ─── EXPLAIN MY SCREEN ──────────────────────────────────────────────────────
+// ─── EXPLAIN MY SCREEN ────────────────────────────────────────────────────────
 
 async function getScreenExplanation(message, sender) {
-  // Prefer cached ScreenContext if it's < 30s old — zero Gemini calls
   const taskState = StateManager.getState();
   const ctx       = taskState?.screenContext;
   const age       = taskState?.updatedAt ? Date.now() - taskState.updatedAt : Infinity;
@@ -183,7 +296,6 @@ async function getScreenExplanation(message, sender) {
     return { success: true, screenContext: ctx, fromCache: true };
   }
 
-  // Need a fresh screenshot + Gemini call
   const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) return { success: false, error: validation.error };
@@ -196,13 +308,12 @@ async function getScreenExplanation(message, sender) {
   return { success: true, screenContext: result.screenContext, fromCache: false };
 }
 
-// ─── SCREEN Q&A ─────────────────────────────────────────────────────────────
+// ─── SCREEN Q&A ──────────────────────────────────────────────────────────────
 
 async function askQuestion(message, sender) {
-  const question  = message.question?.trim();
+  const question = message.question?.trim();
   if (!question) return { success: false, error: 'Question is required.' };
 
-  // Attempt local answer from existing ScreenContext first — no Gemini
   const taskState = StateManager.getState();
   const ctx       = taskState?.screenContext;
   if (ctx) {
@@ -213,7 +324,6 @@ async function askQuestion(message, sender) {
     }
   }
 
-  // Need Gemini
   const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) return { success: false, error: validation.error };
@@ -227,7 +337,6 @@ async function askQuestion(message, sender) {
 
 function tryLocalAnswer(question, ctx) {
   const q = question.toLowerCase();
-
   if (/what.*(app|application|site|website|tool|software|platform)/.test(q)) {
     return ctx.application ? `You are on ${ctx.application}.` : null;
   }
@@ -235,19 +344,16 @@ function tryLocalAnswer(question, ctx) {
     return ctx.screenSummary || null;
   }
   if (/what.*(can i do|do here|available|options|actions)/.test(q)) {
-    return ctx.visibleActions?.length
-      ? 'Available actions: ' + ctx.visibleActions.join(', ') + '.'
-      : null;
+    return ctx.visibleActions?.length ? 'Available actions: ' + ctx.visibleActions.join(', ') + '.' : null;
   }
   if (/what.*(type|kind).*(page|screen|view)/.test(q)) {
     const app = ctx.application ? ` in ${ctx.application}` : '';
     return ctx.pageType ? `This is a ${ctx.pageType} page${app}.` : null;
   }
-
   return null;
 }
 
-// ─── TELEMETRY ──────────────────────────────────────────────────────────────
+// ─── TELEMETRY ───────────────────────────────────────────────────────────────
 
 function handleTelemetryEvent(message) {
   const taskId = StateManager.getState()?.taskId;
@@ -260,12 +366,16 @@ function handleTelemetryEvent(message) {
       break;
     case 'PLAN_STEP_RECOVERED':
       if (taskId) TelemetryService.recordPlanStep(taskId, true);
+      if (taskId) TelemetryService.recordRecovery(taskId, true);
+      break;
+    case 'RECOVERY_ATTEMPTED':
+      if (taskId) TelemetryService.recordRecovery(taskId, false);
       break;
   }
   return { success: true };
 }
 
-// ─── HELPERS ────────────────────────────────────────────────────────────────
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function buildPageContext(message, fallback = {}) {
   return {
@@ -285,6 +395,8 @@ async function init() {
   if (state?.status && ['COMPLETE', 'ABORTED'].includes(state.status)) {
     await StateManager.reset();
   }
+  // Periodic memory cleanup — remove stale entries older than 30 days
+  MemoryService.cleanup?.().catch(() => {});
 }
 
 function log(...args) {

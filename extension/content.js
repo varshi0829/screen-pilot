@@ -135,7 +135,8 @@
     lastUserInteractionAt: 0,
     lastTriggerReason: '',
     restoreTriggered: false,
-    confidenceLevel: 'normal'
+    confidenceLevel: 'normal',
+    enterpriseContext: null,   // populated before each Gemini call
   };
 
   // ─── HIGHLIGHTER ────────────────────────────────────────────────────────────
@@ -1025,13 +1026,19 @@
       }
 
       if (!response) {
+        // Collect enterprise context before every Gemini call (refresh on page changes)
+        if (typeof EnterpriseContextService !== 'undefined') {
+          try { state.enterpriseContext = EnterpriseContextService.detect(); } catch (_) {}
+        }
+
         const t0Gemini = performance.now();
         response = await chrome.runtime.sendMessage({
-          type:  messageType,
-          goal:  state.goal,
-          url:   window.location.href,
-          title: document.title,
-          reason
+          type:             messageType,
+          goal:             state.goal,
+          url:              window.location.href,
+          title:            document.title,
+          reason,
+          enterpriseContext: state.enterpriseContext || null,
         });
         PerfTracer.mark('gemini_roundtrip');
         console.log(`[Perf] Gemini+screenshot: ${Math.round(performance.now() - t0Gemini)}ms`);

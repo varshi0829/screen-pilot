@@ -1,7 +1,7 @@
 // ScreenPilot - Popup Script
 
 document.addEventListener('DOMContentLoaded', () => {
-  // ── Tab switching ────────────────────────────────────────────────────────────
+  // ── Tab switching ─────────────────────────────────────────────────────────────
   document.querySelectorAll('.sp-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       const target = tab.dataset.tab;
@@ -11,7 +11,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // ── Launch tab ───────────────────────────────────────────────────────────────
+  // ── Launch tab ────────────────────────────────────────────────────────────────
   const openBtn  = document.getElementById('openWidget');
   const statusEl = document.getElementById('status');
 
@@ -35,6 +35,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // Content script not present — fall through to inject
       }
 
+      // Inject enterprise context service first (sets window.EnterpriseContextService)
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['services/enterprise-context-service.js'] });
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['lib/dom-matcher.js'] });
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
       await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['styles/widget.css'] });
@@ -47,7 +49,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // ── Analytics tab ────────────────────────────────────────────────────────────
+  // ── Analytics tab ─────────────────────────────────────────────────────────────
   document.getElementById('clearAnalytics').addEventListener('click', async () => {
     await chrome.runtime.sendMessage({ type: 'CLEAR_ANALYTICS' });
     loadAnalytics();
@@ -61,15 +63,23 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function renderKPIs(kpis) {
-    setKPI('kpi-plan-success',    kpis.planSuccessRate,    pct, 0.6, 0.4, false);
-    setKPI('kpi-cache-hit',       kpis.cacheHitRate,       pct, 0.3, 0.1, false);
-    setKPI('kpi-gemini-per-task', kpis.geminiCallsPerTask, num, 2,   4,   true);
-    setKPI('kpi-completion',      kpis.taskCompletionRate, pct, 0.7, 0.4, false);
+    // Row 1 — Core navigation efficiency
+    setKPI('kpi-plan-success',    kpis.planSuccessRate,      pct, 0.6,  0.4,  false);
+    setKPI('kpi-cache-hit',       kpis.cacheHitRate,         pct, 0.3,  0.1,  false);
+    setKPI('kpi-gemini-per-task', kpis.geminiCallsPerTask,   num, 2,    4,    true);
+    setKPI('kpi-completion',      kpis.taskCompletionRate,   pct, 0.7,  0.4,  false);
+
+    // Row 2 — Enterprise intelligence & cost avoidance
+    setKPI('kpi-gemini-avoided',  kpis.geminiAvoidanceRate,  pct, 0.4,  0.15, false);
+    setKPI('kpi-recovery',        kpis.recoverySuccessRate,  pct, 0.6,  0.3,  false);
+    setKPI('kpi-enterprise',      kpis.enterpriseDetectionRate, pct, 0.5, 0.2, false);
+    setKPI('kpi-memory-hit',      kpis.memoryHitRate,        pct, 0.2,  0.05, false);
   }
 
-  // Sets a KPI cell. lowerIsBetter reverses the good/warn colour logic.
+  // Colours a KPI cell. lowerIsBetter reverses the good/warn logic.
   function setKPI(id, value, fmt, goodThreshold, warnThreshold, lowerIsBetter) {
     const el = document.getElementById(id);
+    if (!el) return;
     if (value === null || value === undefined) {
       el.textContent = '—';
       el.className = 'sp-kpi-value empty';
@@ -89,15 +99,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const recent = [...tasks].reverse().slice(0, 20);
     list.innerHTML = recent.map(t => {
-      const geminiLabel = `${t.geminiCalls}G`;
-      const planLabel   = t.planGenerated
-        ? ` · ${t.planStepsSucceeded}/${t.planStepsAttempted}p`
-        : '';
+      const geminiLabel   = `${t.geminiCalls}G`;
+      const planLabel     = t.planGenerated ? ` · ${t.planStepsSucceeded}/${t.planStepsAttempted}p` : '';
+      const memoryBadge   = t.memoryHit  ? ' · M' : '';
+      const entBadge      = t.enterpriseApp ? ` · ${escHtml(t.enterpriseApp.slice(0, 8))}` : '';
       return `
         <div class="sp-task-row">
           <div class="sp-task-dot ${t.completionStatus}"></div>
           <div class="sp-task-goal" title="${escHtml(t.goal)}">${escHtml(t.goal)}</div>
-          <div class="sp-task-meta">${geminiLabel}${planLabel}</div>
+          <div class="sp-task-meta">${geminiLabel}${planLabel}${memoryBadge}${entBadge}</div>
         </div>`;
     }).join('');
   }

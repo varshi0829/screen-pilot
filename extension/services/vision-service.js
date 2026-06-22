@@ -12,14 +12,14 @@ export const VisionService = (() => {
 
   // ─── PUBLIC ────────────────────────────────────────────────────────────────
 
-  async function analyzeScreenshot({ screenshot, goal, pageContext = {}, taskState = null }) {
+  async function analyzeScreenshot({ screenshot, goal, pageContext = {}, taskState = null, enterpriseContext = null }) {
     if (!goal?.trim()) {
       return buildError('Enter a goal before starting ScreenPilot.', false);
     }
     if (!screenshot?.success) {
       return buildError(screenshot?.error || 'No screenshot available for analysis.');
     }
-    return _callWithRetry({ screenshot, goal, pageContext, taskState, mode: 'navigate' }, parseVisionResponse);
+    return _callWithRetry({ screenshot, goal, pageContext, taskState, enterpriseContext, mode: 'navigate' }, parseVisionResponse);
   }
 
   // Returns { success, screenContext } — uses existing ScreenContext if caller passes one.
@@ -56,7 +56,7 @@ export const VisionService = (() => {
     return buildError(normalizeError(lastError), isRetryable(lastError));
   }
 
-  async function callBackend({ screenshot, goal, pageContext, taskState, mode = 'navigate' }) {
+  async function callBackend({ screenshot, goal, pageContext, taskState, enterpriseContext, mode = 'navigate' }) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -69,10 +69,11 @@ export const VisionService = (() => {
           'X-Session-ID':  sessionId,
         },
         body: JSON.stringify({
-          screenshot: { image: screenshot.image, mimeType: screenshot.mimeType },
+          screenshot:      { image: screenshot.image, mimeType: screenshot.mimeType },
           goal,
           pageContext,
           taskState,
+          enterpriseContext: enterpriseContext || null,
           mode,
         }),
         signal: controller.signal,

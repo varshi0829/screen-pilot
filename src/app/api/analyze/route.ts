@@ -61,6 +61,14 @@ export async function POST(req: NextRequest) {
     goal: string;
     pageContext?: Record<string, string>;
     taskState?: { completedSteps?: string[]; currentInstruction?: string } | null;
+    enterpriseContext?: {
+      application?: string | null;
+      module?: string | null;
+      workspace?: string | null;
+      pageType?: string;
+      navigationHierarchy?: string[];
+      confidence?: number;
+    } | null;
     mode?: string;
   };
   try {
@@ -69,7 +77,7 @@ export async function POST(req: NextRequest) {
     return json({ error: "Invalid JSON body." }, 400);
   }
 
-  const { screenshot, goal, pageContext = {}, taskState = null, mode: rawMode = "navigate" } = body;
+  const { screenshot, goal, pageContext = {}, taskState = null, enterpriseContext = null, mode: rawMode = "navigate" } = body;
   const mode: Mode = (["navigate", "explain", "ask"] as const).includes(rawMode as Mode)
     ? (rawMode as Mode)
     : "navigate";
@@ -86,7 +94,7 @@ export async function POST(req: NextRequest) {
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mode]}:generateContent`;
   const prompt = mode === "ask"
     ? buildQAPrompt(goal, pageContext)
-    : buildNavigatePrompt(goal, pageContext, taskState);
+    : buildNavigatePrompt(goal, pageContext, taskState, enterpriseContext);
 
   console.log(`[analyze] ${reqId} mode=${mode} model=${MODELS[mode]} session=${sessionId}`);
 
@@ -167,12 +175,33 @@ Rules:
 function buildNavigatePrompt(
   goal: string,
   pageContext: Record<string, string>,
-  taskState: { completedSteps?: string[]; currentInstruction?: string } | null
+  taskState: { completedSteps?: string[]; currentInstruction?: string } | null,
+  enterpriseContext?: {
+    application?: string | null;
+    module?: string | null;
+    workspace?: string | null;
+    pageType?: string;
+    navigationHierarchy?: string[];
+    confidence?: number;
+  } | null
 ): string {
+  // Build enterprise context line — only inject when confidence is sufficient
+  const ec = enterpriseContext;
+  const ecLine = (ec && ec.application && (ec.confidence ?? 0) >= 0.5)
+    ? [
+        ec.application  ? `Enterprise app: ${ec.application}` : "",
+        ec.module       ? `Module: ${ec.module}` : "",
+        ec.workspace    ? `Workspace: ${ec.workspace}` : "",
+        ec.pageType && ec.pageType !== "other" ? `Detected page type: ${ec.pageType}` : "",
+        ec.navigationHierarchy?.length ? `Navigation: ${ec.navigationHierarchy.join(" > ")}` : "",
+      ].filter(Boolean).join(" | ")
+    : "";
+
   const context = [
     `Goal: ${goal}`,
     pageContext.url   ? `URL: ${pageContext.url}` : "",
     pageContext.title ? `Page title: ${pageContext.title}` : "",
+    ecLine || "",
     taskState?.completedSteps?.length
       ? `Completed: ${taskState.completedSteps.join(" → ")}`
       : "",
