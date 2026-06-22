@@ -4,7 +4,8 @@
 export const StateManager = (() => {
   'use strict';
 
-  const STORAGE_KEY = 'screenpilotTaskState';
+  const STORAGE_KEY  = 'screenpilotTaskState';
+  const MAX_HISTORY  = 20;   // cap prevents unbounded session storage growth
   let currentState = null;
 
   function createTask(goal) {
@@ -19,6 +20,7 @@ export const StateManager = (() => {
       currentTarget: null,
       currentConfidence: 0,
       screenContext: null,
+      taskPlan: null,
       currentPage: {
         url: '',
         title: ''
@@ -56,6 +58,10 @@ export const StateManager = (() => {
     if (analysis.screenContext) {
       currentState.screenContext = analysis.screenContext;
     }
+    // Always replace the plan when Gemini returns a new one (re-plan on REANALYZE)
+    if (analysis.taskPlan) {
+      currentState.taskPlan = analysis.taskPlan;
+    }
     currentState.lastScreenshotTimestamp = screenshotTimestamp || currentState.lastScreenshotTimestamp;
     currentState.currentPage = {
       url: pageContext.url || currentState.currentPage.url || '',
@@ -70,6 +76,10 @@ export const StateManager = (() => {
       screenshotTimestamp: currentState.lastScreenshotTimestamp,
       timestamp: Date.now()
     });
+    // Cap history to prevent unbounded session storage growth
+    if (currentState.history.length > MAX_HISTORY) {
+      currentState.history = currentState.history.slice(-MAX_HISTORY);
+    }
     currentState.updatedAt = Date.now();
     delete currentState.error;
     delete currentState.abortReason;
@@ -152,6 +162,45 @@ export const StateManager = (() => {
     return currentState?.status === 'ACTIVE';
   }
 
+  // Called by content.js when a plan step is executed locally (no Gemini call).
+  // Advances the plan index and records the step in completedSteps/history.
+  function advancePlanStep(stepIndex, instruction) {
+    if (!currentState) return null;
+
+    const plan = currentState.taskPlan;
+    if (plan) {
+      // Mark the step we just finished as done
+      const prevIdx = plan.currentStepIndex;
+      if (prevIdx >= 0 && prevIdx < plan.steps.length) {
+        plan.steps[prevIdx].status = 'done';
+      }
+      plan.currentStepIndex = stepIndex;
+    }
+
+    if (
+      currentState.currentInstruction &&
+      currentState.completedSteps[currentState.completedSteps.length - 1] !== currentState.currentInstruction
+    ) {
+      currentState.completedSteps.push(currentState.currentInstruction);
+    }
+
+    currentState.currentStep += 1;
+    currentState.currentInstruction = instruction;
+    currentState.updatedAt = Date.now();
+
+    currentState.history.push({
+      step: currentState.currentStep,
+      instruction,
+      source: 'plan',
+      timestamp: Date.now()
+    });
+    if (currentState.history.length > MAX_HISTORY) {
+      currentState.history = currentState.history.slice(-MAX_HISTORY);
+    }
+
+    return persistAndReturn();
+  }
+
   async function persistAndReturn() {
     await chrome.storage.session.set({
       [STORAGE_KEY]: currentState
@@ -164,6 +213,7 @@ export const StateManager = (() => {
     createTask,
     getState,
     updateFromAnalysis,
+    advancePlanStep,
     complete,
     fail,
     abort,

@@ -6,12 +6,15 @@
   console.log('[Content] File loaded');
 
   const DEBUG = false;
-  const LOW_CONFIDENCE_THRESHOLD   = 0.5;
+  const LOW_CONFIDENCE_THRESHOLD    = 0.5;
   const WARNING_CONFIDENCE_THRESHOLD = 0.8;
-  const REANALYZE_DEBOUNCE_MS  = 1200;
+  const REANALYZE_DEBOUNCE_MS   = 1200;
   const CLICK_REANALYZE_DELAY_MS = 900;
   const MATCH_HARD_FLOOR   = 40;   // scores below this are noise regardless of context
   const AMBIGUITY_DELTA    = 5;    // winner vs runner-up gap below this → flag ambiguous
+  // Minimum DOM match score to trust a plan step without a Gemini call.
+  // Higher than MATCH_HARD_FLOOR — we're skipping Gemini so we need more confidence.
+  const PLAN_STEP_MIN_SCORE = 70;
 
   // Stage definitions for progressive loading UI
   const STAGES = ['understanding', 'capturing', 'analyzing', 'matching'];
@@ -246,7 +249,16 @@
         childList: true,
         subtree: true,
         attributes: true,
-        characterData: false
+        characterData: false,
+        // Only watch attributes that signal meaningful UI state changes.
+        // Omitting class, style, data-*, aria-busy prevents thousands of
+        // animation/counter/loading-state mutations from triggering re-analysis.
+        attributeFilter: [
+          'hidden', 'disabled', 'aria-disabled', 'aria-hidden',
+          'aria-expanded', 'aria-selected', 'aria-checked',
+          'aria-invalid', 'aria-current', 'aria-pressed',
+          'href', 'src', 'value', 'open', 'checked', 'selected'
+        ],
       });
 
       window.addEventListener('popstate',   this.handleUrlChange, true);
@@ -284,6 +296,83 @@
       }, REANALYZE_DEBOUNCE_MS);
     }
   };
+
+  // ─── PLAN EXECUTOR ──────────────────────────────────────────────────────────
+  // DOM-first step execution. When a TaskPlan exists, tries to find the next
+  // expected element in the live DOM without calling Gemini.
+  // Falls back to full REANALYZE if the element cannot be found or scored too low.
+
+  function tryPlanStep() {
+    const plan = state.currentTaskState?.taskPlan;
+    if (!plan?.steps?.length) return null;
+
+    const nextIdx = plan.currentStepIndex + 1;
+    if (nextIdx >= plan.steps.length) return null;
+
+    const step = plan.steps[nextIdx];
+    if (!step?.expectedElement?.text) return null;
+    if (step.status === 'done') return null;
+
+    const match = DOMMatcher.matchElement(step.expectedElement);
+    if (!match?.element || match.score < PLAN_STEP_MIN_SCORE) {
+      console.log(`[Plan] Step ${nextIdx} not found — score ${match?.score ?? 'n/a'} < ${PLAN_STEP_MIN_SCORE}, falling back to Gemini`);
+      return null;
+    }
+
+    console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
+    return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
+  }
+
+  async function executePlanStep({ element, step, stepIndex, matchScore }) {
+    PerfTracer.begin(state.goal);
+    PerfTracer.mark('plan_dom_match');
+
+    // Notify background to advance plan state — lightweight, no Gemini call
+    let response = null;
+    try {
+      response = await chrome.runtime.sendMessage({
+        type: 'ADVANCE_PLAN_STEP',
+        stepIndex,
+        instruction: step.description,
+      });
+    } catch (err) {
+      console.warn('[Plan] ADVANCE_PLAN_STEP failed:', err?.message);
+    }
+
+    if (!response?.success) {
+      // Background rejected the advance — fall back to full reanalysis
+      console.warn('[Plan] Background rejected plan advance, falling back to Gemini');
+      state.awaitingUpdate = false;
+      requestAnalysis('REANALYZE', 'plan-advance-rejected');
+      return;
+    }
+
+    state.highlightedElement = element;
+    const highlighted = await Highlighter.show(element, step.description);
+    PerfTracer.mark('highlight');
+
+    if (!highlighted) {
+      // Element exists in DOM but is off-screen or not actionable — fall back
+      console.warn('[Plan] Plan step element not highlightable, falling back to Gemini');
+      state.highlightedElement = null;
+      state.awaitingUpdate = false;
+      requestAnalysis('REANALYZE', 'plan-step-not-visible');
+      return;
+    }
+
+    // Commit state after successful highlight
+    state.currentTaskState   = response.state || state.currentTaskState;
+    state.currentAction      = { instruction: step.description, targetElement: step.expectedElement };
+    state.confidenceLevel    = matchScore >= 100 ? 'normal' : matchScore >= 70 ? 'warning' : 'low';
+    state.lastReanalysisAt   = Date.now();
+    state.awaitingUpdate     = false;
+    state.requestInFlight    = false;
+
+    setStatus('HIGHLIGHTING', step.description);
+    PageObserver.start();
+    PerfTracer.report();
+    renderProgressPanel();
+  }
 
   // ─── UNIVERSAL PLANNER ──────────────────────────────────────────────────────
   // Data-driven element selection. Zero site-specific logic.
@@ -931,6 +1020,22 @@
     if (state.status === 'ERROR') {
       console.log('[PageObserver] Ignoring change because workflow has an error');
       return;
+    }
+
+    // On click: try the next plan step in the DOM before calling Gemini.
+    // If found with sufficient confidence, execute locally and skip the round-trip.
+    if (reason === 'Click detected') {
+      const planStep = tryPlanStep();
+      if (planStep) {
+        state.awaitingUpdate     = true;
+        state.requestInFlight    = true;
+        state.highlightedElement = null;
+        state.lastTriggerReason  = reason;
+        Highlighter.clear();
+        setStatus('ANALYZING', 'Following plan…');
+        executePlanStep(planStep);
+        return;
+      }
     }
 
     state.awaitingUpdate   = true;

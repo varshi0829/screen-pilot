@@ -186,7 +186,14 @@ Return ONLY valid JSON (no markdown fences, no extra text):
   ],
   "targetElement": { "text": "text of best candidate", "type": "button|link|input|menu" },
   "instruction": "short user-facing instruction (e.g. Click 'Save Changes')",
-  "confidence": 0.95
+  "confidence": 0.95,
+  "plan": [
+    {
+      "id": 1,
+      "description": "short action label visible to the user (e.g. 'Click New Issue')",
+      "expectedElement": { "text": "exact visible text of the element", "type": "button|link|input|menu", "region": "one of the 8 region types" }
+    }
+  ]
 }
 
 Rules:
@@ -197,5 +204,8 @@ Rules:
 - Match element text EXACTLY as shown in the UI — copy verbatim.
 - Never repeat a completed step.
 - If the task is already complete: set currentStep to "Task complete", targetElement.text to "", confidence to 1.
-- If no clear next action is visible: leave targetElement.text empty, set confidence below 0.4.`;
+- If no clear next action is visible: leave targetElement.text empty, set confidence below 0.4.
+- For "plan": include 1–6 steps predicting ALL actions needed to complete the goal from the current screen.
+  Step 1 must match the current instruction. Include only steps you can predict with reasonable confidence.
+  Omit steps that depend on unknown future UI state. Use the same element text format as candidates.`;
 }

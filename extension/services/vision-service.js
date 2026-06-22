@@ -97,8 +97,9 @@ export const VisionService = (() => {
       }
 
       const screenContext = ScreenContextService.buildScreenContext(parsed);
+      const taskPlan = buildTaskPlan(parsed);
 
-      return { success: true, ...normalized, screenContext, raw: parsed };
+      return { success: true, ...normalized, screenContext, taskPlan, raw: parsed };
     } catch (err) {
       return buildError(`Could not parse response: ${err.message}`);
     }
@@ -142,6 +143,37 @@ export const VisionService = (() => {
       instruction:   typeof result?.instruction === 'string' ? result.instruction.trim() : '',
       confidence,
       complete: result?.currentStep === 'Task complete' || result?.instruction === 'Task complete',
+    };
+  }
+
+  function buildTaskPlan(raw) {
+    if (!Array.isArray(raw?.plan) || !raw.plan.length) return null;
+
+    const VALID_TYPES   = ['button', 'link', 'input', 'menu'];
+    const VALID_REGIONS = ['top_navigation','side_navigation','main_content','toolbar',
+                           'modal','dropdown','form','footer'];
+
+    const steps = raw.plan
+      .filter(s => typeof s?.description === 'string' && s.description.trim())
+      .map((s, i) => ({
+        id:              Number.isFinite(Number(s.id)) ? Number(s.id) : (i + 1),
+        description:     s.description.trim(),
+        expectedElement: {
+          text:   typeof s.expectedElement?.text === 'string' ? s.expectedElement.text.trim() : '',
+          type:   VALID_TYPES.includes(s.expectedElement?.type) ? s.expectedElement.type : 'button',
+          region: VALID_REGIONS.includes(s.expectedElement?.region) ? s.expectedElement.region : 'main_content',
+        },
+        status: 'pending',
+      }))
+      .filter(s => s.expectedElement.text);  // drop steps with no matchable element
+
+    if (!steps.length) return null;
+
+    return {
+      steps,
+      currentStepIndex: 0,
+      planVersion:      1,
+      createdAt:        Date.now(),
     };
   }
 

@@ -29,6 +29,8 @@ async function handleMessage(message, sender) {
       return analyzeGoal(message, sender);
     case 'REANALYZE':
       return reanalyzeGoal(message, sender);
+    case 'ADVANCE_PLAN_STEP':
+      return advancePlanStep(message);
     case 'GET_STATE':
       return { success: true, state: StateManager.getState() };
     case 'COMPLETE_TASK':
@@ -136,6 +138,15 @@ function buildSuccessResponse(analysis, complete) {
     screenContext:  analysis.screenContext || null,
     state:          StateManager.getState(),
   };
+}
+
+async function advancePlanStep(message) {
+  const taskState = StateManager.getState();
+  if (!taskState || taskState.status !== 'ACTIVE') {
+    return { success: false, error: 'No active task.' };
+  }
+  const state = await StateManager.advancePlanStep(message.stepIndex, message.instruction);
+  return { success: true, state };
 }
 
 function buildPageContext(message, fallback = {}) {
