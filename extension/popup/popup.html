@@ -4,29 +4,48 @@
   <meta charset="UTF-8">
   <title>ScreenPilot</title>
   <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 300px;
-      padding: 20px;
+      width: 340px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      margin: 0;
+      color: #111827;
     }
-    h1 {
-      font-size: 18px;
-      margin: 0 0 16px 0;
+
+    /* ── Tab bar ── */
+    .sp-tabs {
       display: flex;
-      align-items: center;
-      gap: 8px;
+      border-bottom: 1px solid #e5e7eb;
     }
+    .sp-tab {
+      flex: 1;
+      padding: 10px 0;
+      background: none;
+      border: none;
+      font-size: 13px;
+      font-weight: 500;
+      color: #6b7280;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .sp-tab.active { color: #111827; border-bottom-color: #111827; }
+    .sp-tab:hover:not(.active) { color: #374151; }
+
+    /* ── Tab panels ── */
+    .sp-panel { padding: 18px; display: none; }
+    .sp-panel.active { display: block; }
+
+    /* ── Launch panel ── */
     .status {
-      padding: 12px;
+      padding: 11px 13px;
       background: #f3f4f6;
       border-radius: 8px;
       font-size: 13px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
     .status.ready { background: #ecfdf5; color: #059669; }
     .status.error { background: #fef2f2; color: #dc2626; }
-    button {
+    .sp-btn-launch {
       width: 100%;
       padding: 10px;
       background: #111827;
@@ -37,13 +56,131 @@
       font-weight: 500;
       cursor: pointer;
     }
-    button:hover { background: #374151; }
+    .sp-btn-launch:hover { background: #374151; }
+
+    /* ── Analytics panel ── */
+    .sp-kpi-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .sp-kpi {
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .sp-kpi-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: #111827;
+      line-height: 1.2;
+    }
+    .sp-kpi-value.good  { color: #059669; }
+    .sp-kpi-value.warn  { color: #d97706; }
+    .sp-kpi-value.empty { color: #9ca3af; font-size: 16px; }
+    .sp-kpi-label { font-size: 11px; color: #6b7280; margin-top: 2px; }
+
+    .sp-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .sp-section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .sp-btn-clear {
+      font-size: 11px;
+      color: #9ca3af;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 2px 4px;
+    }
+    .sp-btn-clear:hover { color: #ef4444; }
+
+    .sp-tasks-list { max-height: 200px; overflow-y: auto; }
+    .sp-task-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 0;
+      border-bottom: 1px solid #f3f4f6;
+      font-size: 12px;
+    }
+    .sp-task-row:last-child { border-bottom: none; }
+    .sp-task-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .sp-task-dot.completed { background: #10b981; }
+    .sp-task-dot.failed    { background: #ef4444; }
+    .sp-task-dot.aborted   { background: #9ca3af; }
+    .sp-task-dot.active    { background: #3b82f6; }
+    .sp-task-goal {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #374151;
+    }
+    .sp-task-meta { color: #9ca3af; white-space: nowrap; }
+    .sp-no-data {
+      text-align: center;
+      padding: 24px 0;
+      color: #9ca3af;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
-  <h1>📍 ScreenPilot</h1>
-  <div class="status ready" id="status">Ready - Open ScreenPilot on the current page</div>
-  <button id="openWidget">Open ScreenPilot</button>
+  <div class="sp-tabs">
+    <button class="sp-tab active" data-tab="launch">Launch</button>
+    <button class="sp-tab" data-tab="analytics">Analytics</button>
+  </div>
+
+  <div class="sp-panel active" id="panel-launch">
+    <div class="status ready" id="status">Ready — open ScreenPilot on the current page</div>
+    <button class="sp-btn-launch" id="openWidget">Open ScreenPilot</button>
+  </div>
+
+  <div class="sp-panel" id="panel-analytics">
+    <div class="sp-kpi-grid">
+      <div class="sp-kpi">
+        <div class="sp-kpi-value empty" id="kpi-plan-success">—</div>
+        <div class="sp-kpi-label">Plan Success Rate</div>
+      </div>
+      <div class="sp-kpi">
+        <div class="sp-kpi-value empty" id="kpi-cache-hit">—</div>
+        <div class="sp-kpi-label">Cache Hit Rate</div>
+      </div>
+      <div class="sp-kpi">
+        <div class="sp-kpi-value empty" id="kpi-gemini-per-task">—</div>
+        <div class="sp-kpi-label">Gemini / Task</div>
+      </div>
+      <div class="sp-kpi">
+        <div class="sp-kpi-value empty" id="kpi-completion">—</div>
+        <div class="sp-kpi-label">Task Completion</div>
+      </div>
+    </div>
+
+    <div class="sp-section-header">
+      <span class="sp-section-title">Recent Tasks</span>
+      <button class="sp-btn-clear" id="clearAnalytics">Clear all</button>
+    </div>
+    <div class="sp-tasks-list" id="tasksList">
+      <div class="sp-no-data">No tasks recorded yet</div>
+    </div>
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

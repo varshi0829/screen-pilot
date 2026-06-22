@@ -10,6 +10,7 @@ export const StateManager = (() => {
 
   function createTask(goal) {
     currentState = {
+      taskId: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
       goal,
       currentStep: 0,
       completedSteps: [],

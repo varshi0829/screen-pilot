@@ -316,6 +316,7 @@
     const match = DOMMatcher.matchElement(step.expectedElement);
     if (!match?.element || match.score < PLAN_STEP_MIN_SCORE) {
       console.log(`[Plan] Step ${nextIdx} not found — score ${match?.score ?? 'n/a'} < ${PLAN_STEP_MIN_SCORE}, falling back to Gemini`);
+      chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_FAILED' }).catch(() => {});
       return null;
     }
 
@@ -817,6 +818,7 @@
         if (cached) {
           response = cached;
           PerfTracer.mark('cache_hit');
+          chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'CACHE_HIT' }).catch(() => {});
         }
       }
 

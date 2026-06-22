@@ -1,6 +1,7 @@
 import { ScreenshotService } from './services/screenshot-service.js';
 import { StateManager } from './services/state-manager.js';
 import { VisionService } from './services/vision-service.js';
+import { TelemetryService } from './services/telemetry-service.js';
 
 const DEBUG = false;
 
@@ -34,12 +35,16 @@ async function handleMessage(message, sender) {
     case 'GET_STATE':
       return { success: true, state: StateManager.getState() };
     case 'COMPLETE_TASK':
-      await StateManager.complete(message.message || 'Task complete');
-      return { success: true, state: StateManager.getState() };
+      return completeTask(message);
     case 'ABORT_TASK':
-      await StateManager.abort(message.reason || 'User cancelled');
-      activeAnalysis = null;
-      return { success: true, state: StateManager.getState() };
+      return abortTask(message);
+    case 'TELEMETRY_EVENT':
+      return handleTelemetryEvent(message);
+    case 'GET_ANALYTICS':
+      return { success: true, analytics: await TelemetryService.getAnalytics() };
+    case 'CLEAR_ANALYTICS':
+      await TelemetryService.clear();
+      return { success: true };
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
@@ -47,6 +52,8 @@ async function handleMessage(message, sender) {
 
 async function analyzeGoal(message, sender) {
   await StateManager.createTask(message.goal);
+  const taskId = StateManager.getState().taskId;
+  TelemetryService.startTask(taskId, message.goal);
   activeAnalysis = null;
   return queueVisionCycle({
     sender,
@@ -61,6 +68,11 @@ async function reanalyzeGoal(message, sender) {
   const taskState = StateManager.getState();
   if (!taskState?.goal || taskState.status !== 'ACTIVE') {
     return { success: false, error: 'No active ScreenPilot task to continue.' };
+  }
+  // Detect plan fallbacks: plan step failed in DOM and fell through to Gemini
+  const isPlanFallback = typeof message.reason === 'string' && message.reason.startsWith('plan-');
+  if (isPlanFallback && taskState.taskId) {
+    TelemetryService.recordFallback(taskState.taskId);
   }
   return queueVisionCycle({
     sender,
@@ -88,7 +100,8 @@ function queueVisionCycle({ sender, goal, pageContext, reason, forceNew }) {
 }
 
 async function runVisionCycle({ goal, sender, pageContext, reason }) {
-  const t0 = Date.now();
+  const t0     = Date.now();
+  const taskId = StateManager.getState()?.taskId;
   log('cycle start — reason:', reason);
 
   const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
@@ -97,6 +110,7 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) {
     await StateManager.fail(validation.error);
+    if (taskId) TelemetryService.completeTask(taskId, 'failed', validation.error);
     return { success: false, error: validation.error, state: StateManager.getState() };
   }
 
@@ -107,15 +121,26 @@ async function runVisionCycle({ goal, sender, pageContext, reason }) {
     pageContext,
     taskState: StateManager.getState(),
   });
-  log(`analysis: ${Date.now() - tAnalyze}ms | success: ${analysis.success}`);
+  const geminiLatencyMs = Date.now() - tAnalyze;
+  log(`analysis: ${geminiLatencyMs}ms | success: ${analysis.success}`);
+
+  if (taskId) {
+    TelemetryService.recordGeminiCall(taskId, { latencyMs: geminiLatencyMs, success: analysis.success });
+  }
 
   if (!analysis.success) {
     await StateManager.fail(analysis.error);
+    if (taskId) TelemetryService.completeTask(taskId, 'failed', analysis.error);
     return { success: false, error: analysis.error, retryable: analysis.retryable, state: StateManager.getState() };
+  }
+
+  if (taskId && analysis.taskPlan?.steps?.length) {
+    TelemetryService.recordPlanGenerated(taskId, analysis.taskPlan.steps.length);
   }
 
   if (analysis.complete) {
     await StateManager.complete(analysis.instruction || 'Task complete');
+    if (taskId) TelemetryService.completeTask(taskId, 'completed', 'task-complete');
     return buildSuccessResponse(analysis, true);
   }
 
@@ -146,7 +171,41 @@ async function advancePlanStep(message) {
     return { success: false, error: 'No active task.' };
   }
   const state = await StateManager.advancePlanStep(message.stepIndex, message.instruction);
+  // Succeeded: counts as one attempt + one success
+  if (taskState.taskId) TelemetryService.recordPlanStep(taskState.taskId, true);
   return { success: true, state };
+}
+
+async function completeTask(message) {
+  const taskState = StateManager.getState();
+  await StateManager.complete(message.message || 'Task complete');
+  if (taskState?.taskId) {
+    TelemetryService.completeTask(taskState.taskId, 'completed', 'user-marked-complete');
+  }
+  return { success: true, state: StateManager.getState() };
+}
+
+async function abortTask(message) {
+  const taskState = StateManager.getState();
+  await StateManager.abort(message.reason || 'User cancelled');
+  if (taskState?.taskId) {
+    TelemetryService.completeTask(taskState.taskId, 'aborted', message.reason || 'user-cancelled');
+  }
+  activeAnalysis = null;
+  return { success: true, state: StateManager.getState() };
+}
+
+function handleTelemetryEvent(message) {
+  const taskId = StateManager.getState()?.taskId;
+  switch (message.event) {
+    case 'CACHE_HIT':
+      TelemetryService.recordCacheHit().catch(() => {});
+      break;
+    case 'PLAN_STEP_FAILED':
+      if (taskId) TelemetryService.recordPlanStep(taskId, false);
+      break;
+  }
+  return { success: true };
 }
 
 function buildPageContext(message, fallback = {}) {
