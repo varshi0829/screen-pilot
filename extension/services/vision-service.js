@@ -4,7 +4,7 @@
 export const VisionService = (() => {
   'use strict';
 
-  const BACKEND_URL = 'https://screen-pilot.vercel.app/api/analyze';
+  const BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
   const MAX_ATTEMPTS = 2;
 
