@@ -4,20 +4,25 @@ const GEMINI_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX = 12;
+const RATE_MAX = 100; // DEV: raised from 12 — restore before public launch
 
 // In-memory store — resets on cold start, sufficient for hackathon
 const sessions = new Map<string, { count: number; resetAt: number }>();
 
-function allowRequest(sessionId: string): boolean {
+function allowRequest(sessionId: string, reqId: string): boolean {
   const now = Date.now();
   const s = sessions.get(sessionId);
   if (!s || now > s.resetAt) {
     sessions.set(sessionId, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=1/${RATE_MAX} window_resets=${new Date(now + RATE_WINDOW_MS).toISOString()}`);
     return true;
   }
-  if (s.count >= RATE_MAX) return false;
+  if (s.count >= RATE_MAX) {
+    console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX} resets_at=${new Date(s.resetAt).toISOString()}`);
+    return false;
+  }
   s.count++;
+  console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=${s.count}/${RATE_MAX}`);
   return true;
 }
 
@@ -37,14 +42,16 @@ export async function OPTIONS() {
 }
 
 export async function POST(req: NextRequest) {
+  const reqId = crypto.randomUUID().slice(0, 8);
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
+    console.error(`[analyze] ${reqId} GEMINI_API_KEY not set`);
     return json({ error: "Service not configured." }, 500);
   }
 
   const sessionId = req.headers.get("x-session-id") ?? "anon";
-  if (!allowRequest(sessionId)) {
-    return json({ error: "Rate limit: 12 requests/minute per session." }, 429);
+  if (!allowRequest(sessionId, reqId)) {
+    return json({ error: `Rate limit: ${RATE_MAX} requests/minute per session.` }, 429);
   }
 
   let body: {
@@ -85,7 +92,7 @@ export async function POST(req: NextRequest) {
         ],
         generationConfig: {
           temperature: 0.2,
-          maxOutputTokens: 1024,
+          maxOutputTokens: 2048,
           thinkingConfig: { thinkingBudget: 0 },
         },
       }),
@@ -93,20 +100,24 @@ export async function POST(req: NextRequest) {
     });
 
     if (!upstream.ok) {
+      const errBody = await upstream.json().catch(() => null);
+      console.error(`[analyze] ${reqId} gemini_status=${upstream.status} session=${sessionId} body=${JSON.stringify(errBody)}`);
       if (upstream.status === 429) {
-        return json({ error: "Service busy — please retry in a moment." }, 429);
+        return json({ error: "Service busy — please retry in a moment.", source: "gemini" }, 429);
       }
       return json({ error: `Upstream error ${upstream.status}.` }, 502);
     }
 
     const data = await upstream.json();
+    console.log(`[analyze] ${reqId} gemini_status=200 session=${sessionId}`);
     return NextResponse.json(data, { headers: CORS_HEADERS });
   } catch (err: unknown) {
     const name = (err as Error).name;
     if (name === "TimeoutError" || name === "AbortError") {
+      console.error(`[analyze] ${reqId} gemini_timeout session=${sessionId}`);
       return json({ error: "Analysis timed out — please try again." }, 504);
     }
-    console.error("[analyze] internal error:", err);
+    console.error(`[analyze] ${reqId} internal_error session=${sessionId}`, err);
     return json({ error: "Internal server error." }, 500);
   }
 }
@@ -154,7 +165,13 @@ Classify each element's UI region using ONLY these generic region types:
 
 Return ONLY valid JSON (no markdown fences, no extra text):
 {
-  "screenSummary": "brief description of the visible application and its current state",
+  "application": "name of the application or website visible (e.g. GitHub, Gmail, Notion, VS Code Web, Jira, Google Docs). Use 'Unknown' if unclear.",
+  "pageType": "one of: list|detail|form|dashboard|editor|settings|login|search|media|conversation|empty|error|other",
+  "screenSummary": "1-2 sentence description of what is currently visible and the application state",
+  "visibleActions": ["up to 5 short labels of the most prominent actions a user could take on this screen, regardless of the current goal"],
+  "importantElements": [
+    { "label": "visible label or name of a notable UI area", "description": "one sentence on its purpose" }
+  ],
   "currentRegion": "the most relevant generic region type currently visible",
   "currentStep": "description of the next step toward the goal",
   "candidates": [
@@ -174,9 +191,9 @@ Return ONLY valid JSON (no markdown fences, no extra text):
 
 Rules:
 - Return JSON only. No markdown, no commentary outside the JSON.
-- Never reference website names, brand names, or domain-specific terminology.
 - Reason from: visual layout, element roles, semantic match to goal, standard UI conventions.
 - List up to 5 candidates in descending order of relevance to the goal.
+- List up to 5 visibleActions and up to 5 importantElements.
 - Match element text EXACTLY as shown in the UI — copy verbatim.
 - Never repeat a completed step.
 - If the task is already complete: set currentStep to "Task complete", targetElement.text to "", confidence to 1.

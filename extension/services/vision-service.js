@@ -1,6 +1,8 @@
 // ScreenPilot - Vision Service
 // Sends screenshot + goal to the ScreenPilot backend; backend holds the API key.
 
+import { ScreenContextService } from './screen-context.js';
+
 export const VisionService = (() => {
   'use strict';
 
@@ -94,7 +96,9 @@ export const VisionService = (() => {
         normalized.targetElement = { text: c.text, type: c.elementType || 'button' };
       }
 
-      return { success: true, ...normalized, raw: parsed };
+      const screenContext = ScreenContextService.buildScreenContext(parsed);
+
+      return { success: true, ...normalized, screenContext, raw: parsed };
     } catch (err) {
       return buildError(`Could not parse response: ${err.message}`);
     }

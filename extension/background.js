@@ -133,6 +133,7 @@ function buildSuccessResponse(analysis, complete) {
     candidates:     analysis.candidates || [],
     instruction:    analysis.instruction,
     confidence:     analysis.confidence,
+    screenContext:  analysis.screenContext || null,
     state:          StateManager.getState(),
   };
 }

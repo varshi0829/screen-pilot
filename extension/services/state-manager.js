@@ -18,6 +18,7 @@ export const StateManager = (() => {
       currentScreenSummary: '',
       currentTarget: null,
       currentConfidence: 0,
+      screenContext: null,
       currentPage: {
         url: '',
         title: ''
@@ -52,6 +53,9 @@ export const StateManager = (() => {
     currentState.currentScreenSummary = analysis.screenSummary;
     currentState.currentTarget = analysis.targetElement;
     currentState.currentConfidence = analysis.confidence;
+    if (analysis.screenContext) {
+      currentState.screenContext = analysis.screenContext;
+    }
     currentState.lastScreenshotTimestamp = screenshotTimestamp || currentState.lastScreenshotTimestamp;
     currentState.currentPage = {
       url: pageContext.url || currentState.currentPage.url || '',
