@@ -1,0 +1,28 @@
+
+> screenpilot-landing@0.1.0 dev
+> next dev
+
+   ▲ Next.js 15.5.19
+   - Local:        http://localhost:3000
+   - Network:      http://192.168.19.75:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 2.4s
+ ○ Compiling /api/analyze ...
+ ✓ Compiled /api/analyze in 781ms (296 modules)
+[analyze] 88d83489 key_fingerprint=AIzaSyDA...8Buw
+[analyze] 88d83489 rate=PASS session=anon count=1/100
+[analyze] 88d83489 mode=navigate model=gemini-2.5-flash session=anon
+[analyze] 88d83489 gemini_status=400 body={"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"generativelanguage.googleapis.com"}},{"@type":"type.googleapis.com/google.rpc.LocalizedMessage","locale":"en-US","message":"API key not valid. Please pass a valid API key."}]}}
+ POST /api/analyze 502 in 1411ms
+ ✓ Compiled in 26ms
+ ✓ Compiled /api/analyze in 140ms (102 modules)
+[analyze] d63ea7eb key_fingerprint=AIzaSyDA...8Buw
+[analyze] d63ea7eb rate=PASS session=anon count=1/100
+[analyze] d63ea7eb mode=navigate model=gemini-2.5-flash session=anon prompt_len=3649 image_len=96
+[analyze] d63ea7eb gemini_status=400 body={"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"generativelanguage.googleapis.com"}},{"@type":"type.googleapis.com/google.rpc.LocalizedMessage","locale":"en-US","message":"API key not valid. Please pass a valid API key."}]}}
+ POST /api/analyze 502 in 564ms
+   Reload env: .env.local
+ ✓ Compiled in 64ms (194 modules)
+[?25h

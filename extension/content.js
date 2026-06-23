@@ -293,7 +293,7 @@
     queueChange(reason) {
       if (!state.goal || state.awaitingUpdate || state.requestInFlight) return;
       if (state.status === 'COMPLETE' || state.status === 'ERROR') return;
-      if (state.status === 'HIGHLIGHTING' && reason === 'Page updated') return;
+      if (state.status === 'HIGHLIGHTING') { console.log(`[Guard] queueChange blocked: HIGHLIGHTING, reason=${reason}`); return; }
 
       const now = Date.now();
       if (now - state.lastReanalysisAt < REANALYZE_DEBOUNCE_MS) return;
@@ -410,6 +410,7 @@
     if (!response?.success) {
       // Background rejected the advance — fall back to full reanalysis
       console.warn('[Plan] Background rejected plan advance, falling back to Gemini');
+      state.requestInFlight = false;
       state.awaitingUpdate = false;
       requestAnalysis('REANALYZE', 'plan-advance-rejected');
       return;
@@ -423,6 +424,7 @@
       // Element exists in DOM but is off-screen or not actionable — fall back
       console.warn('[Plan] Plan step element not highlightable, falling back to Gemini');
       state.highlightedElement = null;
+      state.requestInFlight = false;
       state.awaitingUpdate = false;
       requestAnalysis('REANALYZE', 'plan-step-not-visible');
       return;
@@ -1058,6 +1060,7 @@
         }
 
         state.geminiCallCount++;
+        console.log(`[CALL #${++_geminiCallSeq}] reason=${messageType === 'ANALYZE_GOAL' ? 'goal_submit' : reason || 'reanalyze'}`);
         _emitDebug('GEMINI_CALL', { callNumber: state.geminiCallCount, mode: messageType === 'ANALYZE_GOAL' ? 'navigate' : 'reanalyze' });
 
         const t0Gemini = performance.now();
@@ -1100,6 +1103,15 @@
       if (!response?.success) {
         hideStages();
         setStatus('ERROR', response?.error || 'ScreenPilot could not analyze this page.');
+        state.requestInFlight = false;
+        state.awaitingUpdate = false;
+        return;
+      }
+
+      // Handle blocker response from 8-step architecture
+      if (response.blocked || response.error?.includes('Sign in') || response.error?.includes('sign in')) {
+        hideStages();
+        setStatus('BLOCKED', response.error || 'Action blocked.');
         state.requestInFlight = false;
         state.awaitingUpdate = false;
         return;
@@ -1262,6 +1274,8 @@
 
   // ─── TRIGGER REANALYSIS ─────────────────────────────────────────────────────
 
+  let _geminiCallSeq = 0;
+
   function triggerReanalysis(reason) {
     if (!state.goal || state.awaitingUpdate || state.requestInFlight) return;
     if (state.status === 'COMPLETE') {
@@ -1270,6 +1284,14 @@
     }
     if (state.status === 'ERROR') {
       console.log('[PageObserver] Ignoring change because workflow has an error');
+      return;
+    }
+
+    // ── Guard: while HIGHLIGHTING, only explicit clicks on the highlighted
+    //    element may advance the workflow.  Focus/input/URL/mutation events
+    //    must NEVER trigger a Gemini call during HIGHLIGHTING.
+    if (state.status === 'HIGHLIGHTING' && reason !== 'Click detected') {
+      console.log(`[Guard] triggerReanalysis blocked: HIGHLIGHTING, reason=${reason}`);
       return;
     }
 
@@ -1300,10 +1322,7 @@
     setStatus('OBSERVING', `${reason}. Re-checking…`);
     log('Reanalysis triggered:', reason);
     clearTimeout(state.reanalyzeTimer);
-    state.reanalyzeTimer = setTimeout(
-      () => requestAnalysis('REANALYZE', reason),
-      CLICK_REANALYZE_DELAY_MS
-    );
+    state.reanalyzeTimer = setTimeout(() => requestAnalysis('REANALYZE', reason), CLICK_REANALYZE_DELAY_MS);
   }
 
   // ─── CLICK HANDLER ──────────────────────────────────────────────────────────

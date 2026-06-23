@@ -52,7 +52,22 @@ async function handleMessage(message, sender) {
 
 // ─── NAVIGATION ──────────────────────────────────────────────────────────────
 
+let _bgCallSeq = 0;
+
 async function analyzeGoal(message, sender) {
+  // If this is a recursive call from _buildMemoryResponse (empty workflow),
+  // skip the memory check to prevent infinite loops.
+  if (message._skipMemory) {
+    return queueVisionCycle({
+      sender,
+      goal:             message.goal,
+      pageContext:      buildPageContext(message),
+      enterpriseContext: message.enterpriseContext || null,
+      reason:           'initial-analysis',
+      forceNew:         true,
+    });
+  }
+
   await StateManager.createTask(message.goal);
   const taskId = StateManager.getState().taskId;
   TelemetryService.startTask(taskId, message.goal);
@@ -112,6 +127,7 @@ function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason
   const signature = `${taskState?.goal || goal}|${pageContext.url || ''}|${pageContext.title || ''}`;
 
   if (!forceNew && activeAnalysis?.signature === signature && activeAnalysis?.taskState?.status === 'ACTIVE') {
+    console.log(`[Dedup] queueVisionCycle reused — signature="${signature.slice(0, 60)}" reason=${reason}`);
     return activeAnalysis.promise;
   }
 
@@ -125,6 +141,7 @@ function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason
 async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }) {
   const t0     = Date.now();
   const taskId = StateManager.getState()?.taskId;
+  console.log(`[CALL #${++_bgCallSeq}] reason=${reason}`);
   log('cycle start — reason:', reason);
 
   // Phase 4: Check extension-side rate limit before capturing screenshot
@@ -179,28 +196,76 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
     ValidationService.recordEvent('PLAN_GENERATED', { stepCount: analysis.taskPlan.steps.length });
   }
 
-  // Phase 5: Navigation Planning - analyze if goal requires navigation
-  const stateModel = NavigationPlanner.modelState(analysis);
-  const goalGap = NavigationPlanner.analyzeGoalGap(goal, stateModel);
+  // Phase 5: Use 8-step architecture fields directly from backend
+  // The backend now returns: blockers, navigationRequired, transitions, nextAction, urlChanged, domChanged, pageTypeChanged
+  const raw = analysis.raw || {};
+  
+  // STEP 4: Blocker Detection - check if blocked before navigation
+  if (raw.blockers?.length > 0) {
+    const blockerMessage = raw.blockers[0];
+    log(`[8-Step] BLOCKER DETECTED: ${blockerMessage}`);
+    await StateManager.fail(blockerMessage);
+    if (taskId) TelemetryService.completeTask(taskId, 'blocked', blockerMessage);
+    ValidationService.endRun('blocked', blockerMessage);
+    return { success: false, error: blockerMessage, blocked: true, state: StateManager.getState() };
+  }
 
-  log(`[Navigation] stateModel: pageType=${stateModel.pageType}, confidence=${stateModel.confidence}`);
-  log(`[Navigation] goalGap: current=${goalGap.currentState}, target=${goalGap.targetState}, needed=${goalGap.navigationNeeded}`);
+  // STEP 3: Gap Analysis - use transitions from backend if available
+  const navigationRequired = raw.navigationRequired ?? false;
+  const transitions = raw.transitions || [];
+  
+  if (navigationRequired && transitions.length > 0) {
+    log(`[8-Step] GAP DETECTED: transitions=${transitions.join(' -> ')}`);
+    TelemetryService.recordNavigationTransition(taskId, transitions[0], transitions[transitions.length - 1]);
+  }
 
-  if (goalGap.navigationNeeded) {
-    log(`[Navigation] gap detected: ${goalGap.reason}`);
-    TelemetryService.recordNavigationTransition(taskId, goalGap.currentState, goalGap.targetState);
+  // STEP 5: Route Execution - use nextAction directly from backend
+  if (raw.nextAction && !analysis.instruction) {
+    analysis.instruction = raw.nextAction;
+    log(`[8-Step] NEXT ACTION: ${raw.nextAction}`);
+  }
 
-    // Create multi-step plan with navigation
-    const navPlan = NavigationPlanner.createNavigationPlan(goal, stateModel, goalGap);
-    // Always use navigation plan when navigation is needed - don't check length
-    if (navPlan?.steps?.length) {
-      analysis.taskPlan = navPlan;
-      log(`[Navigation] multi-step plan: ${navPlan.steps.length} steps`);
-      log(`[Navigation] plan injected: taskPlan.steps = ${JSON.stringify(navPlan.steps.map(s => s.description))}`);
+  // STEP 6: State Verification - check if previous action resulted in state change
+  // Only on reanalysis: verify URL/DOM/pageType changed
+  const isReanalysis = reason && (reason.includes('reanalyze') || reason.includes('click') || reason.includes('advance'));
+  if (isReanalysis) {
+    const urlChanged = raw.urlChanged ?? false;
+    const domChanged = raw.domChanged ?? false;
+    const pageTypeChanged = raw.pageTypeChanged ?? false;
+    const replan = raw.replan ?? false;
+    
+    log(`[8-Step] VERIFY: urlChanged=${urlChanged}, domChanged=${domChanged}, pageTypeChanged=${pageTypeChanged}, replan=${replan}`);
+    
+    if (replan || (!urlChanged && !domChanged && !pageTypeChanged)) {
+      // State didn't change - need to replan
+      log(`[8-Step] REPLAN: previous action did not result in state change`);
+      TelemetryService.recordRecovery(taskId, false);
+      // Continue with new analysis - the backend will provide new nextAction
+    } else {
+      TelemetryService.recordRecovery(taskId, true);
     }
-  } else {
-    // Direct achievement - no navigation needed
-    TelemetryService.recordNavigationSuccess(taskId, stateModel.pageType, 'target');
+  }
+
+  // Legacy NavigationPlanner fallback - only if 8-step fields not available
+  if (!raw.application && !raw.pageType) {
+    const stateModel = NavigationPlanner.modelState(analysis);
+    const goalGap = NavigationPlanner.analyzeGoalGap(goal, stateModel);
+
+    log(`[Navigation] stateModel: pageType=${stateModel.pageType}, confidence=${stateModel.confidence}`);
+    log(`[Navigation] goalGap: current=${goalGap.currentState}, target=${goalGap.targetState}, needed=${goalGap.navigationNeeded}`);
+
+    if (goalGap.navigationNeeded) {
+      log(`[Navigation] gap detected: ${goalGap.reason}`);
+      TelemetryService.recordNavigationTransition(taskId, goalGap.currentState, goalGap.targetState);
+
+      const navPlan = NavigationPlanner.createNavigationPlan(goal, stateModel, goalGap);
+      if (navPlan?.steps?.length) {
+        analysis.taskPlan = navPlan;
+        log(`[Navigation] multi-step plan: ${navPlan.steps.length} steps`);
+      }
+    } else {
+      TelemetryService.recordNavigationSuccess(taskId, stateModel.pageType, 'target');
+    }
   }
 
   if (analysis.complete) {
@@ -260,6 +325,7 @@ async function _buildMemoryResponse(workflow, confidence, message, sender) {
 // ─── PLAN ADVANCEMENT ─────────────────────────────────────────────────────────
 
 function buildSuccessResponse(analysis, complete) {
+  const raw = analysis.raw || {};
   return {
     success:       true,
     complete,
@@ -273,6 +339,18 @@ function buildSuccessResponse(analysis, complete) {
     confidence:    analysis.confidence,
     screenContext: analysis.screenContext || null,
     state:         StateManager.getState(),
+    // 8-step fields pass-through
+    application:   raw.application,
+    pageType:      raw.pageType,
+    authenticated: raw.authenticated,
+    blockers:      raw.blockers,
+    navigationRequired: raw.navigationRequired,
+    transitions:  raw.transitions,
+    nextAction:    raw.nextAction,
+    urlChanged:    raw.urlChanged,
+    domChanged:    raw.domChanged,
+    pageTypeChanged: raw.pageTypeChanged,
+    replan:        raw.replan,
   };
 }
 

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const MODELS = {
-  navigate: "gemini-2.5-flash",
+  navigate: "gemini-2.0-flash",
   explain:  "gemini-2.0-flash",
   ask:      "gemini-2.0-flash",
 } as const;
@@ -14,21 +14,46 @@ const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
 // In-memory store — resets on cold start, sufficient for current scale
 const sessions = new Map<string, { count: number; resetAt: number }>();
 
-function allowRequest(sessionId: string, reqId: string): boolean {
+// Global rate limiter — protects shared Gemini API key from multi-user overload.
+const GLOBAL_MAX  = 50; // stay below Gemini free tier (60 RPM)
+let globalCount   = 0;
+let globalResetAt = 0;
+
+type BlockReason = 'session' | 'global' | null;
+
+function allowRequest(sessionId: string, reqId: string): BlockReason {
   const now = Date.now();
+
+  // ── Per-session limiter ────────────────────────────────────────────────
   const s = sessions.get(sessionId);
+  let sessionCount: number;
   if (!s || now > s.resetAt) {
     sessions.set(sessionId, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=1/${RATE_MAX}`);
-    return true;
+    sessionCount = 1;
+  } else {
+    if (s.count >= RATE_MAX) {
+      console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX}`);
+      return 'session';
+    }
+    s.count++;
+    sessionCount = s.count;
   }
-  if (s.count >= RATE_MAX) {
-    console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX}`);
-    return false;
+  console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} session_count=${sessionCount}/${RATE_MAX}`);
+
+  // ── Global limiter (protects shared Gemini API key) ────────────────────
+  if (now > globalResetAt) {
+    globalCount = 1;
+    globalResetAt = now + RATE_WINDOW_MS;
+    console.log(`[analyze] ${reqId} global_rate=PASS count=${globalCount}/${GLOBAL_MAX}`);
+    return null;
   }
-  s.count++;
-  console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} count=${s.count}/${RATE_MAX}`);
-  return true;
+  if (globalCount >= GLOBAL_MAX) {
+    console.warn(`[analyze] ${reqId} rate=GLOBAL_BLOCKED count=${globalCount}/${GLOBAL_MAX}`);
+    return 'global';
+  }
+  globalCount++;
+  console.log(`[analyze] ${reqId} global_rate=PASS count=${globalCount}/${GLOBAL_MAX}`);
+  return null;
 }
 
 const CORS_HEADERS = {
@@ -54,8 +79,14 @@ export async function POST(req: NextRequest) {
   console.log(`[analyze] ${reqId} key_fingerprint=${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`);
 
   const sessionId = req.headers.get("x-session-id") ?? "anon";
-  if (!allowRequest(sessionId, reqId)) {
-    return json({ error: `Rate limit: ${RATE_MAX} requests/minute per session.` }, 429);
+  const blockReason = allowRequest(sessionId, reqId);
+  if (blockReason === 'session') {
+    console.error(`[analyze] ${reqId} 429 SESSION_RATE_LIMIT session=${sessionId} max=${RATE_MAX}`);
+    return json({ error: `Too many requests — please wait a moment and try again.`, source: "session" }, 429);
+  }
+  if (blockReason === 'global') {
+    console.error(`[analyze] ${reqId} 429 GLOBAL_RATE_LIMIT count=${globalCount}/${GLOBAL_MAX}`);
+    return json({ error: `Too many requests — please wait a moment and try again.`, source: "global" }, 429);
   }
 
   let body: {
@@ -98,50 +129,94 @@ export async function POST(req: NextRequest) {
     ? buildQAPrompt(goal, pageContext)
     : buildNavigatePrompt(goal, pageContext, taskState, enterpriseContext);
 
-  console.log(`[analyze] ${reqId} mode=${mode} model=${MODELS[mode]} session=${sessionId}`);
-
-  try {
-    const upstream = await fetch(`${geminiUrl}?key=${apiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: screenshot.mimeType ?? "image/jpeg", data: screenshot.image } },
-            ],
-          },
+  // Build request body for logging
+  const requestBody = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          { inlineData: { mimeType: screenshot.mimeType ?? "image/jpeg", data: screenshot.image } },
         ],
-        generationConfig: {
-          temperature: mode === "ask" ? 0.3 : 0.2,
-          maxOutputTokens: mode === "ask" ? 512 : 2048,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
-      }),
-      signal: AbortSignal.timeout(25_000),
-    });
+      },
+    ],
+    generationConfig: {
+      temperature: mode === "ask" ? 0.3 : 0.2,
+      maxOutputTokens: mode === "ask" ? 512 : 2048,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  };
 
-    if (!upstream.ok) {
-      const errBody = await upstream.json().catch(() => null);
-      console.error(`[analyze] ${reqId} gemini_status=${upstream.status} body=${JSON.stringify(errBody)}`);
-      if (upstream.status === 429) {
-        return json({ error: "Service busy — please retry in a moment.", source: "gemini" }, 429);
+  console.log(`[analyze] ${reqId} mode=${mode} model=${MODELS[mode]} session=${sessionId} prompt_len=${prompt.length} image_len=${screenshot.image.length}`);
+
+  const TOTAL_BUDGET_MS = 22_000;
+  const PER_ATTEMPT_MS  = 12_000;
+  const gController     = new AbortController();
+  const gBudgetTimer    = setTimeout(() => gController.abort(), TOTAL_BUDGET_MS);
+  const MAX_GEMINI_RETRIES = 2;
+  try {
+    for (let gAttempt = 1; gAttempt <= MAX_GEMINI_RETRIES; gAttempt++) {
+      if (gController.signal.aborted) {
+        console.error(`[analyze] ${reqId} gemini_budget_exhausted session=${sessionId}`);
+        return json({ error: "Analysis timed out — please try again." }, 504);
       }
-      return json({ error: `Upstream error ${upstream.status}.` }, 502);
-    }
+      let upstream;
+      let localTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const localController = new AbortController();
+        localTimeout = setTimeout(() => localController.abort(), PER_ATTEMPT_MS);
+        gController.signal.addEventListener('abort', () => localController.abort(), { once: true });
+        upstream = await fetch(`${geminiUrl}?key=${apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+          signal: localController.signal,
+        });
+        clearTimeout(localTimeout);
+        localTimeout = undefined;
+      } catch (err: unknown) {
+        clearTimeout(localTimeout);
+        const name = (err as Error).name;
+        if (name === "TimeoutError" || name === "AbortError") {
+          if (gController.signal.aborted) {
+            console.error(`[analyze] ${reqId} gemini_budget_exhausted session=${sessionId}`);
+            return json({ error: "Analysis timed out — please try again." }, 504);
+          }
+          if (gAttempt < MAX_GEMINI_RETRIES) {
+            const backoffMs = 1000 * Math.pow(2, gAttempt - 1) + Math.random() * 500;
+            console.warn(`[analyze] ${reqId} gemini_timeout retry ${gAttempt + 1}/${MAX_GEMINI_RETRIES} in ${Math.round(backoffMs)}ms`);
+            await new Promise(r => setTimeout(r, backoffMs));
+            continue;
+          }
+          console.error(`[analyze] ${reqId} gemini_timeout session=${sessionId}`);
+          return json({ error: "Analysis timed out — please try again." }, 504);
+        }
+        console.error(`[analyze] ${reqId} internal_error`, err);
+        return json({ error: "Internal server error." }, 500);
+      }
 
-    const data = await upstream.json();
-    console.log(`[analyze] ${reqId} gemini_ok mode=${mode}`);
-    return NextResponse.json(data, { headers: CORS_HEADERS });
-  } catch (err: unknown) {
-    const name = (err as Error).name;
-    if (name === "TimeoutError" || name === "AbortError") {
-      console.error(`[analyze] ${reqId} gemini_timeout session=${sessionId}`);
-      return json({ error: "Analysis timed out — please try again." }, 504);
+      if (!upstream.ok) {
+        const errBody = await upstream.json().catch(() => null);
+        console.error(`[analyze] ${reqId} gemini_status=${upstream.status} body=${JSON.stringify(errBody)}`);
+        if (upstream.status === 429 && gAttempt < MAX_GEMINI_RETRIES) {
+          const backoffMs = Math.min(2000 * Math.pow(2, gAttempt - 1) + Math.random() * 1000, 4000);
+          console.warn(`[analyze] ${reqId} gemini_429 retry ${gAttempt + 1}/${MAX_GEMINI_RETRIES} in ${Math.round(backoffMs)}ms`);
+          await new Promise(r => setTimeout(r, backoffMs));
+          continue;
+        }
+        if (upstream.status === 429) {
+          const geminiMsg = errBody?.error?.message || JSON.stringify(errBody);
+          console.error(`[analyze] ${reqId} 429 GEMINI_QUOTA_EXCEEDED body=${geminiMsg}`);
+          return json({ error: `Gemini API quota exceeded: ${geminiMsg}`, source: "gemini" }, 429);
+        }
+        return json({ error: `Upstream error ${upstream.status}.` }, 502);
+      }
+
+      const data = await upstream.json();
+      console.log(`[analyze] ${reqId} gemini_ok mode=${mode}`);
+      return NextResponse.json(data, { headers: CORS_HEADERS });
     }
-    console.error(`[analyze] ${reqId} internal_error`, err);
-    return json({ error: "Internal server error." }, 500);
+  } finally {
+    clearTimeout(gBudgetTimer);
   }
 }
 
@@ -173,6 +248,18 @@ Rules:
 - If you cannot see enough to answer, say so in the answer field
 - Return JSON only, no extra text`;
 }
+
+/**
+ * 8-Step Copilot Architecture:
+ * 1. State Detection - detect application, page type, auth state
+ * 2. Goal Understanding - convert goal to destination state
+ * 3. Gap Analysis - generate transitions path
+ * 4. Blocker Detection - check auth, permissions, prerequisites
+ * 5. Route Execution - generate single next action only
+ * 6. State Verification - verify URL/DOM changed
+ * 7. Replanning - generate new route if failed
+ * 8. Token Efficiency - cache and reuse
+ */
 
 function buildNavigatePrompt(
   goal: string,
@@ -214,65 +301,103 @@ function buildNavigatePrompt(
 
   return `${context}
 
-Analyze this browser screenshot and determine the next action to achieve the goal.
+You are a universal browser copilot. Follow this 8-step architecture:
 
-Classify each relevant UI element using ONLY these generic action types (never use website or brand names):
-- primary_action    : main call-to-action (Submit, Save, Create, Send, Confirm, Next, Apply, Post)
-- secondary_action  : supporting action (Cancel, Back, Reset, Skip, Dismiss, Close)
-- navigation_action : moves to another page or section (tab, breadcrumb, sidebar link)
-- destructive_action: removes or deletes content (Delete, Remove, Archive, Trash)
-- menu_action       : opens a dropdown, popover, or context menu
-- content_item      : selectable row, card, list item, or search result
-- input_field       : text box, textarea, date picker, file picker, select
-- filter_control    : search bar, filter dropdown, sort control, tag filter
-- settings_control  : toggle, checkbox, radio button, configuration field
+## STEP 1: STATE DETECTION
+Analyze the screenshot and determine:
+- application: name of the app (GitHub, Gmail, Notion, Salesforce, Jira, etc.)
+- pageType: one of login|list|detail|form|dashboard|editor|settings|search|media|conversation|empty|error|other
+- authenticated: true if signed in, false if not signed in or login page
+- currentActivity: what the user is currently doing on this page
 
-Classify each element's UI region using ONLY these generic region types:
+## STEP 2: GOAL UNDERSTANDING
+Convert the goal into a destination state:
+- destinationApplication: the app needed to complete the goal
+- destinationPageType: the page type needed (e.g., "repository_creation", "compose_email")
+
+## STEP 3: GAP ANALYSIS
+Compare current state vs destination state:
+- If same application and pageType: navigationRequired = false
+- If different or need different pageType: navigationRequired = true
+- Generate transitions: array of page types from current to destination
+
+## STEP 4: BLOCKER DETECTION
+Check for blockers BEFORE navigation:
+- not_logged_in: user needs to sign in first
+- permission_denied: user lacks permissions
+- organization_access_missing: needs org access
+- account_required: needs account setup
+- workspace_not_selected: needs workspace selection
+
+If blocker exists:
+- blockers: ["specific blocker message"]
+- STOP here, do not continue planning
+
+## STEP 5: ROUTE EXECUTION
+Generate ONLY the next actionable step (never full plan):
+- nextAction: short instruction like "Click 'New Repository'" or "Fill repository name"
+- targetElement: { text: "exact visible text", type: "button|link|input" }
+- expectedState: what the page should look like AFTER this action
+
+## STEP 6: STATE VERIFICATION (only if taskState.currentInstruction exists)
+Verify the previous action worked:
+- urlChanged: did URL change meaningfully?
+- domChanged: did page content change?
+- pageTypeChanged: did page type change?
+
+If no meaningful change: replan = true
+
+## STEP 7: REPLANNING (only if replan = true)
+Reanalyze current screen and generate new route.
+
+## STEP 8: TOKEN EFFICIENCY
+- If task is complete: set currentStep to "Task complete", confidence to 1
+- If no clear next action: targetElement.text = "", confidence below 0.4
+
+Classify elements using ONLY these action types:
+- primary_action: Submit, Save, Create, Send, Confirm, Next, Apply, Post
+- secondary_action: Cancel, Back, Reset, Skip, Dismiss, Close
+- navigation_action: tab, breadcrumb, sidebar link
+- destructive_action: Delete, Remove, Archive, Trash
+- menu_action: dropdown, popover, context menu
+- content_item: row, card, list item
+- input_field: text box, textarea, date picker, select
+- filter_control: search bar, filter dropdown
+- settings_control: toggle, checkbox, radio
+
+Classify regions using ONLY:
 - top_navigation, side_navigation, main_content, toolbar, modal, dropdown, form, footer
 
-Return ONLY valid JSON (no markdown fences, no extra text):
+Return ONLY valid JSON:
 {
-  "application": "name of the application or website visible (e.g. GitHub, Gmail, Notion). Use 'Unknown' if unclear.",
-  "pageType": "one of: list|detail|form|dashboard|editor|settings|login|search|media|conversation|empty|error|other",
-  "screenSummary": "1-2 sentence description of what is currently visible and the application state",
-  "visibleActions": ["up to 5 short labels of the most prominent actions a user could take on this screen"],
-  "importantElements": [
-    { "label": "visible label or name of a notable UI area", "description": "one sentence on its purpose" }
-  ],
-  "currentRegion": "the most relevant generic region type currently visible",
-  "currentStep": "description of the next step toward the goal",
+  "application": "GitHub",
+  "pageType": "repository_detail",
+  "authenticated": true,
+  "currentActivity": "viewing repository",
+  "destinationApplication": "GitHub",
+  "destinationPageType": "repository_creation",
+  "navigationRequired": true,
+  "transitions": ["repository_detail", "dashboard", "repository_creation"],
+  "blockers": [],
+  "currentStep": "Click 'Your repositories' to go to dashboard",
+  "nextAction": "Click 'Your repositories'",
+  "targetElement": { "text": "Your repositories", "type": "link" },
+  "expectedState": { "pageType": "dashboard" },
+  "urlChanged": false,
+  "domChanged": true,
+  "pageTypeChanged": true,
+  "replan": false,
+  "confidence": 0.9,
   "candidates": [
-    {
-      "text": "exact visible text, label, or placeholder of the element",
-      "actionType": "one of the 9 action types above",
-      "elementType": "button|link|input|menu",
-      "region": "one of the 8 region types above",
-      "confidence": 0.95,
-      "reasoning": "one sentence: why this element is the right next action for the goal"
-    }
-  ],
-  "targetElement": { "text": "text of best candidate", "type": "button|link|input|menu" },
-  "instruction": "short user-facing instruction (e.g. Click 'Save Changes')",
-  "confidence": 0.95,
-  "plan": [
-    {
-      "id": 1,
-      "description": "short action label visible to the user (e.g. 'Click New Issue')",
-      "expectedElement": { "text": "exact visible text of the element", "type": "button|link|input|menu", "region": "one of the 8 region types" }
-    }
+    { "text": "Your repositories", "actionType": "navigation_action", "elementType": "link", "region": "side_navigation", "confidence": 0.9, "reasoning": "navigates to dashboard where new repo can be created" }
   ]
 }
 
 Rules:
-- Return JSON only. No markdown, no commentary outside the JSON.
-- Reason from: visual layout, element roles, semantic match to goal, standard UI conventions.
-- List up to 5 candidates in descending order of relevance to the goal.
-- List up to 5 visibleActions and up to 5 importantElements.
-- Match element text EXACTLY as shown in the UI — copy verbatim.
-- Never repeat a completed step.
-- If the task is already complete: set currentStep to "Task complete", targetElement.text to "", confidence to 1.
-- If no clear next action is visible: leave targetElement.text empty, set confidence below 0.4.
-- For "plan": include 1–6 steps predicting ALL actions needed to complete the goal from the current screen.
-  Step 1 must match the current instruction. Include only steps you can predict with reasonable confidence.
-  Omit steps that depend on unknown future UI state. Use the same element text format as candidates.`;
+- Return JSON only. No markdown.
+- STEP 5: Generate ONE next action only, never a full plan.
+- STEP 4: If blocked, return blockers and STOP.
+- STEP 6: Only include verification fields if taskState.currentInstruction exists.
+- Match element text EXACTLY as shown in the UI.
+- If task complete: currentStep = "Task complete", confidence = 1`;
 }

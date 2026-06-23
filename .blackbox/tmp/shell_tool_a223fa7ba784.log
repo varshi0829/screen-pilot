@@ -1,0 +1,25 @@
+
+> screenpilot-landing@0.1.0 dev
+> next dev
+
+   ▲ Next.js 15.5.19
+   - Local:        http://localhost:3000
+   - Network:      http://192.168.19.75:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 2.2s
+ ○ Compiling /api/analyze ...
+ ✓ Compiled /api/analyze in 805ms (296 modules)
+[analyze] 1364b788 rate=PASS session=anon count=1/100
+[analyze] 1364b788 mode=navigate model=gemini-2.5-flash session=anon
+[analyze] 1364b788 gemini_status=400 body={"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"generativelanguage.googleapis.com"}},{"@type":"type.googleapis.com/google.rpc.LocalizedMessage","locale":"en-US","message":"API key not valid. Please pass a valid API key."}]}}
+ POST /api/analyze 502 in 1356ms
+[analyze] 0ecf7aa9 rate=PASS session=anon count=1/100
+ POST /api/analyze 400 in 30ms
+[analyze] 02322d6e rate=PASS session=anon count=2/100
+[analyze] 02322d6e mode=navigate model=gemini-2.5-flash session=anon
+[analyze] 02322d6e gemini_status=400 body={"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"generativelanguage.googleapis.com"}},{"@type":"type.googleapis.com/google.rpc.LocalizedMessage","locale":"en-US","message":"API key not valid. Please pass a valid API key."}]}}
+ POST /api/analyze 502 in 263ms
+ ✓ Compiled in 28ms
+[?25h

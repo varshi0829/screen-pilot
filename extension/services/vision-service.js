@@ -8,7 +8,7 @@ export const VisionService = (() => {
 
   const BACKEND_URL       = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
-  const MAX_ATTEMPTS       = 2;
+  const MAX_ATTEMPTS       = 3;
 
   // ─── PUBLIC ────────────────────────────────────────────────────────────────
 
@@ -51,6 +51,10 @@ export const VisionService = (() => {
         console.error(`[VisionService] Attempt ${attempt} failed:`, err.message);
         lastError = err;
         if (!isRetryable(err) || attempt === MAX_ATTEMPTS) break;
+        const baseMs = err.status === 429 ? 2000 : 1000;
+        const delayMs = Math.min(baseMs * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+        console.warn(`[VisionService] Retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+        await new Promise(r => setTimeout(r, delayMs));
       }
     }
     return buildError(normalizeError(lastError), isRetryable(lastError));
@@ -83,6 +87,10 @@ export const VisionService = (() => {
         const body = await res.json().catch(() => ({ error: `Server error ${res.status}` }));
         const err  = new Error(body.error || `HTTP ${res.status}`);
         err.status = res.status;
+        err.body   = body;
+        if (res.status === 429) {
+          console.error(`[VisionService] 429 response:`, JSON.stringify(body));
+        }
         throw err;
       }
 
@@ -246,14 +254,19 @@ export const VisionService = (() => {
   function normalizeError(err) {
     if (!err) return 'Unknown error.';
     if (err.name === 'AbortError') return 'Request timed out. Please try again.';
-    if (err.status === 429)        return 'Too many requests — please wait a moment and try again.';
+    if (err.status === 429) {
+      const source = err.body?.source === 'gemini' ? 'Gemini AI' : 'rate limit';
+      const detail = err.body?.error || '';
+      console.error(`[VisionService] 429 source=${source} detail="${detail}" body=${JSON.stringify(err.body)}`);
+      return detail || 'Too many requests — please wait a moment and try again.';
+    }
     if (err.status >= 500)         return 'ScreenPilot service is temporarily unavailable.';
     return `Analysis failed: ${err.message}`;
   }
 
   function isRetryable(err) {
     if (!err) return false;
-    return err.name === 'AbortError' || (err.status >= 500 && err.status !== 501);
+    return err.name === 'AbortError' || err.status === 429 || (err.status >= 500 && err.status !== 501);
   }
 
   function buildError(error, retryable = true) {

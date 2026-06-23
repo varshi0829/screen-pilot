@@ -1,0 +1,21 @@
+
+> screenpilot-landing@0.1.0 dev
+> next dev
+
+ ⚠ Port 3000 is in use by an unknown process, using available port 3001 instead.
+   ▲ Next.js 15.5.19
+   - Local:        http://localhost:3001
+   - Network:      http://192.168.19.75:3001
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 1579ms
+ ○ Compiling /api/analyze ...
+ ✓ Compiled /api/analyze in 508ms (296 modules)
+[analyze] 3dbf5d03 key_fingerprint=AQ.Ab8RN...8Buw
+[analyze] 3dbf5d03 rate=PASS session=anon count=1/100
+[analyze] 3dbf5d03 mode=navigate model=gemini-2.5-flash session=anon prompt_len=3649 image_len=96
+[analyze] 3dbf5d03 gemini_status=403 body={"error":{"code":403,"message":"Your project has been denied access. Please contact support.","status":"PERMISSION_DENIED"}}
+ POST /api/analyze 502 in 1397ms
+ ✓ Compiled in 25ms
+ ✓ Compiled in 297ms (194 modules)
