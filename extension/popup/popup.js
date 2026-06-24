@@ -18,8 +18,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusEl = document.getElementById('status');
 
   openBtn.addEventListener('click', async () => {
+    console.log('[SP:LAUNCH] button clicked');
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      console.log(`[SP:LAUNCH] tab id=${tab?.id} url=${tab?.url}`);
       if (!tab?.id) throw new Error('No active tab found');
 
       if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://') ||
@@ -29,23 +31,35 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      // PATH A: content script already injected by manifest — send OPEN_WIDGET directly
+      console.log('[SP:LAUNCH] PATH A: attempting sendMessage to existing content script');
       try {
-        await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
+        const respA = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
+        console.log('[SP:LAUNCH] PATH A: sendMessage OK, response=', respA, '— closing popup');
         window.close();
         return;
-      } catch {
-        // Content script not present — fall through to inject
+      } catch (innerErr) {
+        console.warn('[SP:LAUNCH] PATH A: sendMessage failed:', innerErr.message, '— proceeding to PATH B');
       }
 
-      // Inject enterprise context service first (sets window.EnterpriseContextService)
+      // PATH B: content script not present — inject all scripts manually
+      console.log('[SP:LAUNCH] PATH B: injecting scripts');
+      console.log('[SP:LAUNCH]   → enterprise-context-service.js');
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['services/enterprise-context-service.js'] });
+      console.log('[SP:LAUNCH]   → lib/dom-matcher.js');
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['lib/dom-matcher.js'] });
+      console.log('[SP:LAUNCH]   → content.js');
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      console.log('[SP:LAUNCH]   → widget.css');
       await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['styles/widget.css'] });
+      console.log('[SP:LAUNCH] PATH B: all scripts injected, waiting 150ms');
       await new Promise(resolve => setTimeout(resolve, 150));
-      await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
+      console.log('[SP:LAUNCH] PATH B: sending OPEN_WIDGET');
+      const respB = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
+      console.log('[SP:LAUNCH] PATH B: sendMessage OK, response=', respB, '— closing popup');
       window.close();
     } catch (error) {
+      console.error('[SP:LAUNCH] OUTER ERROR:', error.message, error);
       statusEl.textContent = 'Could not open ScreenPilot: ' + error.message;
       statusEl.className = 'status error';
     }

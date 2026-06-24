@@ -113,9 +113,12 @@ export async function POST(req: NextRequest) {
   if (userApiKey) { _m.userKeyRequests++; } else { _m.sharedKeyRequests++; }
 
   const keyType = userApiKey ? "user" : "shared";
+  const activeKey = userApiKey ?? sharedKey!;
+  const keyFingerprint = `${activeKey.slice(0, 4)}...${activeKey.slice(-4)}`;
   console.log(
     `[SP:REQ] reqId=${reqId} ts=${new Date().toISOString()}` +
-    ` session=${sessionId.slice(-8)} key=${keyType}`
+    ` session=${sessionId.slice(-8)} key=${keyType}` +
+    ` keyFingerprint=${keyFingerprint} X-Gemini-Key-present=${!!userApiKey}`
   );
 
   if (!userApiKey) {

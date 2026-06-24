@@ -649,11 +649,11 @@
 
   function createWidget() {
     if (document.getElementById('screenpilot-widget')) {
-      console.log('[ScreenPilot] Widget already exists');
+      console.log('[SP:LAUNCH] createWidget(): widget already in DOM, skipping');
       return;
     }
 
-    console.log('[ScreenPilot] Creating widget');
+    console.log('[SP:LAUNCH] createWidget(): creating widget element');
 
     const widget = document.createElement('div');
     widget.id = 'screenpilot-widget';
@@ -751,7 +751,8 @@
     `;
 
     document.body.appendChild(widget);
-    console.log('[ScreenPilot] Widget injected into DOM');
+    const verify = !!document.getElementById('screenpilot-widget');
+    console.log('[SP:LAUNCH] createWidget(): appended to body, getElementById verify=', verify);
     attachWidgetEvents(widget);
     renderProgressPanel();
   }
@@ -1567,10 +1568,16 @@
   }
 
   function openWidget() {
+    console.log('[SP:LAUNCH] openWidget() called');
     const widget = document.getElementById('screenpilot-widget');
-    if (!widget) return;
+    if (!widget) {
+      console.error('[SP:LAUNCH] openWidget(): #screenpilot-widget NOT in DOM — widget was never created or was removed');
+      return;
+    }
+    console.log('[SP:LAUNCH] openWidget(): widget found, classes before:', widget.className || '(none)');
     state.isOpen = true;
     widget.classList.add('sp-open');
+    console.log('[SP:LAUNCH] openWidget(): sp-open added, classes after:', widget.className);
     setTimeout(() => widget.querySelector('.sp-goal-input')?.focus(), 50);
   }
 
@@ -1680,12 +1687,12 @@
   // ─── INIT ───────────────────────────────────────────────────────────────────
 
   function init() {
-    console.log('[Content] init() entered');
+    console.log('[SP:LAUNCH] init() entered, readyState=', document.readyState, 'body=', !!document.body, 'url=', window.location.href);
     if (document.getElementById('screenpilot-widget')) {
-      console.log('[Content] widget already exists, skipping init');
+      console.log('[SP:LAUNCH] init(): widget already in DOM, skipping init');
       return;
     }
-    console.log('[ScreenPilot] Initializing on:', window.location.href);
+    console.log('[SP:LAUNCH] init(): no existing widget, calling createWidget()');
     createWidget();
     document.addEventListener('click', handleDocumentClick, true);
     // Add input/focus/blur detection for dynamic content
@@ -1723,7 +1730,13 @@
     console.log('[Content] message received', message.type);
     // Only handle messages explicitly directed at the content script.
     // Do NOT call sendResponse for other types — background responses must not be intercepted.
-    if (message.type === 'OPEN_WIDGET')  { openWidget();  sendResponse({ success: true }); return false; }
+    if (message.type === 'OPEN_WIDGET')  {
+      openWidget();
+      const widgetInDom = !!document.getElementById('screenpilot-widget');
+      console.log('[SP:LAUNCH] OPEN_WIDGET handled, widgetInDom=', widgetInDom, 'state.isOpen=', state.isOpen);
+      sendResponse({ success: true, widgetInDom });
+      return false;
+    }
     if (message.type === 'CLOSE_WIDGET') { closeWidget(); sendResponse({ success: true }); return false; }
     if (message.type === 'RUN_GOAL') {
       // Benchmark injection: open the widget and trigger analysis for the given goal.
@@ -1750,9 +1763,12 @@
     return false;
   });
 
+  console.log('[SP:LAUNCH] content.js IIFE bottom, readyState=', document.readyState);
   if (document.readyState === 'loading') {
+    console.log('[SP:LAUNCH] waiting for DOMContentLoaded before init()');
     document.addEventListener('DOMContentLoaded', init);
   } else {
+    console.log('[SP:LAUNCH] DOM already ready, calling init() now');
     init();
   }
 })();

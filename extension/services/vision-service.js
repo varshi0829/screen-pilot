@@ -99,9 +99,13 @@ export const VisionService = (() => {
 
       const keyType = geminiApiKey ? 'user' : 'shared';
       if (geminiApiKey) { _m.userKey++; } else { _m.sharedKey++; }
+      const keyFingerprint = geminiApiKey
+        ? `${geminiApiKey.slice(0, 4)}...${geminiApiKey.slice(-4)}`
+        : '(none — using shared backend key)';
       console.log(
         `[SP:REQ] ts=${new Date().toISOString()}` +
-        ` session=${sessionId.slice(-8)} key=${keyType} mode=${mode}`
+        ` session=${sessionId.slice(-8)} key=${keyType}` +
+        ` keyFingerprint=${keyFingerprint} mode=${mode}`
       );
 
       const headers = {
