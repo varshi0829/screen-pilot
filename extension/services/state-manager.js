@@ -163,6 +163,21 @@ export const StateManager = (() => {
     return currentState?.status === 'ACTIVE';
   }
 
+  // Called by background.js before reanalysis to record that the current
+  // instruction was executed by the user. This ensures Gemini sees
+  // "Completed: X" on the next call rather than "Last instruction: X",
+  // preventing it from repeating the same step.
+  function markCurrentInstructionCompleted() {
+    if (!currentState?.currentInstruction) return Promise.resolve(null);
+    const last = currentState.completedSteps[currentState.completedSteps.length - 1];
+    if (last !== currentState.currentInstruction) {
+      currentState.completedSteps.push(currentState.currentInstruction);
+      currentState.updatedAt = Date.now();
+      return persistAndReturn();
+    }
+    return Promise.resolve(currentState);
+  }
+
   // Called by content.js when a plan step is executed locally (no Gemini call).
   // Advances the plan index and records the step in completedSteps/history.
   function advancePlanStep(stepIndex, instruction) {
@@ -214,6 +229,7 @@ export const StateManager = (() => {
     createTask,
     getState,
     updateFromAnalysis,
+    markCurrentInstructionCompleted,
     advancePlanStep,
     complete,
     fail,

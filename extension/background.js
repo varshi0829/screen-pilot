@@ -112,6 +112,13 @@ async function reanalyzeGoal(message, sender) {
   }
   const isPlanFallback = typeof message.reason === 'string' && message.reason.startsWith('plan-');
   if (isPlanFallback && taskState.taskId) TelemetryService.recordFallback(taskState.taskId);
+
+  // Mark the current instruction as completed before reanalysis.
+  // Any reanalysis means the user has taken an action (click, form input, navigation).
+  // This ensures Gemini sees "Completed: X" on the next call and advances
+  // rather than repeating the same instruction.
+  await StateManager.markCurrentInstructionCompleted();
+
   return queueVisionCycle({
     sender,
     goal:             taskState.goal,
@@ -143,6 +150,21 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   const taskId = StateManager.getState()?.taskId;
   console.log(`[CALL #${++_bgCallSeq}] reason=${reason}`);
   log('cycle start — reason:', reason);
+
+  // Capture progress snapshot before calling Gemini so we can measure advancement.
+  const _snap = {
+    instruction: StateManager.getState()?.currentInstruction || '(none)',
+    completed:   [...(StateManager.getState()?.completedSteps || [])],
+    url:         StateManager.getState()?.currentPage?.url || '(none)',
+  };
+  console.log(
+    `[Progress] START` +
+    ` goal="${goal}"` +
+    ` prevInstruction="${_snap.instruction}"` +
+    ` completedSteps=[${_snap.completed.join(' → ') || 'none'}]` +
+    ` prevUrl="${_snap.url}"` +
+    ` currentUrl="${pageContext.url || '(none)'}"`
+  );
 
   // Phase 4: Check extension-side rate limit before capturing screenshot
   const canProceed = await RateLimiterService.canProceed();
@@ -183,6 +205,22 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
 
   if (taskId) TelemetryService.recordGeminiCall(taskId, { latencyMs, success: analysis.success });
   ValidationService.recordEvent('GEMINI_RESPONSE', { latencyMs, success: analysis.success });
+
+  if (analysis.success) {
+    const _newInstruction = analysis.instruction || '(none)';
+    const _repeated       = _newInstruction === _snap.instruction && _snap.completed.includes(_snap.instruction);
+    const _advanced       = _newInstruction !== _snap.instruction;
+    const _urlChanged     = pageContext.url && _snap.url !== '(none)' && pageContext.url !== _snap.url;
+    console.log(
+      `[Progress] RESULT` +
+      ` prevInstruction="${_snap.instruction}"` +
+      ` newInstruction="${_newInstruction}"` +
+      ` progressMade=${_advanced}` +
+      ` repeated=${_repeated}` +
+      ` urlChanged=${_urlChanged}` +
+      ` reason=${_repeated ? 'WARN:same-instruction-already-completed' : _advanced ? 'advanced' : 'unchanged'}`
+    );
+  }
 
   if (!analysis.success) {
     await StateManager.fail(analysis.error);

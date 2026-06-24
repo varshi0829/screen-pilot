@@ -141,7 +141,11 @@ export async function POST(req: NextRequest) {
     screenshot: { image: string; mimeType?: string };
     goal: string;
     pageContext?: Record<string, string>;
-    taskState?: { completedSteps?: string[]; currentInstruction?: string } | null;
+    taskState?: {
+      completedSteps?: string[];
+      currentInstruction?: string;
+      currentPage?: { url?: string; title?: string };
+    } | null;
     enterpriseContext?: {
       application?: string | null;
       module?: string | null;
@@ -317,7 +321,11 @@ Rules:
 function buildNavigatePrompt(
   goal: string,
   pageContext: Record<string, string>,
-  taskState: { completedSteps?: string[]; currentInstruction?: string } | null,
+  taskState: {
+    completedSteps?: string[];
+    currentInstruction?: string;
+    currentPage?: { url?: string; title?: string };
+  } | null,
   enterpriseContext?: {
     application?: string | null;
     module?: string | null;
@@ -339,9 +347,13 @@ function buildNavigatePrompt(
       ].filter(Boolean).join(" | ")
     : "";
 
+  const prevUrl = taskState?.currentPage?.url;
+  const urlActuallyChanged = prevUrl && pageContext.url && prevUrl !== pageContext.url;
+
   const context = [
     `Goal: ${goal}`,
     pageContext.url   ? `URL: ${pageContext.url}` : "",
+    urlActuallyChanged ? `Previous URL: ${prevUrl}` : "",
     pageContext.title ? `Page title: ${pageContext.title}` : "",
     ecLine || "",
     taskState?.completedSteps?.length
