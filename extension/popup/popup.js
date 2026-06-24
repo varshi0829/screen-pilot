@@ -9,6 +9,7 @@ document.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('.sp-panel').forEach(p => p.classList.toggle('active', p.id === `panel-${target}`));
       if (target === 'analytics')  loadAnalytics();
       if (target === 'validation') loadValidation();
+      if (target === 'settings')   loadSettings();
     });
   });
 
@@ -120,4 +121,46 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/&/g, '&amp;').replace(/</g, '&lt;')
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
+
+  // ── Settings tab ──────────────────────────────────────────────────────────────
+  async function loadSettings() {
+    const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+    const statusEl = document.getElementById('key-status');
+    const inputEl  = document.getElementById('gemini-key-input');
+    if (geminiApiKey) {
+      inputEl.placeholder = '••••••••' + geminiApiKey.slice(-4);
+      statusEl.textContent = 'Your key is active — using your own Gemini quota';
+      statusEl.className = 'sp-key-status saved';
+    } else {
+      inputEl.placeholder = 'AIza...';
+      statusEl.textContent = 'No key set — using shared quota (may hit limits)';
+      statusEl.className = 'sp-key-status';
+    }
+  }
+
+  document.getElementById('save-key-btn').addEventListener('click', async () => {
+    const inputEl  = document.getElementById('gemini-key-input');
+    const statusEl = document.getElementById('key-status');
+    const key = inputEl.value.trim();
+    if (!key) {
+      statusEl.textContent = 'Paste a key first.';
+      statusEl.className = 'sp-key-status error';
+      return;
+    }
+    await chrome.storage.local.set({ geminiApiKey: key });
+    inputEl.value = '';
+    inputEl.placeholder = '••••••••' + key.slice(-4);
+    statusEl.textContent = 'Key saved — using your own Gemini quota';
+    statusEl.className = 'sp-key-status saved';
+  });
+
+  document.getElementById('clear-key-btn').addEventListener('click', async () => {
+    await chrome.storage.local.remove('geminiApiKey');
+    const inputEl  = document.getElementById('gemini-key-input');
+    const statusEl = document.getElementById('key-status');
+    inputEl.value = '';
+    inputEl.placeholder = 'AIza...';
+    statusEl.textContent = 'Key cleared — using shared quota';
+    statusEl.className = 'sp-key-status';
+  });
 });

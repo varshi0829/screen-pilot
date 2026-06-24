@@ -6,9 +6,25 @@ import { ScreenContextService } from './screen-context.js';
 export const VisionService = (() => {
   'use strict';
 
-  const BACKEND_URL       = 'https://screen-pilot-j1az.vercel.app/api/analyze';
+  const BACKEND_URL        = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
   const MAX_ATTEMPTS       = 3;
+
+  // Session metrics — resets when service worker restarts
+  const _m = { logical: 0, attempts: 0, hits429: 0, userKey: 0, sharedKey: 0 };
+
+  function _logMetrics() {
+    const avg = _m.logical > 0 ? (_m.attempts / _m.logical).toFixed(2) : '0.00';
+    console.log(
+      `[SCREENPILOT_METRICS]` +
+      ` total_requests=${_m.logical}` +
+      ` total_gemini_calls=${_m.attempts}` +
+      ` avg_calls_per_request=${avg}` +
+      ` 429_count=${_m.hits429}` +
+      ` shared_key_requests=${_m.sharedKey}` +
+      ` user_key_requests=${_m.userKey}`
+    );
+  }
 
   // ─── PUBLIC ────────────────────────────────────────────────────────────────
 
@@ -40,23 +56,36 @@ export const VisionService = (() => {
   // ─── PRIVATE ───────────────────────────────────────────────────────────────
 
   async function _callWithRetry(params, parser) {
+    _m.logical++;
     let lastError = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      _m.attempts++;
+      console.log(
+        `[SP:CALL] ts=${new Date().toISOString()}` +
+        ` logical=${_m.logical} attempt=${attempt}/${MAX_ATTEMPTS}` +
+        ` mode=${params.mode || 'navigate'}`
+      );
       try {
         const raw    = await callBackend(params);
         const parsed = parser(raw);
         if (parsed.success) parsed.attempts = attempt;
+        _logMetrics();
         return parsed;
       } catch (err) {
-        console.error(`[VisionService] Attempt ${attempt} failed:`, err.message);
+        if (err.status === 429) _m.hits429++;
+        console.error(
+          `[SP:CALL] ts=${new Date().toISOString()}` +
+          ` logical=${_m.logical} attempt=${attempt}/${MAX_ATTEMPTS}` +
+          ` FAILED status=${err.status || 'network'} msg=${err.message}`
+        );
         lastError = err;
         if (!isRetryable(err) || attempt === MAX_ATTEMPTS) break;
-        const baseMs = err.status === 429 ? 2000 : 1000;
-        const delayMs = Math.min(baseMs * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
-        console.warn(`[VisionService] Retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+        console.warn(`[SP:CALL] retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
         await new Promise(r => setTimeout(r, delayMs));
       }
     }
+    _logMetrics();
     return buildError(normalizeError(lastError), isRetryable(lastError));
   }
 
@@ -66,12 +95,24 @@ export const VisionService = (() => {
 
     try {
       const sessionId = await getOrCreateSessionId();
+      const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+
+      const keyType = geminiApiKey ? 'user' : 'shared';
+      if (geminiApiKey) { _m.userKey++; } else { _m.sharedKey++; }
+      console.log(
+        `[SP:REQ] ts=${new Date().toISOString()}` +
+        ` session=${sessionId.slice(-8)} key=${keyType} mode=${mode}`
+      );
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Session-ID': sessionId,
+      };
+      if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
+
       const res = await fetch(BACKEND_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'X-Session-ID':  sessionId,
-        },
+        headers,
         body: JSON.stringify({
           screenshot:      { image: screenshot.image, mimeType: screenshot.mimeType },
           goal,
@@ -266,7 +307,8 @@ export const VisionService = (() => {
 
   function isRetryable(err) {
     if (!err) return false;
-    return err.name === 'AbortError' || err.status === 429 || (err.status >= 500 && err.status !== 501);
+    // 429 is never retried — retrying quota errors burns more quota
+    return err.name === 'AbortError' || (err.status >= 500 && err.status !== 501);
   }
 
   function buildError(error, retryable = true) {

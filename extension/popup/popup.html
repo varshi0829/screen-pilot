@@ -259,6 +259,38 @@
     }
     .sp-breakdown-bar { height: 100%; background: #3b82f6; border-radius: 3px; }
     .sp-breakdown-pts { width: 36px; text-align: right; color: #111827; font-weight: 600; }
+
+    /* ── Settings panel ── */
+    .sp-setting-group { margin-bottom: 16px; }
+    .sp-setting-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 4px;
+    }
+    .sp-setting-hint {
+      font-size: 11px;
+      color: #6b7280;
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+    .sp-setting-hint a { color: #3b82f6; text-decoration: none; }
+    .sp-setting-hint a:hover { text-decoration: underline; }
+    .sp-key-input {
+      width: 100%;
+      padding: 7px 10px;
+      font-size: 13px;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      font-family: monospace;
+    }
+    .sp-key-input:focus { outline: none; border-color: #111827; }
+    .sp-setting-actions { display: flex; gap: 6px; margin-bottom: 8px; }
+    .sp-key-status { font-size: 11px; color: #6b7280; }
+    .sp-key-status.saved { color: #059669; }
+    .sp-key-status.error { color: #dc2626; }
   </style>
 </head>
 <body>
@@ -266,6 +298,7 @@
     <button class="sp-tab active" data-tab="launch">Launch</button>
     <button class="sp-tab" data-tab="analytics">Analytics</button>
     <button class="sp-tab" data-tab="validation">Validation</button>
+    <button class="sp-tab" data-tab="settings">Settings</button>
   </div>
 
   <div class="sp-panel active" id="panel-launch">
@@ -359,6 +392,23 @@
     </div>
     <div class="sp-val-runs" id="val-runs-list">
       <div class="sp-no-data">No validation runs yet</div>
+    </div>
+  </div>
+
+  <div class="sp-panel" id="panel-settings">
+    <div class="sp-setting-group">
+      <label class="sp-setting-label">Gemini API Key</label>
+      <p class="sp-setting-hint">
+        Paste your own free key to use your personal quota instead of the shared one.
+        Get one free at <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a>
+        (1,500 requests/day free).
+      </p>
+      <input type="password" id="gemini-key-input" placeholder="AIza..." class="sp-key-input" autocomplete="off" />
+      <div class="sp-setting-actions">
+        <button class="sp-btn-small" id="save-key-btn">Save Key</button>
+        <button class="sp-btn-small outline" id="clear-key-btn">Clear</button>
+      </div>
+      <div id="key-status" class="sp-key-status"></div>
     </div>
   </div>
 

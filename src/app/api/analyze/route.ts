@@ -15,9 +15,34 @@ const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
 const sessions = new Map<string, { count: number; resetAt: number }>();
 
 // Global rate limiter — protects shared Gemini API key from multi-user overload.
-const GLOBAL_MAX  = 50; // stay below Gemini free tier (60 RPM)
+// Gemini free tier is 15 RPM; keep 3 RPM headroom for network jitter.
+const GLOBAL_MAX  = 12;
 let globalCount   = 0;
 let globalResetAt = 0;
+
+// ── In-process metrics (resets on cold start) ────────────────────────────────
+const _m = {
+  totalRequests:     0,
+  totalGeminiCalls:  0,
+  total429:          0,
+  sharedKeyRequests: 0,
+  userKeyRequests:   0,
+};
+
+function logMetrics(reqId: string) {
+  const avg = _m.totalRequests > 0
+    ? (_m.totalGeminiCalls / _m.totalRequests).toFixed(2)
+    : "0.00";
+  console.log(
+    `[SCREENPILOT_METRICS] reqId=${reqId}` +
+    ` total_requests=${_m.totalRequests}` +
+    ` total_gemini_calls=${_m.totalGeminiCalls}` +
+    ` avg_calls_per_request=${avg}` +
+    ` 429_count=${_m.total429}` +
+    ` shared_key_requests=${_m.sharedKeyRequests}` +
+    ` user_key_requests=${_m.userKeyRequests}`
+  );
+}
 
 type BlockReason = 'session' | 'global' | null;
 
@@ -58,7 +83,7 @@ function allowRequest(sessionId: string, reqId: string): BlockReason {
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "Content-Type, X-Session-ID",
+  "Access-Control-Allow-Headers": "Content-Type, X-Session-ID, X-Gemini-Key",
 };
 
 export async function OPTIONS() {
@@ -70,23 +95,41 @@ export async function OPTIONS() {
 
 export async function POST(req: NextRequest) {
   const reqId = crypto.randomUUID().slice(0, 8);
-  const apiKey = process.env.GEMINI_API_KEY;
+
+  // User-supplied key takes priority over shared env key (BYOK).
+  const userApiKey = req.headers.get("x-gemini-key");
+  const sharedKey  = process.env.GEMINI_API_KEY;
+  const apiKey     = userApiKey || sharedKey;
+
   if (!apiKey) {
-    console.error(`[analyze] ${reqId} GEMINI_API_KEY not set`);
+    console.error(`[analyze] ${reqId} no API key available`);
     return json({ error: "Service not configured." }, 500);
   }
-  // Debug: log key fingerprint (first 8 + last 4 chars)
-  console.log(`[analyze] ${reqId} key_fingerprint=${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`);
 
   const sessionId = req.headers.get("x-session-id") ?? "anon";
-  const blockReason = allowRequest(sessionId, reqId);
-  if (blockReason === 'session') {
-    console.error(`[analyze] ${reqId} 429 SESSION_RATE_LIMIT session=${sessionId} max=${RATE_MAX}`);
-    return json({ error: `Too many requests — please wait a moment and try again.`, source: "session" }, 429);
-  }
-  if (blockReason === 'global') {
-    console.error(`[analyze] ${reqId} 429 GLOBAL_RATE_LIMIT count=${globalCount}/${GLOBAL_MAX}`);
-    return json({ error: `Too many requests — please wait a moment and try again.`, source: "global" }, 429);
+
+  // Skip global rate limit when user provides their own key — they burn their own quota.
+  _m.totalRequests++;
+  if (userApiKey) { _m.userKeyRequests++; } else { _m.sharedKeyRequests++; }
+
+  const keyType = userApiKey ? "user" : "shared";
+  console.log(
+    `[SP:REQ] reqId=${reqId} ts=${new Date().toISOString()}` +
+    ` session=${sessionId.slice(-8)} key=${keyType}`
+  );
+
+  if (!userApiKey) {
+    const blockReason = allowRequest(sessionId, reqId);
+    if (blockReason === 'session') {
+      console.error(`[analyze] ${reqId} 429 SESSION_RATE_LIMIT session=${sessionId} max=${RATE_MAX}`);
+      logMetrics(reqId);
+      return json({ error: `Too many requests — please wait a moment and try again.`, source: "session" }, 429);
+    }
+    if (blockReason === 'global') {
+      console.error(`[analyze] ${reqId} 429 GLOBAL_RATE_LIMIT count=${globalCount}/${GLOBAL_MAX}`);
+      logMetrics(reqId);
+      return json({ error: `Too many requests — please wait a moment and try again.`, source: "global" }, 429);
+    }
   }
 
   let body: {
@@ -159,6 +202,13 @@ export async function POST(req: NextRequest) {
         console.error(`[analyze] ${reqId} gemini_budget_exhausted session=${sessionId}`);
         return json({ error: "Analysis timed out — please try again." }, 504);
       }
+      _m.totalGeminiCalls++;
+      console.log(
+        `[SP:GEMINI] reqId=${reqId} attempt=${gAttempt}/${MAX_GEMINI_RETRIES}` +
+        ` ts=${new Date().toISOString()} session=${sessionId.slice(-8)}` +
+        ` key=${keyType} mode=${mode}`
+      );
+
       let upstream;
       let localTimeout: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -197,22 +247,20 @@ export async function POST(req: NextRequest) {
       if (!upstream.ok) {
         const errBody = await upstream.json().catch(() => null);
         console.error(`[analyze] ${reqId} gemini_status=${upstream.status} body=${JSON.stringify(errBody)}`);
-        if (upstream.status === 429 && gAttempt < MAX_GEMINI_RETRIES) {
-          const backoffMs = Math.min(2000 * Math.pow(2, gAttempt - 1) + Math.random() * 1000, 4000);
-          console.warn(`[analyze] ${reqId} gemini_429 retry ${gAttempt + 1}/${MAX_GEMINI_RETRIES} in ${Math.round(backoffMs)}ms`);
-          await new Promise(r => setTimeout(r, backoffMs));
-          continue;
-        }
         if (upstream.status === 429) {
+          // Never retry a 429 — retrying burns more quota without benefit.
+          _m.total429++;
           const geminiMsg = errBody?.error?.message || JSON.stringify(errBody);
-          console.error(`[analyze] ${reqId} 429 GEMINI_QUOTA_EXCEEDED body=${geminiMsg}`);
+          console.error(`[SP:GEMINI] ${reqId} 429 QUOTA_EXCEEDED key=${keyType} — not retrying`);
+          logMetrics(reqId);
           return json({ error: `Gemini API quota exceeded: ${geminiMsg}`, source: "gemini" }, 429);
         }
         return json({ error: `Upstream error ${upstream.status}.` }, 502);
       }
 
       const data = await upstream.json();
-      console.log(`[analyze] ${reqId} gemini_ok mode=${mode}`);
+      console.log(`[SP:GEMINI] ${reqId} attempt=${gAttempt} OK mode=${mode}`);
+      logMetrics(reqId);
       return NextResponse.json(data, { headers: CORS_HEADERS });
     }
   } finally {
