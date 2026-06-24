@@ -1011,7 +1011,11 @@
   // ─── CORE REQUEST FLOW ──────────────────────────────────────────────────────
 
   async function requestAnalysis(messageType, reason = '') {
-    if (state.requestInFlight) return;
+    console.log(`[PostClick] requestAnalysis ENTRY: type=${messageType} reason="${reason}" requestInFlight=${state.requestInFlight} status=${state.status}`);
+    if (state.requestInFlight) {
+      console.warn(`[PostClick] requestAnalysis BLOCKED by requestInFlight — "Re-checking..." will NOT be cleared; awaitingUpdate=${state.awaitingUpdate}`);
+      return;
+    }
 
     const requestToken = ++state.activeRequestToken;
     state.requestInFlight  = true;
@@ -1065,6 +1069,7 @@
         _emitDebug('GEMINI_CALL', { callNumber: state.geminiCallCount, mode: messageType === 'ANALYZE_GOAL' ? 'navigate' : 'reanalyze' });
 
         const t0Gemini = performance.now();
+        console.log(`[PostClick] Gemini REQUEST sent: type=${messageType} reason="${reason}" url="${window.location.href.slice(0, 80)}"`);
         response = await chrome.runtime.sendMessage({
           type:             messageType,
           goal:             state.goal,
@@ -1076,6 +1081,7 @@
         const geminiMs = Math.round(performance.now() - t0Gemini);
         PerfTracer.mark('gemini_roundtrip');
         console.log(`[Perf] Gemini+screenshot: ${geminiMs}ms`);
+        console.log(`[PostClick] Gemini RESPONSE: success=${response?.success} complete=${response?.complete} currentStep="${response?.state?.currentStep || response?.currentStep || '(none)'}" instruction="${(response?.instruction || '').slice(0, 80)}" confidence=${response?.confidence} candidates=${response?.candidates?.length ?? 0}`);
 
         _emitDebug('GEMINI_RESPONSE', {
           latencyMs:  geminiMs,
@@ -1095,13 +1101,17 @@
       if (response?.fromMemory) _emitDebug('MEMORY_HIT', { confidence: response.confidence });
       else if (response?.success && messageType === 'ANALYZE_GOAL') _emitDebug('MEMORY_MISS', {});
 
-      if (requestToken !== state.activeRequestToken) return;
+      if (requestToken !== state.activeRequestToken) {
+        console.warn(`[PostClick] STALE TOKEN: token=${requestToken} activeToken=${state.activeRequestToken} — status="${state.status}" stays "${state.statusMessage}" (Re-checking stuck if OBSERVING)`);
+        return;
+      }
 
       // Extract goal early for dedup — do NOT commit currentTaskState yet.
       // State is only committed after a successful highlight to avoid contradictory UI.
       if (response?.state?.goal) state.goal = response.state.goal;
 
       if (!response?.success) {
+        console.warn(`[PostClick] RESPONSE FAILED: error="${response?.error}" — will show ERROR status`);
         hideStages();
         setStatus('ERROR', response?.error || 'ScreenPilot could not analyze this page.');
         state.requestInFlight = false;
@@ -1111,6 +1121,7 @@
 
       // Handle blocker response from 8-step architecture
       if (response.blocked || response.error?.includes('Sign in') || response.error?.includes('sign in')) {
+        console.warn(`[PostClick] BLOCKED: "${response.error}"`);
         hideStages();
         setStatus('BLOCKED', response.error || 'Action blocked.');
         state.requestInFlight = false;
@@ -1119,11 +1130,14 @@
       }
 
       if (response.complete) {
+        console.log(`[PostClick] GOAL COMPLETE: instruction="${response.instruction}" — calling completeWorkflow`);
         state.currentTaskState = response?.state || state.currentTaskState;
         hideStages();
         completeWorkflow(response.instruction || 'Task complete');
         return;
       }
+
+      console.log(`[PostClick] NOT complete — checking state: urlChanged=${response?.urlChanged} domChanged=${response?.domChanged} replan=${response?.replan}`);
 
       if (response.confidence < LOW_CONFIDENCE_THRESHOLD) {
         const proceed = window.confirm('I am not fully confident. Continue?');
@@ -1148,6 +1162,7 @@
       // Handle case where Gemini found no candidates AND no targetElement
       if (!plannerResult && !response.targetElement?.text) {
         console.log('[UniversalPlanner] No candidates and no targetElement - Gemini could not identify elements');
+        console.warn(`[PostClick] NO ELEMENT: no candidates and no targetElement — instruction="${(response?.instruction || '').slice(0, 80)}"`);
         hideStages();
         setStatus('ERROR', 'Could not identify any actionable elements on this page.');
         return;
@@ -1233,6 +1248,7 @@
 
       if (!finalElement) {
         console.log('[UniversalPlanner] No element found for:', response.targetElement?.text);
+        console.warn(`[PostClick] DOM MATCH FAILED: targetText="${response.targetElement?.text}" instruction="${(response?.instruction || '').slice(0, 80)}" source=${actionSource} — will show ERROR`);
         hideStages();
         setStatus('ERROR', buildMissingElementMessage(response.targetElement));
         return;
@@ -1244,6 +1260,7 @@
       PerfTracer.mark('highlight');
 
       if (!highlighted) {
+        console.warn(`[PostClick] HIGHLIGHT FAILED: element found but not actionable — text="${finalText}" instruction="${finalInstruction.slice(0, 80)}"`);
         hideStages();
         setStatus('ERROR', `I found "${finalText}", but it is not actionable on screen yet.`);
         return;
@@ -1254,6 +1271,7 @@
       state.currentAction    = response;
       state.confidenceLevel  = getConfidenceLevel(response.confidence);
 
+      console.log(`[PostClick] ADVANCED: instruction="${finalInstruction.slice(0, 80)}" source=${actionSource} completedSteps=${response?.state?.completedSteps?.length ?? 0}`);
       finishAllStages();
       setTimeout(hideStages, 600);
       setStatus('HIGHLIGHTING', finalInstruction);
@@ -1278,7 +1296,10 @@
   let _geminiCallSeq = 0;
 
   function triggerReanalysis(reason) {
-    if (!state.goal || state.awaitingUpdate || state.requestInFlight) return;
+    if (!state.goal || state.awaitingUpdate || state.requestInFlight) {
+      console.warn(`[PostClick] triggerReanalysis BLOCKED: goal=${!!state.goal} awaitingUpdate=${state.awaitingUpdate} requestInFlight=${state.requestInFlight} reason="${reason}"`);
+      return;
+    }
     if (state.status === 'COMPLETE') {
       console.log('[PageObserver] Ignoring change because workflow is complete');
       return;
@@ -1302,6 +1323,7 @@
       const planStep = tryPlanStep();
       if (planStep) {
         console.log(`[Transition] SUCCESS: Next step found, executing: "${planStep.step.description}"`);
+        console.log(`[PostClick] triggerReanalysis: PLAN path — step="${planStep.step.description}" score=${planStep.matchScore}`);
         state.awaitingUpdate     = true;
         state.requestInFlight    = true;
         state.highlightedElement = null;
@@ -1312,6 +1334,7 @@
         return;
       } else {
         console.log(`[Transition] FALLBACK: No plan step found, calling Gemini`);
+        console.log(`[PostClick] triggerReanalysis: GEMINI path — no plan step matched, scheduling 900ms reanalysis`);
       }
     }
 
@@ -1335,6 +1358,7 @@
       const clickedElement = state.currentAction?.targetElement?.text || 'unknown';
       const currentState = state.currentTaskState?.taskPlan?.steps?.[state.currentTaskState?.taskPlan?.currentStepIndex]?.state || 'unknown';
       console.log(`[Transition] CLICK: "${clickedElement}", From: ${currentState}`);
+      console.log(`[PostClick] CLICK on "${clickedElement}" — status=${state.status} awaitingUpdate=${state.awaitingUpdate} requestInFlight=${state.requestInFlight}`);
       triggerRipple(event.clientX, event.clientY);
       state.lastUserInteractionAt = Date.now();
       triggerReanalysis('Click detected');

@@ -107,7 +107,9 @@ async function analyzeGoal(message, sender) {
 
 async function reanalyzeGoal(message, sender) {
   const taskState = StateManager.getState();
+  console.log(`[PostClick] reanalyzeGoal: status=${taskState?.status} goal="${(taskState?.goal || '').slice(0, 60)}" reason="${message.reason}"`);
   if (!taskState?.goal || taskState.status !== 'ACTIVE') {
+    console.warn(`[PostClick] reanalyzeGoal BLOCKED: status=${taskState?.status} goal=${!!taskState?.goal} — returning error to content.js`);
     return { success: false, error: 'No active ScreenPilot task to continue.' };
   }
   const isPlanFallback = typeof message.reason === 'string' && message.reason.startsWith('plan-');
@@ -307,12 +309,15 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   }
 
   if (analysis.complete) {
+    console.log(`[PostClick] GOAL COMPLETE (backend): currentStep="${analysis.raw?.currentStep}" instruction="${analysis.instruction}"`);
     await StateManager.complete(analysis.instruction || 'Task complete');
     if (taskId) TelemetryService.completeTask(taskId, 'completed', 'task-complete');
     return buildSuccessResponse(analysis, true);
   }
 
+  console.log(`[PostClick] NOT complete (backend): currentStep="${analysis.raw?.currentStep}" instruction="${(analysis.instruction || '').slice(0, 80)}" replan=${analysis.raw?.replan} urlChanged=${analysis.raw?.urlChanged} domChanged=${analysis.raw?.domChanged}`);
   await StateManager.updateFromAnalysis(analysis, screenshot.timestamp, pageContext);
+  console.log(`[PostClick] state UPDATED: completedSteps=[${StateManager.getState()?.completedSteps?.join(' → ') || 'none'}] currentInstruction="${StateManager.getState()?.currentInstruction?.slice(0, 60)}"`);
   log(`total cycle: ${Date.now() - t0}ms`);
   return buildSuccessResponse(analysis, false);
 }
