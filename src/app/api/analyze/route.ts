@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
+const GEMINI_MODEL = "gemini-2.5-flash";
+
 const MODELS = {
-  navigate: "gemini-2.0-flash",
-  explain:  "gemini-2.0-flash",
-  ask:      "gemini-2.0-flash",
+  navigate: GEMINI_MODEL,
+  explain:  GEMINI_MODEL,
+  ask:      GEMINI_MODEL,
 } as const;
 type Mode = keyof typeof MODELS;
 
