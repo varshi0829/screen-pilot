@@ -28,6 +28,12 @@
       "js": ["v2-task.js"],
       "run_at": "document_idle",
       "type": "module"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["playground/playground.js"],
+      "run_at": "document_idle",
+      "type": "module"
     }
   ],
   "action": {
