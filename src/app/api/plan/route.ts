@@ -516,5 +516,6 @@ Rules:
 - If a destructive action requires explicit user confirmation: result="NEEDS_USER", state="planned".
 - plannerSummary: 1–2 sentences on why this route was chosen (not a step list).
 - Match element text EXACTLY as visible in the screenshot.
+- targetElement.text must NEVER be null or empty. For icon-only or image elements (avatars, icon buttons, logo buttons) with no visible text: use the element's aria-label if shown in the screenshot, or the nearest visible label, or a short descriptive phrase that matches the element's accessible name (e.g. "View profile and more", "profile avatar", "notifications"). This string will be used to locate the element in the DOM — make it unique and matchable.
 - alternatives[]: 2–3 fallback texts for the same element, ordered by likelihood.`;
 }

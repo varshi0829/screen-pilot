@@ -33,6 +33,7 @@ async function handleMessage(message, sender) {
     case 'GET_STATE':              return { success: true, state: StateManager.getState() };
     case 'COMPLETE_TASK':          return completeTask(message);
     case 'ABORT_TASK':             return abortTask(message);
+    case 'CAPTURE_SCREENSHOT':     return captureScreenshot(sender);
     case 'GET_SCREEN_EXPLANATION': return getScreenExplanation(message, sender);
     case 'ASK_QUESTION':           return askQuestion(message, sender);
     case 'TELEMETRY_EVENT':        return handleTelemetryEvent(message);
@@ -87,12 +88,14 @@ async function analyzeGoal(message, sender) {
   const memHit = await MemoryService.findWorkflow(message.goal);
   if (memHit && memHit.confidence >= 0.85) {
     log(`[Memory] Hit — confidence=${memHit.confidence.toFixed(2)} type=${memHit.matchType}`);
+    console.log(`[SP:TRACE:BG] ANALYZE_GOAL path=MEMORY_HIT confidence=${memHit.confidence.toFixed(2)} — NO Gemini call`);
     TelemetryService.recordMemoryHit(taskId);
     ValidationService.recordEvent('MEMORY_HIT', { confidence: memHit.confidence, matchType: memHit.matchType });
     activeAnalysis = null;
     return _buildMemoryResponse(memHit.workflow, memHit.confidence, message, sender);
   }
   ValidationService.recordEvent('MEMORY_MISS', {});
+  console.log(`[SP:TRACE:BG] ANALYZE_GOAL path=MEMORY_MISS → proceeding to Gemini`);
 
   activeAnalysis = null;
   return queueVisionCycle({
@@ -108,6 +111,7 @@ async function analyzeGoal(message, sender) {
 async function reanalyzeGoal(message, sender) {
   const taskState = StateManager.getState();
   console.log(`[PostClick] reanalyzeGoal: status=${taskState?.status} goal="${(taskState?.goal || '').slice(0, 60)}" reason="${message.reason}"`);
+  console.log(`[SP:TRACE:BG] REANALYZE_GOAL reason="${message.reason}" status=${taskState?.status} url="${message.url||'?'}"`);
   if (!taskState?.goal || taskState.status !== 'ACTIVE') {
     console.warn(`[PostClick] reanalyzeGoal BLOCKED: status=${taskState?.status} goal=${!!taskState?.goal} — returning error to content.js`);
     return { success: false, error: 'No active ScreenPilot task to continue.' };
@@ -137,9 +141,11 @@ function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason
 
   if (!forceNew && activeAnalysis?.signature === signature && activeAnalysis?.taskState?.status === 'ACTIVE') {
     console.log(`[Dedup] queueVisionCycle reused — signature="${signature.slice(0, 60)}" reason=${reason}`);
+    console.log(`[SP:TRACE:BG] QUEUE_CYCLE DEDUP reason=${reason} signature="${signature.slice(0,70)}" (returning existing promise, NO extra Gemini call)`);
     return activeAnalysis.promise;
   }
 
+  console.log(`[SP:TRACE:BG] QUEUE_CYCLE NEW reason=${reason} forceNew=${forceNew} signature="${signature.slice(0,70)}" activeAnalysis=${!!activeAnalysis}`);
   const promise = runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }).finally(() => {
     if (activeAnalysis?.promise === promise) activeAnalysis = null;
   });
@@ -151,6 +157,7 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   const t0     = Date.now();
   const taskId = StateManager.getState()?.taskId;
   console.log(`[CALL #${++_bgCallSeq}] reason=${reason}`);
+  console.log(`[SP:TRACE:BG] RUN_CYCLE #${_bgCallSeq} reason=${reason} goal="${goal.slice(0,60)}" url="${pageContext.url||'?'}" taskId=${taskId||'none'}`);
   log('cycle start — reason:', reason);
 
   // Capture progress snapshot before calling Gemini so we can measure advancement.
@@ -443,6 +450,15 @@ async function abortTask(message) {
   ValidationService.endRun('aborted', message.reason || 'user-cancelled').catch(() => {});
   activeAnalysis = null;
   return { success: true, state: StateManager.getState() };
+}
+
+// ─── V2 SCREENSHOT CAPTURE ───────────────────────────────────────────────────
+
+async function captureScreenshot(sender) {
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const validation = ScreenshotService.validateScreenshot(screenshot);
+  if (!validation.valid) return { success: false, error: validation.error };
+  return { success: true, image: screenshot.image, mimeType: screenshot.mimeType };
 }
 
 // ─── EXPLAIN MY SCREEN ────────────────────────────────────────────────────────

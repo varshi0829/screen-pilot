@@ -443,6 +443,12 @@ const DOMMatcher = (() => {
   };
 })();
 
+// Expose on window so ES module content scripts (v2-task.js) can access it.
+// const declarations are not properties of window — this bridges the gap.
+if (typeof window !== 'undefined') {
+  window.DOMMatcher = DOMMatcher;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = DOMMatcher;
 }

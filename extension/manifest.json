@@ -22,6 +22,12 @@
       "js": ["lib/dom-matcher.js", "content.js"],
       "css": ["styles/widget.css"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["v2-task.js"],
+      "run_at": "document_idle",
+      "type": "module"
     }
   ],
   "action": {

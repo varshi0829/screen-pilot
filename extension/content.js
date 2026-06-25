@@ -236,6 +236,9 @@
     }
   };
 
+  // Expose Highlighter to v2 module content scripts (same isolated world).
+  window.__SP_Highlighter = Highlighter;
+
   function applyRect(el, rect, pad = 0) {
     el.style.top    = `${rect.top    - pad}px`;
     el.style.left   = `${rect.left   - pad}px`;
@@ -291,6 +294,16 @@
     },
 
     queueChange(reason) {
+      // Trace every PageObserver fire with its block reason
+      const _blockReason =
+        !state.goal                                              ? 'no_goal' :
+        state.awaitingUpdate                                     ? 'awaitingUpdate' :
+        state.requestInFlight                                    ? 'requestInFlight' :
+        (state.status === 'COMPLETE' || state.status === 'ERROR') ? `status_${state.status}` :
+        state.status === 'HIGHLIGHTING'                           ? 'HIGHLIGHTING_guard' :
+        (Date.now() - state.lastReanalysisAt < REANALYZE_DEBOUNCE_MS) ? `debounce_${REANALYZE_DEBOUNCE_MS}ms` : null;
+      _trace('OBSERVER', { source: reason, status: state.status, blocked: !!_blockReason, blockReason: _blockReason || 'none', inFlight: state.requestInFlight, awaiting: state.awaitingUpdate });
+
       if (!state.goal || state.awaitingUpdate || state.requestInFlight) return;
       if (state.status === 'COMPLETE' || state.status === 'ERROR') return;
       if (state.status === 'HIGHLIGHTING') { console.log(`[Guard] queueChange blocked: HIGHLIGHTING, reason=${reason}`); return; }
@@ -302,6 +315,7 @@
       // no longer match the current UI state. Re-planning is required.
       PageStateCache.invalidate(reason);
 
+      console.log(`[SP:TRACE] PageObserver SCHEDULING triggerReanalysis in ${REANALYZE_DEBOUNCE_MS}ms reason="${reason}"`);
       clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => {
         state.currentUrl = window.location.href;
@@ -777,6 +791,11 @@
         return;
       }
 
+      const _n = ++_userActionSeq;
+      _geminiPerGoal = 0;
+      console.log(`\n[SP:TRACE] ════ ACTION #${_n}: Go button pressed ════`);
+      _trace('ACTION', { n: _n, source: 'go_button', goal, url: window.location.href });
+
       state.goal = goal;
       state.currentUrl = window.location.href;
       state.restoreTriggered = false;
@@ -1012,6 +1031,16 @@
 
   async function requestAnalysis(messageType, reason = '') {
     console.log(`[PostClick] requestAnalysis ENTRY: type=${messageType} reason="${reason}" requestInFlight=${state.requestInFlight} status=${state.status}`);
+    _trace('REQ_ANALYSIS', {
+      source: messageType,
+      reason: reason || messageType,
+      status: state.status,
+      blocked: state.requestInFlight,
+      blockReason: state.requestInFlight ? 'requestInFlight' : 'none',
+      inFlight: state.requestInFlight,
+      awaiting: state.awaitingUpdate,
+      url: window.location.href,
+    });
     if (state.requestInFlight) {
       console.warn(`[PostClick] requestAnalysis BLOCKED by requestInFlight — "Re-checking..." will NOT be cleared; awaitingUpdate=${state.awaitingUpdate}`);
       return;
@@ -1026,6 +1055,7 @@
     // Show staged progress — advance immediately, no artificial delays
     if (messageType === 'ANALYZE_GOAL') {
       state.geminiCallCount = 0;
+      _geminiPerGoal = 0;
       _emitDebug('TASK_START', { goal: state.goal });
       setGoButtonLoading(true);
       showStages();
@@ -1045,9 +1075,12 @@
         const cached = PageStateCache.get(state.goal);
         if (cached) {
           response = cached;
+          _trace('CACHE_HIT', { source: 'PageStateCache', extra: 'skipping Gemini — same URL+goal+DOM fingerprint' });
           PerfTracer.mark('cache_hit');
           _emitDebug('CACHE_HIT', {});
           chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'CACHE_HIT' }).catch(() => {});
+        } else {
+          _trace('CACHE_MISS', { source: 'PageStateCache', extra: 'proceeding to Gemini call' });
         }
       }
 
@@ -1065,7 +1098,19 @@
         }
 
         state.geminiCallCount++;
-        console.log(`[CALL #${++_geminiCallSeq}] reason=${messageType === 'ANALYZE_GOAL' ? 'goal_submit' : reason || 'reanalyze'}`);
+        _geminiPerGoal++;
+        const _callLabel = messageType === 'ANALYZE_GOAL' ? 'goal_submit' : reason || 'reanalyze';
+        const _nowMs = Date.now();
+        const _sinceLastMs = _lastGeminiAt ? (_nowMs - _lastGeminiAt) : 0;
+        _lastGeminiAt = _nowMs;
+        console.log(`[CALL #${++_geminiCallSeq}] reason=${_callLabel}`);
+        console.log(
+          `[SP:TRACE] ──── GEMINI_CALL #${_geminiCallSeq} ────` +
+          ` type=${messageType} reason="${_callLabel}"` +
+          ` callsThisGoal=${_geminiPerGoal}` +
+          ` sinceLastCall=${_sinceLastMs}ms` +
+          ` url="${window.location.href.slice(0,80)}"`
+        );
         _emitDebug('GEMINI_CALL', { callNumber: state.geminiCallCount, mode: messageType === 'ANALYZE_GOAL' ? 'navigate' : 'reanalyze' });
 
         const t0Gemini = performance.now();
@@ -1082,6 +1127,15 @@
         PerfTracer.mark('gemini_roundtrip');
         console.log(`[Perf] Gemini+screenshot: ${geminiMs}ms`);
         console.log(`[PostClick] Gemini RESPONSE: success=${response?.success} complete=${response?.complete} currentStep="${response?.state?.currentStep || response?.currentStep || '(none)'}" instruction="${(response?.instruction || '').slice(0, 80)}" confidence=${response?.confidence} candidates=${response?.candidates?.length ?? 0}`);
+        console.log(
+          `[SP:TRACE] ──── GEMINI_RECV #${_geminiCallSeq} ────` +
+          ` latency=${geminiMs}ms` +
+          ` success=${response?.success}` +
+          ` complete=${response?.complete}` +
+          ` instruction="${(response?.instruction||'').slice(0,60)}"` +
+          ` candidates=${response?.candidates?.length??0}` +
+          ` callsThisGoal=${_geminiPerGoal}`
+        );
 
         _emitDebug('GEMINI_RESPONSE', {
           latencyMs:  geminiMs,
@@ -1293,9 +1347,45 @@
 
   // ─── TRIGGER REANALYSIS ─────────────────────────────────────────────────────
 
-  let _geminiCallSeq = 0;
+  let _geminiCallSeq  = 0;
+  let _userActionSeq  = 0;
+  let _geminiPerGoal  = 0;   // resets each ANALYZE_GOAL
+  let _lastGeminiAt   = 0;
+
+  // Always-on structured trace — shows every trigger chain without altering logic.
+  function _trace(tag, detail = {}) {
+    const parts = [`[SP:TRACE:${tag}]`];
+    if (detail.n        !== undefined) parts.push(`#${detail.n}`);
+    if (detail.source)   parts.push(`src=${detail.source}`);
+    if (detail.reason)   parts.push(`reason="${detail.reason}"`);
+    if (detail.status)   parts.push(`status=${detail.status}`);
+    if (detail.blocked !== undefined) parts.push(detail.blocked ? `BLOCKED(${detail.blockReason})` : 'PROCEED');
+    if (detail.element)  parts.push(`element="${String(detail.element).slice(0,40)}"`);
+    if (detail.goal)     parts.push(`goal="${String(detail.goal).slice(0,60)}"`);
+    if (detail.url)      parts.push(`url="${String(detail.url).slice(0,70)}"`);
+    if (detail.latency !== undefined) parts.push(`latency=${detail.latency}ms`);
+    if (detail.complete !== undefined) parts.push(`complete=${detail.complete}`);
+    if (detail.instruction) parts.push(`instr="${String(detail.instruction).slice(0,60)}"`);
+    if (detail.candidates !== undefined) parts.push(`candidates=${detail.candidates}`);
+    if (detail.geminiPerGoal !== undefined) parts.push(`callsThisGoal=${detail.geminiPerGoal}`);
+    if (detail.inFlight !== undefined) parts.push(`inFlight=${detail.inFlight}`);
+    if (detail.awaiting !== undefined) parts.push(`awaiting=${detail.awaiting}`);
+    if (detail.path)     parts.push(`path=${detail.path}`);
+    if (detail.dedup    !== undefined) parts.push(detail.dedup ? 'DEDUP' : 'NEW_CALL');
+    if (detail.extra)    parts.push(detail.extra);
+    console.log(parts.join(' '));
+  }
 
   function triggerReanalysis(reason) {
+    const _blocked =
+      !state.goal              ? 'no_goal' :
+      state.awaitingUpdate     ? 'awaitingUpdate' :
+      state.requestInFlight    ? 'requestInFlight' :
+      state.status === 'COMPLETE' ? 'status_COMPLETE' :
+      state.status === 'ERROR'    ? 'status_ERROR' :
+      (state.status === 'HIGHLIGHTING' && reason !== 'Click detected') ? 'HIGHLIGHTING_guard' : null;
+    _trace('TRIGGER', { reason, status: state.status, blocked: !!_blocked, blockReason: _blocked || 'none', inFlight: state.requestInFlight, awaiting: state.awaitingUpdate });
+
     if (!state.goal || state.awaitingUpdate || state.requestInFlight) {
       console.warn(`[PostClick] triggerReanalysis BLOCKED: goal=${!!state.goal} awaitingUpdate=${state.awaitingUpdate} requestInFlight=${state.requestInFlight} reason="${reason}"`);
       return;
@@ -1324,6 +1414,7 @@
       if (planStep) {
         console.log(`[Transition] SUCCESS: Next step found, executing: "${planStep.step.description}"`);
         console.log(`[PostClick] triggerReanalysis: PLAN path — step="${planStep.step.description}" score=${planStep.matchScore}`);
+        _trace('TRIGGER', { reason, path: 'PLAN_STEP', extra: `step="${planStep.step.description}" score=${planStep.matchScore}` });
         state.awaitingUpdate     = true;
         state.requestInFlight    = true;
         state.highlightedElement = null;
@@ -1335,7 +1426,10 @@
       } else {
         console.log(`[Transition] FALLBACK: No plan step found, calling Gemini`);
         console.log(`[PostClick] triggerReanalysis: GEMINI path — no plan step matched, scheduling 900ms reanalysis`);
+        _trace('TRIGGER', { reason, path: `GEMINI_TIMER_${CLICK_REANALYZE_DELAY_MS}ms` });
       }
+    } else {
+      _trace('TRIGGER', { reason, path: `DEBOUNCE_TIMER_${CLICK_REANALYZE_DELAY_MS}ms` });
     }
 
     state.awaitingUpdate   = true;
@@ -1346,7 +1440,10 @@
     setStatus('OBSERVING', `${reason}. Re-checking…`);
     log('Reanalysis triggered:', reason);
     clearTimeout(state.reanalyzeTimer);
-    state.reanalyzeTimer = setTimeout(() => requestAnalysis('REANALYZE', reason), CLICK_REANALYZE_DELAY_MS);
+    state.reanalyzeTimer = setTimeout(() => {
+      _trace('TIMER_FIRE', { reason, source: 'reanalyzeTimer', extra: `${CLICK_REANALYZE_DELAY_MS}ms elapsed → requestAnalysis(REANALYZE)` });
+      requestAnalysis('REANALYZE', reason);
+    }, CLICK_REANALYZE_DELAY_MS);
   }
 
   // ─── CLICK HANDLER ──────────────────────────────────────────────────────────
@@ -1359,6 +1456,11 @@
       const currentState = state.currentTaskState?.taskPlan?.steps?.[state.currentTaskState?.taskPlan?.currentStepIndex]?.state || 'unknown';
       console.log(`[Transition] CLICK: "${clickedElement}", From: ${currentState}`);
       console.log(`[PostClick] CLICK on "${clickedElement}" — status=${state.status} awaitingUpdate=${state.awaitingUpdate} requestInFlight=${state.requestInFlight}`);
+
+      const _n = ++_userActionSeq;
+      console.log(`\n[SP:TRACE] ════ ACTION #${_n}: Click on highlighted element ════`);
+      _trace('ACTION', { n: _n, source: 'document_click', element: clickedElement, status: state.status, inFlight: state.requestInFlight, awaiting: state.awaitingUpdate });
+
       triggerRipple(event.clientX, event.clientY);
       state.lastUserInteractionAt = Date.now();
       triggerReanalysis('Click detected');
@@ -1635,9 +1737,13 @@
         renderProgressPanel();
         if (!state.restoreTriggered) {
           state.restoreTriggered = true;
+          _trace('RESTORE', { source: 'restoreTaskState', extra: `ACTIVE task found, scheduling REANALYZE in 1200ms goal="${(taskState.goal||'').slice(0,60)}" url="${window.location.href.slice(0,70)}"` });
           setTimeout(() => {
             if (state.goal && !state.requestInFlight) {
+              _trace('RESTORE_FIRE', { source: 'restoreTaskState_timer', reason: 'restore-after-navigation', goal: state.goal, url: window.location.href });
               requestAnalysis('REANALYZE', 'restore-after-navigation');
+            } else {
+              _trace('RESTORE_FIRE', { source: 'restoreTaskState_timer', extra: `SKIPPED goal=${!!state.goal} inFlight=${state.requestInFlight}` });
             }
           }, 1200);
         }
@@ -1731,8 +1837,11 @@
   // ─── INPUT EVENT HANDLERS ─────────────────────────────────────────────
   function handleInputEvent(event) {
     if (!state.goal || !state.highlightedElement) return;
-    // Check if user typed in the highlighted element
     if (state.highlightedElement.contains(event.target)) {
+      const blockReason = state.status === 'HIGHLIGHTING' ? 'HIGHLIGHTING_guard'
+        : state.awaitingUpdate   ? 'awaitingUpdate'
+        : state.requestInFlight  ? 'requestInFlight' : null;
+      _trace('INPUT', { source: `${event.type}_on_highlighted`, status: state.status, blocked: !!blockReason, blockReason: blockReason || 'none', inFlight: state.requestInFlight, awaiting: state.awaitingUpdate });
       console.log('[PageObserver] Input detected in highlighted element');
       triggerReanalysis('Input detected');
     }
@@ -1740,9 +1849,12 @@
 
   function handleFocusEvent(event) {
     if (!state.goal || !state.highlightedElement) return;
-    // Check if user focused/blurred the highlighted element
     if (state.highlightedElement.contains(event.target)) {
       const reason = event.type === 'focusin' ? 'Focus gained' : 'Focus lost';
+      const blockReason = state.status === 'HIGHLIGHTING' ? 'HIGHLIGHTING_guard'
+        : state.awaitingUpdate   ? 'awaitingUpdate'
+        : state.requestInFlight  ? 'requestInFlight' : null;
+      _trace('FOCUS', { source: reason, status: state.status, blocked: !!blockReason, blockReason: blockReason || 'none', inFlight: state.requestInFlight, awaiting: state.awaitingUpdate });
       console.log('[PageObserver]', reason, 'on highlighted element');
       triggerReanalysis(reason);
     }
