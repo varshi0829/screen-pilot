@@ -304,6 +304,7 @@ export class ExecutorEngine {
     // so we detect the action even if the element stops propagation or navigates away.
     const clickHandler = (e) => {
       if (e.target?.closest?.('#screenpilot-widget')) return; // ignore our own UI
+      if (!this._activeElement || !this._activeElement.contains(e.target)) return;
       onUserAction('click');
     };
     document.addEventListener('click', clickHandler, { capture: true });
@@ -311,8 +312,27 @@ export class ExecutorEngine {
       document.removeEventListener('click', clickHandler, { capture: true })
     );
 
-    // URL-change events cover SPA pushState, back/forward, and hash navigation.
-    const urlChangeHandler = () => onUserAction('url_change');
+    // URL-change events cover SPA pushState and hash navigation.
+    // For v3 steps that declare expectedOutcome, only fire when the URL moved
+    // toward the expected destination. This prevents browser Back (popstate)
+    // from being treated as a successful step completion, which would silently
+    // corrupt session history.
+    // v1 steps without expectedOutcome skip the guard and behave as before.
+    const urlChangeHandler = () => {
+      if (step.expectedOutcome !== undefined) {
+        if (!step.expectedOutcome.urlChanges) return;
+        const pattern = step.expectedOutcome.urlPattern;
+        if (pattern) {
+          try {
+            const { pathname, hash } = new URL(window.location.href);
+            if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
+          } catch {
+            return;
+          }
+        }
+      }
+      onUserAction('url_change');
+    };
     window.addEventListener('popstate',   urlChangeHandler);
     window.addEventListener('hashchange', urlChangeHandler);
     this._cleanups.push(() => {

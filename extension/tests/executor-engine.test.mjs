@@ -43,6 +43,7 @@ const MOCK_ELEMENT = {
   getAttribute:  () => 'Submit',
   innerText:     'Submit',
   closest:       () => null,
+  contains:      () => true,
 };
 
 const MOCK_SNAPSHOT = {
@@ -135,6 +136,7 @@ let pass = 0, fail = 0;
 async function test(name, fn) {
   mockDocument._listeners.clear();
   mockWindow._listeners.clear();
+  mockWindow.location = undefined; // prevent URL from leaking into the next test's direction guard
   try {
     await fn();
     console.log(`  ✓  ${name}`);
@@ -341,6 +343,87 @@ await test('click inside #screenpilot-widget is ignored', async () => {
     new Promise(r => setTimeout(() => r('silent'), 100)),
   ]);
   assert.equal(result, 'silent', 'widget click should not emit user:acted');
+});
+
+await test('click on an off-target element does not advance the step', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([makeStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  // Simulate MOCK_ELEMENT.contains() returning false (click landed elsewhere)
+  const saved = MOCK_ELEMENT.contains;
+  MOCK_ELEMENT.contains = () => false;
+  mockDocument.dispatch('click', { target: { closest: () => null } });
+  MOCK_ELEMENT.contains = saved;
+
+  const result = await Promise.race([
+    nextEvent(ex, 'user:acted').then(() => 'fired'),
+    new Promise(r => setTimeout(() => r('silent'), 100)),
+  ]);
+  assert.equal(result, 'silent', 'off-target click should not emit user:acted');
+  ex.abort();
+});
+
+// ── Direction-aware popstate guard (v3 steps with expectedOutcome) ────────────
+//
+// For v3 steps that declare expectedOutcome.urlPattern, popstate/hashchange
+// must only fire user:acted when the URL moved toward the expected destination.
+// Browser Back in a SPA fires popstate but moves AWAY from the target — it must
+// not be treated as a successful step completion.
+//
+// v1 steps without expectedOutcome skip the guard entirely (backward compatible).
+
+await test('popstate does NOT fire user:acted when URL moved away from expected destination', async () => {
+  // Simulate browser Back: URL is the repo root, but step expects /pulls.
+  mockWindow.location = { href: 'https://github.com/torvalds/linux' };
+
+  const ex   = makeExecutor();
+  const step = makeStep({ expectedOutcome: { urlChanges: true, urlPattern: '/pulls' } });
+  ex.start(makePlan([step]));
+  await nextEvent(ex, 'element:ready');
+
+  // Register BEFORE dispatch — _emit is synchronous. If the guard fires user:acted,
+  // it happens inside dispatch() before the next line, and a late-registered nextEvent
+  // would miss it, turning this into a trivial no-op test that always passes.
+  const acted = nextEvent(ex, 'user:acted');
+  mockWindow.dispatch('popstate');
+  const result = await Promise.race([
+    acted.then(() => 'fired'),
+    new Promise(r => setTimeout(() => r('silent'), 100)),
+  ]);
+  assert.equal(result, 'silent', 'backward popstate must not emit user:acted');
+  ex.abort();
+});
+
+await test('popstate DOES fire user:acted when URL matches expectedOutcome.urlPattern', async () => {
+  // Simulate forward SPA navigation: URL now contains the expected pattern.
+  mockWindow.location = { href: 'https://github.com/torvalds/linux/pulls' };
+
+  const ex   = makeExecutor();
+  const step = makeStep({ expectedOutcome: { urlChanges: true, urlPattern: '/pulls' } });
+  ex.start(makePlan([step]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockWindow.dispatch('popstate');
+  const payload = await acted;
+
+  assert.equal(payload.trigger, 'url_change');
+});
+
+await test('popstate fires user:acted for v1 step without expectedOutcome (backward compat)', async () => {
+  // v1 step has no expectedOutcome — the direction guard is skipped entirely.
+  // This preserves identical behavior for all existing Architecture A flows.
+  const ex   = makeExecutor();
+  const step = makeStep(); // no expectedOutcome
+  ex.start(makePlan([step]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockWindow.dispatch('popstate');
+  const payload = await acted;
+
+  assert.equal(payload.trigger, 'url_change');
 });
 
 await test('double-trigger emits user:acted exactly once', async () => {
