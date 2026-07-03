@@ -137,7 +137,7 @@ export class VercelBackendAdapter extends BackendAdapter {
       'Content-Type': 'application/json',
       'X-Session-ID': this._sessionId,
     };
-    if (this._apiKey) headers['X-Gemini-Key'] = this._apiKey;
+    if (this._apiKey) headers['X-OpenRouter-Key'] = this._apiKey;
 
     // 30 s client-side timeout — matches the Vercel function's own budget ceiling.
     // Without this, a stalled connection hangs the service worker indefinitely.
