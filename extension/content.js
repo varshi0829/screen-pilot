@@ -162,6 +162,7 @@
       if (!element) return false;
 
       await scrollIntoViewIfNeeded(element);
+
       if (!isElementActionable(element) || !isInViewport(element)) return false;
 
       const rect = element.getBoundingClientRect();

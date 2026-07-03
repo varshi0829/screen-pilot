@@ -678,6 +678,8 @@ Return ONLY valid JSON (no markdown, no explanation):
 Rules:
 - Return JSON only. No markdown.
 - Produce ALL steps — never just the next one.
+- Prefer the SHORTEST PATH. If a global navigation control on the current page can achieve the goal (header "+" menu, sidebar Create button, toolbar action), use it directly. Do NOT add steps to navigate to a dashboard or home page first.
+  Examples of always-available global controls: GitHub "+" (new repo/issue/PR from any page), Gmail "Compose" (always in left sidebar), LinkedIn message icon (always in top nav), YouTube "Create" (always in top nav).
 - If the goal is already achieved: state="complete", plan.steps=[].
 - If blocked (not logged in, permission denied): result="OK", state="blocked", list blockers[], plan omitted.
 - If multiple valid paths exist and user must choose: result="NEEDS_USER", state="ambiguous".

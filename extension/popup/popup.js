@@ -8,7 +8,6 @@ document.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('.sp-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === target));
       document.querySelectorAll('.sp-panel').forEach(p => p.classList.toggle('active', p.id === `panel-${target}`));
       if (target === 'analytics')  loadAnalytics();
-      if (target === 'validation') loadValidation();
       if (target === 'settings')   loadSettings();
     });
   });
@@ -31,36 +30,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // PATH A: content script already injected by manifest — send OPEN_WIDGET directly
-      console.log('[SP:LAUNCH] PATH A: attempting sendMessage to existing content script');
-      try {
-        const respA = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
-        console.log('[SP:LAUNCH] PATH A: sendMessage OK, response=', respA, '— closing popup');
-        window.close();
-        return;
-      } catch (innerErr) {
-        console.warn('[SP:LAUNCH] PATH A: sendMessage failed:', innerErr.message, '— proceeding to PATH B');
-      }
-
-      // PATH B: content script not present — inject all scripts manually
-      console.log('[SP:LAUNCH] PATH B: injecting scripts');
-      console.log('[SP:LAUNCH]   → enterprise-context-service.js');
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['services/enterprise-context-service.js'] });
-      console.log('[SP:LAUNCH]   → lib/dom-matcher.js');
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['lib/dom-matcher.js'] });
-      console.log('[SP:LAUNCH]   → content.js');
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
-      console.log('[SP:LAUNCH]   → widget.css');
-      await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ['styles/widget.css'] });
-      console.log('[SP:LAUNCH] PATH B: all scripts injected, waiting 150ms');
-      await new Promise(resolve => setTimeout(resolve, 150));
-      console.log('[SP:LAUNCH] PATH B: sending OPEN_WIDGET');
-      const respB = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_WIDGET' });
-      console.log('[SP:LAUNCH] PATH B: sendMessage OK, response=', respB, '— closing popup');
+      console.log('[SP:LAUNCH] sending START_V2_TASK via background');
+      const resp = await chrome.runtime.sendMessage({ type: 'START_V2_TASK', tabId: tab.id });
+      if (!resp?.success) throw new Error(resp?.error || 'Could not open ScreenPilot');
+      console.log('[SP:LAUNCH] overlay opened — closing popup');
       window.close();
     } catch (error) {
-      console.error('[SP:LAUNCH] OUTER ERROR:', error.message, error);
-      statusEl.textContent = 'Could not open ScreenPilot: ' + error.message;
+      console.error('[SP:LAUNCH] ERROR:', error.message, error);
+      statusEl.textContent = 'ScreenPilot needs to activate on this page first. Press Ctrl+R (Cmd+R on Mac) to reload, then click Open ScreenPilot again.';
       statusEl.className = 'status error';
     }
   });
@@ -138,22 +115,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Settings tab ──────────────────────────────────────────────────────────────
   async function loadSettings() {
-    const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+    const { openRouterApiKey } = await chrome.storage.local.get('openRouterApiKey');
     const statusEl = document.getElementById('key-status');
-    const inputEl  = document.getElementById('gemini-key-input');
-    if (geminiApiKey) {
-      inputEl.placeholder = '••••••••' + geminiApiKey.slice(-4);
-      statusEl.textContent = 'Your key is active — using your own Gemini quota';
+    const inputEl  = document.getElementById('openrouter-key-input');
+    if (openRouterApiKey) {
+      inputEl.placeholder = '••••••••' + openRouterApiKey.slice(-4);
+      statusEl.textContent = 'Your key is active — using your own OpenRouter quota';
       statusEl.className = 'sp-key-status saved';
     } else {
-      inputEl.placeholder = 'AIza...';
+      inputEl.placeholder = 'sk-or-...';
       statusEl.textContent = 'No key set — using shared quota (may hit limits)';
       statusEl.className = 'sp-key-status';
     }
   }
 
   document.getElementById('save-key-btn').addEventListener('click', async () => {
-    const inputEl  = document.getElementById('gemini-key-input');
+    const inputEl  = document.getElementById('openrouter-key-input');
     const statusEl = document.getElementById('key-status');
     const key = inputEl.value.trim();
     if (!key) {
@@ -161,19 +138,19 @@ document.addEventListener('DOMContentLoaded', () => {
       statusEl.className = 'sp-key-status error';
       return;
     }
-    await chrome.storage.local.set({ geminiApiKey: key });
+    await chrome.storage.local.set({ openRouterApiKey: key });
     inputEl.value = '';
     inputEl.placeholder = '••••••••' + key.slice(-4);
-    statusEl.textContent = 'Key saved — using your own Gemini quota';
+    statusEl.textContent = 'Key saved — using your own OpenRouter quota';
     statusEl.className = 'sp-key-status saved';
   });
 
   document.getElementById('clear-key-btn').addEventListener('click', async () => {
-    await chrome.storage.local.remove('geminiApiKey');
-    const inputEl  = document.getElementById('gemini-key-input');
+    await chrome.storage.local.remove('openRouterApiKey');
+    const inputEl  = document.getElementById('openrouter-key-input');
     const statusEl = document.getElementById('key-status');
     inputEl.value = '';
-    inputEl.placeholder = 'AIza...';
+    inputEl.placeholder = 'sk-or-...';
     statusEl.textContent = 'Key cleared — using shared quota';
     statusEl.className = 'sp-key-status';
   });

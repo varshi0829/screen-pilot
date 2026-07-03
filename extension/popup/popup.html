@@ -8,13 +8,15 @@
     body {
       width: 340px;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: #111827;
+      background: #0d0d0d;
+      color: #f0f0f0;
     }
 
     /* ── Tab bar ── */
     .sp-tabs {
       display: flex;
-      border-bottom: 1px solid #e5e7eb;
+      background: #0d0d0d;
+      border-bottom: 1px solid rgba(255,255,255,0.07);
     }
     .sp-tab {
       flex: 1;
@@ -23,64 +25,67 @@
       border: none;
       font-size: 13px;
       font-weight: 500;
-      color: #6b7280;
+      color: #555;
       cursor: pointer;
       border-bottom: 2px solid transparent;
       margin-bottom: -1px;
     }
-    .sp-tab.active { color: #111827; border-bottom-color: #111827; }
-    .sp-tab:hover:not(.active) { color: #374151; }
+    .sp-tab.active { color: #f0f0f0; border-bottom-color: #cc2222; }
+    .sp-tab:hover:not(.active) { color: #999; }
 
     /* ── Tab panels ── */
-    .sp-panel { padding: 18px; display: none; }
+    .sp-panel { padding: 16px; display: none; }
     .sp-panel.active { display: block; }
 
     /* ── Launch panel ── */
     .status {
-      padding: 11px 13px;
-      background: #f3f4f6;
+      padding: 10px 13px;
+      background: #161616;
+      border: 1px solid rgba(255,255,255,0.07);
       border-radius: 8px;
       font-size: 13px;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
+      color: #999;
     }
-    .status.ready { background: #ecfdf5; color: #059669; }
-    .status.error { background: #fef2f2; color: #dc2626; }
+    .status.ready { background: rgba(34,197,94,0.08); border-color: rgba(34,197,94,0.2); color: #86efac; }
+    .status.error { background: rgba(204,34,34,0.08); border-color: rgba(204,34,34,0.2); color: #fca5a5; }
     .sp-btn-launch {
       width: 100%;
       padding: 10px;
-      background: #111827;
+      background: #cc2222;
       color: white;
       border: none;
-      border-radius: 6px;
+      border-radius: 7px;
       font-size: 14px;
-      font-weight: 500;
+      font-weight: 600;
       cursor: pointer;
+      letter-spacing: 0.01em;
     }
-    .sp-btn-launch:hover { background: #374151; }
+    .sp-btn-launch:hover { background: #aa1111; }
 
     /* ── Analytics panel ── */
     .sp-kpi-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-bottom: 16px;
+      gap: 7px;
+      margin-bottom: 14px;
     }
     .sp-kpi {
-      background: #f8fafc;
-      border: 1px solid #e5e7eb;
+      background: #161616;
+      border: 1px solid rgba(255,255,255,0.07);
       border-radius: 8px;
-      padding: 10px 12px;
+      padding: 9px 11px;
     }
     .sp-kpi-value {
-      font-size: 20px;
+      font-size: 19px;
       font-weight: 700;
-      color: #111827;
+      color: #f0f0f0;
       line-height: 1.2;
     }
-    .sp-kpi-value.good  { color: #059669; }
-    .sp-kpi-value.warn  { color: #d97706; }
-    .sp-kpi-value.empty { color: #9ca3af; font-size: 16px; }
-    .sp-kpi-label { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    .sp-kpi-value.good  { color: #22c55e; }
+    .sp-kpi-value.warn  { color: #f59e0b; }
+    .sp-kpi-value.empty { color: #444; font-size: 16px; }
+    .sp-kpi-label { font-size: 11px; color: #555; margin-top: 2px; }
 
     .sp-section-header {
       display: flex;
@@ -89,21 +94,21 @@
       margin-bottom: 8px;
     }
     .sp-section-title {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 600;
-      color: #374151;
+      color: #444;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
     }
     .sp-btn-clear {
       font-size: 11px;
-      color: #9ca3af;
+      color: #444;
       background: none;
       border: none;
       cursor: pointer;
       padding: 2px 4px;
     }
-    .sp-btn-clear:hover { color: #ef4444; }
+    .sp-btn-clear:hover { color: #cc2222; }
 
     .sp-tasks-list { max-height: 200px; overflow-y: auto; }
     .sp-task-row {
@@ -111,7 +116,7 @@
       align-items: center;
       gap: 8px;
       padding: 7px 0;
-      border-bottom: 1px solid #f3f4f6;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
       font-size: 12px;
     }
     .sp-task-row:last-child { border-bottom: none; }
@@ -121,183 +126,81 @@
       border-radius: 50%;
       flex-shrink: 0;
     }
-    .sp-task-dot.completed { background: #10b981; }
-    .sp-task-dot.failed    { background: #ef4444; }
-    .sp-task-dot.aborted   { background: #9ca3af; }
+    .sp-task-dot.completed { background: #22c55e; }
+    .sp-task-dot.failed    { background: #cc2222; }
+    .sp-task-dot.aborted   { background: #444; }
     .sp-task-dot.active    { background: #3b82f6; }
     .sp-task-goal {
       flex: 1;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      color: #374151;
+      color: #999;
     }
-    .sp-task-meta { color: #9ca3af; white-space: nowrap; }
+    .sp-task-meta { color: #444; white-space: nowrap; }
     .sp-no-data {
       text-align: center;
       padding: 24px 0;
-      color: #9ca3af;
+      color: #444;
       font-size: 12px;
     }
 
-    /* ── Validation panel ── */
-    .sp-score-card {
-      background: #f8fafc;
-      border: 1px solid #e5e7eb;
-      border-radius: 10px;
-      padding: 14px 16px;
-      margin-bottom: 14px;
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .sp-score-ring {
-      width: 52px;
-      height: 52px;
-      border-radius: 50%;
-      border: 4px solid #e5e7eb;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 18px;
-      font-weight: 700;
-      color: #9ca3af;
-      flex-shrink: 0;
-    }
-    .sp-score-ring.green  { border-color: #10b981; color: #059669; }
-    .sp-score-ring.amber  { border-color: #f59e0b; color: #d97706; }
-    .sp-score-ring.orange { border-color: #f97316; color: #ea580c; }
-    .sp-score-ring.red    { border-color: #ef4444; color: #dc2626; }
-    .sp-score-label {
-      font-size: 13px;
-      font-weight: 600;
-      color: #111827;
-    }
-    .sp-score-sub {
-      font-size: 11px;
-      color: #6b7280;
-      margin-top: 2px;
-    }
-    .sp-val-section { margin-bottom: 12px; }
-    .sp-val-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 6px;
-    }
-    .sp-val-select {
-      flex: 1;
-      font-size: 12px;
-      padding: 5px 8px;
-      border: 1px solid #d1d5db;
-      border-radius: 5px;
-      background: white;
-      color: #111827;
-    }
+    /* ── Settings panel ── */
     .sp-btn-small {
       font-size: 12px;
       padding: 5px 10px;
-      background: #111827;
+      background: #cc2222;
       color: white;
       border: none;
       border-radius: 5px;
       cursor: pointer;
       white-space: nowrap;
     }
-    .sp-btn-small:hover { background: #374151; }
+    .sp-btn-small:hover { background: #aa1111; }
     .sp-btn-small.outline {
-      background: white;
-      color: #374151;
-      border: 1px solid #d1d5db;
+      background: #161616;
+      color: #999;
+      border: 1px solid rgba(255,255,255,0.12);
     }
-    .sp-btn-small.outline:hover { background: #f9fafb; }
-    .sp-btn-small.active {
-      background: #059669;
-    }
-    .sp-val-runs {
-      max-height: 150px;
-      overflow-y: auto;
-    }
-    .sp-val-run-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 0;
-      border-bottom: 1px solid #f3f4f6;
-      font-size: 11px;
-    }
-    .sp-val-run-row:last-child { border-bottom: none; }
-    .sp-val-run-goal {
-      flex: 1;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      color: #374151;
-    }
-    .sp-val-run-meta { color: #9ca3af; white-space: nowrap; }
-    .sp-breakdown {
-      background: #f8fafc;
-      border: 1px solid #e5e7eb;
-      border-radius: 8px;
-      padding: 8px 10px;
-      margin-bottom: 10px;
-    }
-    .sp-breakdown-row {
-      display: flex;
-      align-items: center;
-      font-size: 11px;
-      padding: 3px 0;
-      gap: 6px;
-    }
-    .sp-breakdown-name { flex: 1; color: #6b7280; }
-    .sp-breakdown-bar-wrap {
-      width: 60px;
-      height: 5px;
-      background: #e5e7eb;
-      border-radius: 3px;
-      overflow: hidden;
-    }
-    .sp-breakdown-bar { height: 100%; background: #3b82f6; border-radius: 3px; }
-    .sp-breakdown-pts { width: 36px; text-align: right; color: #111827; font-weight: 600; }
-
-    /* ── Settings panel ── */
+    .sp-btn-small.outline:hover { background: #1e1e1e; color: #f0f0f0; }
     .sp-setting-group { margin-bottom: 16px; }
     .sp-setting-label {
       display: block;
       font-size: 12px;
       font-weight: 600;
-      color: #374151;
+      color: #999;
       margin-bottom: 4px;
     }
     .sp-setting-hint {
       font-size: 11px;
-      color: #6b7280;
+      color: #444;
       margin-bottom: 8px;
       line-height: 1.4;
     }
-    .sp-setting-hint a { color: #3b82f6; text-decoration: none; }
+    .sp-setting-hint a { color: #cc2222; text-decoration: none; }
     .sp-setting-hint a:hover { text-decoration: underline; }
     .sp-key-input {
       width: 100%;
       padding: 7px 10px;
       font-size: 13px;
-      border: 1px solid #d1d5db;
+      background: #060606;
+      border: 1px solid rgba(255,255,255,0.1);
       border-radius: 6px;
       margin-bottom: 8px;
       font-family: monospace;
+      color: #f0f0f0;
     }
-    .sp-key-input:focus { outline: none; border-color: #111827; }
+    .sp-key-input:focus { outline: none; border-color: #cc2222; }
     .sp-setting-actions { display: flex; gap: 6px; margin-bottom: 8px; }
-    .sp-key-status { font-size: 11px; color: #6b7280; }
-    .sp-key-status.saved { color: #059669; }
-    .sp-key-status.error { color: #dc2626; }
+    .sp-key-status { font-size: 11px; color: #444; }
+    .sp-key-status.saved { color: #22c55e; }
+    .sp-key-status.error { color: #fca5a5; }
   </style>
 </head>
 <body>
   <div class="sp-tabs">
     <button class="sp-tab active" data-tab="launch">Launch</button>
     <button class="sp-tab" data-tab="analytics">Analytics</button>
-    <button class="sp-tab" data-tab="validation">Validation</button>
     <button class="sp-tab" data-tab="settings">Settings</button>
   </div>
 
@@ -318,7 +221,7 @@
       </div>
       <div class="sp-kpi">
         <div class="sp-kpi-value empty" id="kpi-gemini-per-task">—</div>
-        <div class="sp-kpi-label">Gemini / Task</div>
+        <div class="sp-kpi-label">AI / Task</div>
       </div>
       <div class="sp-kpi">
         <div class="sp-kpi-value empty" id="kpi-completion">—</div>
@@ -329,7 +232,7 @@
     <div class="sp-kpi-grid">
       <div class="sp-kpi">
         <div class="sp-kpi-value empty" id="kpi-gemini-avoided">—</div>
-        <div class="sp-kpi-label">Gemini Avoidance</div>
+        <div class="sp-kpi-label">AI Avoidance</div>
       </div>
       <div class="sp-kpi">
         <div class="sp-kpi-value empty" id="kpi-recovery">—</div>
@@ -354,56 +257,15 @@
     </div>
   </div>
 
-  <div class="sp-panel" id="panel-validation">
-    <!-- Readiness score -->
-    <div class="sp-score-card">
-      <div class="sp-score-ring" id="val-score-ring">—</div>
-      <div>
-        <div class="sp-score-label" id="val-score-label">No data yet</div>
-        <div class="sp-score-sub" id="val-score-sub">Run tasks to generate a report</div>
-      </div>
-    </div>
-
-    <!-- Score breakdown (hidden until report loaded) -->
-    <div class="sp-breakdown" id="val-breakdown" style="display:none"></div>
-
-    <!-- Benchmark runner -->
-    <div class="sp-val-section">
-      <div class="sp-section-header">
-        <span class="sp-section-title">Run Benchmark</span>
-      </div>
-      <div class="sp-val-row">
-        <select class="sp-val-select" id="val-benchmark-select"></select>
-        <button class="sp-btn-small" id="val-run-btn">Run</button>
-      </div>
-      <div id="val-hint" style="font-size:11px;color:#9ca3af;margin-bottom:6px"></div>
-    </div>
-
-    <!-- Toolbox row -->
-    <div class="sp-val-row" style="margin-bottom:12px">
-      <button class="sp-btn-small outline" id="val-overlay-btn">Debug Overlay: Off</button>
-      <button class="sp-btn-small outline" id="val-report-btn">Generate Report</button>
-      <button class="sp-btn-small outline" id="val-clear-btn">Clear</button>
-    </div>
-
-    <!-- Recent validation runs -->
-    <div class="sp-section-header">
-      <span class="sp-section-title">Recent Runs</span>
-    </div>
-    <div class="sp-val-runs" id="val-runs-list">
-      <div class="sp-no-data">No validation runs yet</div>
-    </div>
-  </div>
-
   <div class="sp-panel" id="panel-settings">
     <div class="sp-setting-group">
-      <label class="sp-setting-label">Gemini API Key</label>
+      <label class="sp-setting-label">OpenRouter API Key</label>
       <p class="sp-setting-hint">
-        Paste your own free key to use your personal quota instead of the shared one.
-        Get one free at <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a>
-        (1,500 requests/day free).
+        Paste your own key to use your personal quota instead of the shared one.
+        Get one free at <a href="https://openrouter.ai/keys" target="_blank">OpenRouter</a>
+        (free tier available).
       </p>
-      <input type="password" id="gemini-key-input" placeholder="AIza..." class="sp-key-input" autocomplete="off" />
+      <input type="password" id="openrouter-key-input" placeholder="sk-or-..." class="sp-key-input" autocomplete="off" />
       <div class="sp-setting-actions">
         <button class="sp-btn-small" id="save-key-btn">Save Key</button>
         <button class="sp-btn-small outline" id="clear-key-btn">Clear</button>

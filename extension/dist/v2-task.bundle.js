@@ -1335,6 +1335,8 @@ ${lines.join("\n")}`);
   var _tabId = null;
   var _generation = 0;
   var _executor = null;
+  var _taskContext = null;
+  var _taskStartedAt = null;
   var MAX_CLARIFICATIONS = 5;
   var STATUS_ID = "sp-v2-status-banner";
   function showStatus(text, type = "info") {
@@ -1360,8 +1362,8 @@ ${lines.join("\n")}`);
       document.body.appendChild(el);
     }
     const bg = {
-      planning: "#1a55d6",
-      info: "#1a1a2e",
+      planning: "#cc2222",
+      info: "#0d0d0d",
       success: "#0a6b0a",
       error: "#b02020",
       validating: "#7a5500",
@@ -1374,6 +1376,62 @@ ${lines.join("\n")}`);
   function hideStatus() {
     document.getElementById(STATUS_ID)?.remove();
   }
+  function showTaskPanel(ctx) {
+    if (!ctx) return;
+    document.getElementById(STATUS_ID)?.remove();
+    const el = document.createElement("div");
+    el.id = STATUS_ID;
+    el.style.cssText = [
+      "position:fixed",
+      "top:16px",
+      "right:16px",
+      "z-index:2147483647",
+      "width:272px",
+      "background:#0d0d0d",
+      "border-radius:10px",
+      "font-family:system-ui,-apple-system,sans-serif",
+      "box-shadow:0 4px 24px rgba(0,0,0,0.6)",
+      "border:1px solid rgba(255,255,255,0.08)",
+      "overflow:hidden",
+      "pointer-events:none"
+    ].join(";");
+    const recent = (ctx.steps || []).slice(-5);
+    const stepsHtml = recent.map(
+      (s) => `<div style="display:flex;align-items:flex-start;gap:7px;padding:1px 0;font-size:11px"><span style="flex-shrink:0;color:#3a7d44">\u2713</span><span style="color:#555">${s.description}</span></div>`
+    ).join("");
+    const currentHtml = ctx.currentStep ? `<div style="display:flex;align-items:flex-start;gap:7px;padding:2px 0;font-size:11px"><span style="flex-shrink:0;color:#cc2222;font-weight:700">\u2192</span><span style="color:#f0f0f0;font-weight:600">${ctx.currentStep}</span></div>` : "";
+    const n = (ctx.steps || []).length;
+    const progress = n === 0 ? "Starting\u2026" : `${n} step${n !== 1 ? "s" : ""} completed`;
+    el.innerHTML = `<div style="padding:8px 12px 6px;border-bottom:1px solid rgba(255,255,255,0.05)"><div style="font-size:10px;font-weight:700;color:#cc2222;letter-spacing:0.1em;text-transform:uppercase">ScreenPilot</div><div style="font-size:11px;color:#888;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${ctx.goal || ""}</div></div>` + (stepsHtml || currentHtml ? `<div style="padding:6px 12px">${stepsHtml}${currentHtml}</div>` : "") + `<div style="padding:3px 12px 7px;font-size:10px;color:#333">${progress}</div>`;
+    document.body.appendChild(el);
+  }
+  function showCompletionCard(data) {
+    hideStatus();
+    const card = document.createElement("div");
+    card.id = STATUS_ID;
+    card.style.cssText = [
+      "position:fixed",
+      "top:16px",
+      "right:16px",
+      "z-index:2147483647",
+      "width:272px",
+      "background:#0d0d0d",
+      "border-radius:10px",
+      "font-family:system-ui,-apple-system,sans-serif",
+      "box-shadow:0 4px 24px rgba(0,0,0,0.6)",
+      "border:1px solid rgba(255,255,255,0.08)",
+      "overflow:hidden"
+    ].join(";");
+    const elapsed = data.startedAt ? Math.round((Date.now() - data.startedAt) / 1e3) : null;
+    const timeText = elapsed != null ? elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : "";
+    card.innerHTML = `<div style="padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,0.05);text-align:center"><div style="font-size:18px;color:#3a7d44;margin-bottom:3px">\u2713</div><div style="font-size:11px;font-weight:700;color:#3a7d44;letter-spacing:0.08em;text-transform:uppercase">Task Completed</div></div><div style="padding:10px 14px 8px"><div style="font-size:11px;color:#999;line-height:1.4">${data.goal || "Goal completed"}</div><div style="display:flex;gap:12px;margin-top:6px"><span style="font-size:10px;color:#555">Steps: <span style="color:#777">${data.steps}</span></span>` + (timeText ? `<span style="font-size:10px;color:#555">Time: <span style="color:#777">${timeText}</span></span>` : "") + `</div></div><div style="padding:0 14px 12px"><button id="sp-v2-newtask-btn" style="width:100%;padding:7px;background:#cc2222;color:#fff;border:none;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0.03em">Start New Task</button></div>`;
+    document.body.appendChild(card);
+    document.getElementById("sp-v2-newtask-btn").addEventListener("click", () => {
+      hideStatus();
+      openV2Overlay();
+    });
+    setTimeout(hideStatus, 1e4);
+  }
   var PAUSED_ID = "sp-v2-paused-banner";
   function showPausedBanner(session) {
     document.getElementById(PAUSED_ID)?.remove();
@@ -1385,7 +1443,7 @@ ${lines.join("\n")}`);
       "right:24px",
       "z-index:2147483647",
       "width:300px",
-      "background:#1a1a2e",
+      "background:#0d0d0d",
       "border-radius:14px",
       "box-shadow:0 8px 40px rgba(0,0,0,0.5)",
       "font-family:system-ui,-apple-system,sans-serif",
@@ -1395,31 +1453,31 @@ ${lines.join("\n")}`);
     const isBlocked = session.pauseReason === "blocked";
     const blockerHtml = session.currentBlocker ? `<div style="font-size:11px;color:#ffcc44;margin-top:6px;line-height:1.4">${session.currentBlocker}</div>` : "";
     const instructionHtml = isBlocked ? `<div style="font-size:11px;color:#aaa;margin-top:4px;line-height:1.4">
-         Resolve this in the page, then click Resume.
-       </div>` : "";
+       Resolve this in the page, then click Resume.
+     </div>` : "";
     banner.innerHTML = `
-    <div style="padding:14px 16px">
-      <div style="font-size:12px;font-weight:600;color:#888;letter-spacing:0.06em;text-transform:uppercase">
-        ${isBlocked ? "Action required" : "Workflow paused"}
-      </div>
-      <div style="font-size:13px;color:#fff;margin-top:4px;line-height:1.4">
-        ${session.goal}
-      </div>
-      ${blockerHtml}
-      ${instructionHtml}
-      <div style="display:flex;gap:8px;margin-top:12px">
-        <button id="sp-v2-resume-btn"
-          style="flex:1;padding:8px;background:#3b82f6;color:#fff;border:none;
-                 border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">
-          Resume
-        </button>
-        <button id="sp-v2-stop-btn"
-          style="flex:1;padding:8px;background:rgba(255,255,255,0.08);color:#fff;border:none;
-                 border-radius:8px;font-size:13px;cursor:pointer">
-          Stop
-        </button>
-      </div>
-    </div>`;
+  <div style="padding:14px 16px">
+    <div style="font-size:12px;font-weight:600;color:#888;letter-spacing:0.06em;text-transform:uppercase">
+      ${isBlocked ? "Action required" : "Workflow paused"}
+    </div>
+    <div style="font-size:13px;color:#fff;margin-top:4px;line-height:1.4">
+      ${session.goal}
+    </div>
+    ${blockerHtml}
+    ${instructionHtml}
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button id="sp-v2-resume-btn"
+        style="flex:1;padding:8px;background:#cc2222;color:#fff;border:none;
+               border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">
+        Resume
+      </button>
+      <button id="sp-v2-stop-btn"
+        style="flex:1;padding:8px;background:rgba(255,255,255,0.08);color:#fff;border:none;
+               border-radius:8px;font-size:13px;cursor:pointer">
+        Stop
+      </button>
+    </div>
+  </div>`;
     document.body.appendChild(banner);
     document.getElementById("sp-v2-resume-btn").addEventListener("click", _handleResume);
     document.getElementById("sp-v2-stop-btn").addEventListener("click", _handleStop);
@@ -1438,7 +1496,7 @@ ${lines.join("\n")}`);
       "right:24px",
       "z-index:2147483647",
       "width:320px",
-      "background:#1a1a2e",
+      "background:#0d0d0d",
       "border-radius:14px",
       "box-shadow:0 8px 40px rgba(0,0,0,0.5)",
       "font-family:system-ui,-apple-system,sans-serif",
@@ -1447,37 +1505,37 @@ ${lines.join("\n")}`);
     ].join(";");
     const summaryHtml = session.ambiguitySummary ? `<div style="font-size:11px;color:#ffcc44;margin-top:6px;line-height:1.4;font-style:italic">${session.ambiguitySummary}</div>` : "";
     banner.innerHTML = `
-    <div style="padding:14px 16px">
-      <div style="font-size:12px;font-weight:600;color:#888;letter-spacing:0.06em;text-transform:uppercase">
-        Need your input
-      </div>
-      <div style="font-size:13px;color:#fff;margin-top:4px;line-height:1.4">
-        ${session.goal}
-      </div>
-      ${summaryHtml}
-      <div style="font-size:11px;color:#ccc;margin-top:8px;line-height:1.4">
-        Describe which option to take, or click Continue to try again:
-      </div>
-      <textarea id="sp-v2-clarification-input"
-        placeholder="e.g. Use the Billing menu, not Workspace Billing"
-        rows="2"
-        style="width:100%;box-sizing:border-box;margin-top:6px;background:#0d0d1a;
-               border:1px solid #2a2a4a;border-radius:8px;color:#fff;font-size:12px;
-               padding:8px 10px;resize:none;outline:none;font-family:inherit;line-height:1.5">
-      </textarea>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button id="sp-v2-clarify-btn"
-          style="flex:1;padding:8px;background:#3b82f6;color:#fff;border:none;
-                 border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">
-          Continue
-        </button>
-        <button id="sp-v2-ambig-stop-btn"
-          style="flex:1;padding:8px;background:rgba(255,255,255,0.08);color:#fff;border:none;
-                 border-radius:8px;font-size:13px;cursor:pointer">
-          Stop
-        </button>
-      </div>
-    </div>`;
+  <div style="padding:14px 16px">
+    <div style="font-size:12px;font-weight:600;color:#888;letter-spacing:0.06em;text-transform:uppercase">
+      Need your input
+    </div>
+    <div style="font-size:13px;color:#fff;margin-top:4px;line-height:1.4">
+      ${session.goal}
+    </div>
+    ${summaryHtml}
+    <div style="font-size:11px;color:#ccc;margin-top:8px;line-height:1.4">
+      Describe which option to take, or click Continue to try again:
+    </div>
+    <textarea id="sp-v2-clarification-input"
+      placeholder="e.g. Use the Billing menu, not Workspace Billing"
+      rows="2"
+      style="width:100%;box-sizing:border-box;margin-top:6px;background:#161616;
+             border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;font-size:12px;
+             padding:8px 10px;resize:none;outline:none;font-family:inherit;line-height:1.5">
+    </textarea>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button id="sp-v2-clarify-btn"
+        style="flex:1;padding:8px;background:#cc2222;color:#fff;border:none;
+               border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">
+        Continue
+      </button>
+      <button id="sp-v2-ambig-stop-btn"
+        style="flex:1;padding:8px;background:rgba(255,255,255,0.08);color:#fff;border:none;
+               border-radius:8px;font-size:13px;cursor:pointer">
+        Stop
+      </button>
+    </div>
+  </div>`;
     document.body.appendChild(banner);
     document.getElementById("sp-v2-clarify-btn").addEventListener("click", () => {
       const text = document.getElementById("sp-v2-clarification-input")?.value ?? "";
@@ -1511,7 +1569,7 @@ ${lines.join("\n")}`);
         element.style.borderRadius = "4px";
         _el = element;
         const b = document.createElement("div");
-        b.style.cssText = "position:fixed;bottom:88px;left:50%;transform:translateX(-50%);background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:10px;font-family:system-ui,sans-serif;font-size:13px;z-index:2147483646;max-width:380px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.45)";
+        b.style.cssText = "position:fixed;bottom:88px;left:50%;transform:translateX(-50%);background:#0d0d0d;color:#fff;padding:10px 18px;border-radius:10px;font-family:system-ui,sans-serif;font-size:13px;z-index:2147483646;max-width:380px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.45)";
         b.textContent = text;
         document.body.appendChild(b);
         _bubble = b;
@@ -1579,7 +1637,8 @@ ${lines.join("\n")}`);
     return "ambiguous";
   }
   async function _runPlanLoop(tabId, myGen) {
-    const adapter = new VercelBackendAdapter();
+    const { openRouterApiKey } = await chrome.storage.local.get("openRouterApiKey");
+    const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? void 0 });
     while (true) {
       if (_generation !== myGen) {
         console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} \u2014 exiting`);
@@ -1657,9 +1716,12 @@ ${lines.join("\n")}`);
       const outcome = resolveOutcome(planResp);
       if (outcome === "goal_reached") {
         applyEvent(TaskEvent.PLAN_COMPLETE);
-        showStatus("\u2713 Goal achieved!", "success");
+        showCompletionCard({
+          goal: freshSession.goal,
+          steps: freshSession.completedSteps.length,
+          startedAt: _taskStartedAt
+        });
         await SessionStore.clear(tabId);
-        setTimeout(hideStatus, 4e3);
         return;
       }
       if (outcome === "blocked") {
@@ -1754,7 +1816,12 @@ ${lines.join("\n")}`);
       }
       executor.on("element:ready", async ({ step }) => {
         applyEvent(TaskEvent.ELEMENT_READY, { intent: plannerStep.intent });
-        showStatus(step.description, "info");
+        if (_taskContext) {
+          _taskContext.currentStep = step.description;
+          showTaskPanel(_taskContext);
+        } else {
+          showStatus(step.description, "info");
+        }
         await SessionStore.markPendingStep(tabId, buildPendingStepContext(step));
       });
       executor.on("element:not_found", ({ reason, isOptional }) => {
@@ -1765,6 +1832,10 @@ ${lines.join("\n")}`);
       executor.on("user:acted", async ({ step, trigger }) => {
         applyEvent(TaskEvent.USER_ACTED, { trigger });
         if (expectsNavigation) {
+          if (_taskContext) {
+            _taskContext.steps.push({ description: step.description });
+            _taskContext.currentStep = null;
+          }
           done("navigated");
           return;
         }
@@ -1786,6 +1857,10 @@ ${lines.join("\n")}`);
           completedAt: Date.now()
         });
         applyEvent(TaskEvent.VALIDATION_PASSED, { verdict });
+        if (_taskContext) {
+          _taskContext.steps.push({ description: step.description });
+          _taskContext.currentStep = null;
+        }
         executor.advance();
       });
       executor.on("plan:complete", () => {
@@ -1935,6 +2010,8 @@ ${lines.join("\n")}`);
     hideAmbiguousBanner();
     hideStatus();
     _state = TaskState.IDLE;
+    _taskContext = { goal, steps: [], startedAt: Date.now() };
+    _taskStartedAt = Date.now();
     console.log("[SP:V2] \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
     console.log(`[SP:V2] [${ts()}] New task: "${goal}"`);
     console.log(`[SP:V2] [${ts()}] Page: ${window.location.href}`);
@@ -1970,26 +2047,26 @@ ${lines.join("\n")}`);
       "right:24px",
       "z-index:2147483646",
       "width:320px",
-      "background:#1a1a2e",
+      "background:#0d0d0d",
       "border-radius:14px",
       "box-shadow:0 8px 40px rgba(0,0,0,0.5)",
       "font-family:system-ui,-apple-system,sans-serif",
       "overflow:hidden"
     ].join(";");
     overlay.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px 0">
-      <span style="font-size:13px;font-weight:600;color:#fff;letter-spacing:0.02em">ScreenPilot</span>
-      <button id="sp-v2-close-btn" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer;line-height:1;padding:2px 4px">\xD7</button>
-    </div>
-    <div style="padding:12px 16px 16px">
-      <textarea id="sp-v2-goal-input" placeholder="What do you want to do?" rows="3"
-        style="width:100%;box-sizing:border-box;background:#0d0d1a;border:1px solid #2a2a4a;border-radius:8px;
-               color:#fff;font-size:13px;padding:10px 12px;resize:none;outline:none;
-               font-family:inherit;line-height:1.5"></textarea>
-      <button id="sp-v2-start-btn"
-        style="margin-top:8px;width:100%;padding:10px;background:#3b82f6;color:#fff;border:none;
-               border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Start \u2192</button>
-    </div>`;
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px 0">
+    <span style="font-size:13px;font-weight:600;color:#fff;letter-spacing:0.02em">ScreenPilot</span>
+    <button id="sp-v2-close-btn" style="background:none;border:none;color:#888;font-size:20px;cursor:pointer;line-height:1;padding:2px 4px">\xD7</button>
+  </div>
+  <div style="padding:12px 16px 16px">
+    <textarea id="sp-v2-goal-input" placeholder="What do you want to do?" rows="3"
+      style="width:100%;box-sizing:border-box;background:#161616;border:1px solid rgba(255,255,255,0.1);border-radius:8px;
+             color:#fff;font-size:13px;padding:10px 12px;resize:none;outline:none;
+             font-family:inherit;line-height:1.5"></textarea>
+    <button id="sp-v2-start-btn"
+      style="margin-top:8px;width:100%;padding:10px;background:#cc2222;color:#fff;border:none;
+             border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Start \u2192</button>
+  </div>`;
     document.body.appendChild(overlay);
     document.getElementById("sp-v2-close-btn").addEventListener("click", closeV2Overlay);
     const goalInput = document.getElementById("sp-v2-goal-input");

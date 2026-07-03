@@ -115,9 +115,10 @@ export const RecoveryStrategy = Object.freeze({
 
 /** Minimum DOMMatcher score to accept an element as resolved. */
 export const ElementResolutionThreshold = Object.freeze({
-  PRIMARY:   60,
-  RECOVERY:  50,
-  REGION:    50,
+  PRIMARY:    60,
+  RECOVERY:   50,
+  REGION:     50,
+  CONFIDENCE: 0.40,  // normalized 0–1; only enforced on PRIMARY path (≡ score≥60 at divisor=150)
 });
 
 // ─── TYPE DEFINITIONS (JSDoc) ─────────────────────────────────────────────────
@@ -311,6 +312,11 @@ export const ElementResolutionThreshold = Object.freeze({
  * @property {string[]} [applicationMetadata.navigationHierarchy]
  * @property {number}  [applicationMetadata.confidence] - 0–1; planner skips this if below its own threshold
  *
+ * @property {string[]} [clarifications]
+ *   Ordered list of user clarification texts from this session.
+ *   Maps from WorkflowSession.clarifications[].text; sent only when non-empty.
+ *   The planner uses these to resolve ambiguous goals without re-asking the user.
+ *
  * @property {ExtensionBag} [extensions]
  */
 
@@ -370,6 +376,94 @@ export const ElementResolutionThreshold = Object.freeze({
  *
  * @property {string} [error]                 - Human-readable; present when result === "FAILED"
  * @property {string} [errorCode]             - Machine-readable: "QUOTA_EXCEEDED" | "TIMEOUT" | "PARSE_ERROR" | ...
+ */
+
+// ─── SESSION STORE TYPES ──────────────────────────────────────────────────────
+
+/**
+ * Phase of an active workflow session.
+ * Stored in WorkflowSession.phase and written to chrome.storage.session.
+ *
+ * @typedef {'PLANNING'|'EXECUTING'|'PAUSED'} SessionPhase
+ */
+
+/**
+ * Context for the currently-highlighted step, persisted before any user interaction.
+ * Written at element:ready — before navigation can destroy the content script.
+ * Read by the resume logic on the next page to classify the navigation.
+ *
+ * @typedef {Object} PendingStepContext
+ * @property {string}      description         - Step instruction shown to user
+ * @property {string}      intent              - Semantic intent; stable across UI text changes
+ * @property {string}      completionCondition - CompletionCondition value for this step
+ * @property {string|null} expectedUrlPattern  - Substring expected in URL after this step; null for non-nav steps
+ * @property {boolean}     expectedUrlChanges  - Whether a URL change is expected at all
+ * @property {string}      urlBefore           - window.location.href when element:ready fired
+ * @property {number}      stepStartedAt       - Unix ms when element:ready fired
+ */
+
+/**
+ * Record of a confirmed completed step, appended to WorkflowSession.completedSteps.
+ * Append-only — never mutated after creation.
+ *
+ * @typedef {Object} StepRecord
+ * @property {string} description         - Human-readable step description
+ * @property {string} intent              - Semantic intent
+ * @property {string} completionCondition - How this step was completed
+ * @property {string} urlBefore           - URL when the step was started
+ * @property {string} urlAfter            - URL after the step was confirmed complete
+ * @property {number} completedAt         - Unix ms when completion was confirmed
+ */
+
+/**
+ * Persistent workflow session stored in chrome.storage.session, keyed by tab ID.
+ * Survives content script lifecycle changes (page navigations, SPA transitions).
+ * Cleared automatically when the browser closes.
+ *
+ * Invariants:
+ *   - goal is never mutated after creation
+ *   - completedSteps is append-only
+ *   - schemaVersion is checked on every load; mismatches are discarded
+ *   - expiresAt is extended on every write; checked on every load
+ *
+ * @typedef {Object} WorkflowSession
+ * @property {string}              sessionId            - UUID; never mutated after creation
+ * @property {number}              tabId                - Chrome tab ID; namespaces the session
+ * @property {'3'}                 schemaVersion        - Schema version; mismatches discard the session
+ * @property {string}              goal                 - Original goal string; never mutated
+ *
+ * @property {StepRecord[]}        completedSteps       - Append-only history of confirmed steps
+ * @property {number}              planVersion          - Incremented on each /api/plan call
+ *
+ * @property {number}              plannerAttemptCount  - Total /api/plan calls since session start
+ * @property {number}              stepAttemptCount     - /api/plan calls on the current step; resets on step completion
+ * @property {number}              lastProgressAt       - Unix ms of last confirmed step completion
+ *
+ * @property {PendingStepContext|null} pendingStep      - Context for the currently-highlighted step
+ *
+ * @property {SessionPhase}        phase                - Current lifecycle phase
+ *
+ * @property {'blocked'|'ambiguous'|'navigation'|null} pauseReason
+ *   - 'blocked':   Planner returned state=blocked. User must resolve precondition then click Resume.
+ *   - 'ambiguous': Planner returned state=ambiguous. User must submit clarification text.
+ *   - 'navigation': Navigation was classified BACK_BUTTON or UNKNOWN. User must choose Resume or Stop.
+ *   - null: Unknown or legacy pause (treat as navigation interruption in UI).
+ *   Written by patchSession(); absent from schema when not paused.
+ *
+ * @property {string|null}         ambiguitySummary
+ *   Planner's explanation of why the goal is ambiguous (plannerSummary from PlanResponse).
+ *   Present only when pauseReason === 'ambiguous'. Displayed in the ambiguous banner.
+ *
+ * @property {Array<{text: string, ambiguitySummary: string|null, addedAt: number}>} clarifications
+ *   Ordered list of user-submitted clarifications for this workflow.
+ *   Appended on each ambiguous banner submit; capped at 5 entries (oldest dropped).
+ *   Duplicate texts (case-insensitive) are moved to the end rather than duplicated.
+ *   Persists across page loads and navigation events; cleared on new task start.
+ *   Sent to /api/plan as a separate structured field (not merged into goal text).
+ *
+ * @property {number}              createdAt            - Unix ms of session creation
+ * @property {number}              updatedAt            - Unix ms of last write
+ * @property {number}              expiresAt            - updatedAt + 1800000; session discarded after this
  */
 
 /**

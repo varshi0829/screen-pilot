@@ -46,6 +46,8 @@ async function handleMessage(message, sender) {
     case 'GET_BENCHMARKS':           return { success: true, benchmarks: ValidationService.getBenchmarks() };
     case 'CLEAR_VALIDATION':         await ValidationService.clear(); return { success: true };
     case 'RUN_BENCHMARK':            return runBenchmark(message, sender);
+    case 'GET_TAB_ID':               return { success: true, tabId: sender.tab?.id ?? null };
+    case 'START_V2_TASK':            return startV2Task(message, sender);
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
@@ -584,6 +586,19 @@ async function runBenchmark(message, sender) {
   }
 
   return { success: true, benchmark };
+}
+
+// ─── V2 TASK ─────────────────────────────────────────────────────────────────
+
+async function startV2Task(message, sender) {
+  const tabId = message.tabId || sender.tab?.id;
+  if (!tabId) return { success: false, error: 'No target tab specified.' };
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'START_V2_TASK' });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: 'Content script not reachable. Please reload the page.' };
+  }
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────

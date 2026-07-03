@@ -4,6 +4,15 @@
 const DOMMatcher = (() => {
   'use strict';
 
+  // Score adjustments for region matching.
+  // Applied when targetElement.region is provided and detectRegion() agrees/disagrees.
+  const REGION_MATCH_BONUS     = 20;
+  const REGION_MISMATCH_PENALTY = 8;
+
+  // Divisor used to normalise raw score (0–200) → confidence (0.0–1.0).
+  // A single perfect exact-text match scores 110; dividing by 150 yields 0.73.
+  const CONFIDENCE_DIVISOR = 150;
+
   // Generic UI synonyms — no application names, no site-specific phrases.
   // Covers common action labels that mean the same thing across different UIs.
   const SYNONYM_GROUPS = [
@@ -25,19 +34,18 @@ const DOMMatcher = (() => {
       return null;
     }
 
-    const target = buildTargetDescriptor(targetElement);
+    const target       = buildTargetDescriptor(targetElement);
+    const targetRegion = targetElement.region ?? null;
     // Single querySelectorAll instead of N separate calls — major perf win on large DOMs
     const combinedSelector = getCandidateSelectors(targetElement.type).join(',');
     const candidates = new Map();
 
     for (const element of document.querySelectorAll(combinedSelector)) {
       if (!isVisible(element)) continue;
-      if (isScreenPilotNode(element)) {
-        // console.log('[DOMMatcher] Excluded ScreenPilot overlay candidate');
-        continue;
-      }
+      if (isDisabled(element)) continue;          // skip disabled/aria-disabled elements
+      if (isScreenPilotNode(element)) continue;
 
-      const candidate = scoreElement(element, target, targetElement.type);
+      const candidate = scoreElement(element, target, targetElement.type, targetRegion);
       if (!candidate || candidate.score <= 0) continue;
 
       const existing = candidates.get(element);
@@ -49,14 +57,22 @@ const DOMMatcher = (() => {
       return null;
     }
 
+    const best       = ranked[0];
+    // Confidence normalises raw score (0–200) to 0–1 for observability and telemetry.
+    // It is NOT an independent ranking system — both the value and the enforcement threshold
+    // derive from the same score scale. Raise CONFIDENCE in types/index.js only when
+    // production distribution data shows that a higher cut-off reduces wrong-element matches.
+    const confidence = Math.min(best.score / CONFIDENCE_DIVISOR, 1.0);
+
     return {
-      bestMatch:    ranked[0],
+      bestMatch:    best,
       alternatives: ranked.slice(1, 5),
-      candidates:   ranked.slice(0, 5),   // for score distribution telemetry
-      element:      ranked[0].element,
-      score:        ranked[0].score,
-      reason:       ranked[0].reason,
-      matchType:    ranked[0].matchType
+      candidates:   ranked.slice(0, 5),   // top-5 for debugging and telemetry
+      element:      best.element,
+      score:        best.score,
+      confidence,                          // 0.0–1.0 normalized match quality
+      reason:       best.reason,
+      matchType:    best.matchType,
     };
   }
 
@@ -75,7 +91,7 @@ const DOMMatcher = (() => {
     };
   }
 
-  function scoreElement(element, target, targetType) {
+  function scoreElement(element, target, targetType, targetRegion) {
     const attributes = getCandidateAttributes(element);
     let aggregateScore = 0;
     let bestReason = '';
@@ -102,25 +118,70 @@ const DOMMatcher = (() => {
       return null;
     }
 
-    const semantic = scoreSemanticContainer(element, target, targetType);
+    const semantic  = scoreSemanticContainer(element, target, targetType);
     const typeBonus = scoreTypeAffinity(element, targetType);
-    const finalScore = Math.min(Math.round(aggregateScore + semantic.score + typeBonus.score), 200);
+    const region    = scoreRegion(element, targetRegion);
+    const finalScore = Math.min(
+      Math.round(aggregateScore + semantic.score + typeBonus.score + region.score),
+      200
+    );
+
     const reasonParts = matchedReasons.slice(0, 3);
-
-    if (semantic.reason) {
-      reasonParts.push(semantic.reason);
-    }
-
-    if (typeBonus.reason) {
-      reasonParts.push(typeBonus.reason);
-    }
+    if (semantic.reason)  reasonParts.push(semantic.reason);
+    if (typeBonus.reason) reasonParts.push(typeBonus.reason);
+    if (region.reason)    reasonParts.push(region.reason);
 
     return {
       element,
-      score: finalScore,
-      reason: Array.from(new Set(reasonParts)).join('; '),
-      matchType: bestMatchType || 'fuzzy'
+      score:     finalScore,
+      reason:    Array.from(new Set(reasonParts)).join('; '),
+      matchType: bestMatchType || 'fuzzy',
     };
+  }
+
+  // Score region match between element's actual DOM region and the planner's expected region.
+  // A match boosts the element, a mismatch penalises it — critical for disambiguating pages
+  // that have the same label in multiple regions (e.g. "Billing" in top nav vs sidebar).
+  //
+  // INVARIANT: Region is a soft signal — a score boost/penalty, never a hard filter.
+  // Rejecting by region alone would cause element:not_found whenever the planner's region
+  // inference is wrong (common for <nav> elements misclassified by the left-position
+  // heuristic). The -8 mismatch only affects borderline matches (score 60–67); all
+  // high-confidence matches survive even a wrong region classification.
+  function scoreRegion(element, targetRegion) {
+    if (!targetRegion) return { score: 0, reason: '' };
+    const detected = detectRegion(element);
+    if (detected === targetRegion) {
+      return { score: REGION_MATCH_BONUS, reason: `region:${detected}` };
+    }
+    return { score: -REGION_MISMATCH_PENALTY, reason: '' };
+  }
+
+  // Return true when the element is non-interactive because it is disabled.
+  // Checks both the native DOM property and the ARIA attribute.
+  function isDisabled(element) {
+    if (element.disabled === true) return true;
+    if (element.getAttribute?.('aria-disabled') === 'true') return true;
+    return false;
+  }
+
+  // Return true when the element has a non-zero bounding rect that intersects the viewport.
+  //
+  // INVARIANT: isInViewport must NOT be called from matchElement's candidate filter.
+  // Elements below the fold are valid targets — highlighter.show() calls scrollIntoView
+  // to bring them into view. Filtering off-screen elements here would cause systematic
+  // element:not_found failures on any settings page or long form where key targets
+  // (Save, Submit, Delete) appear below the initial viewport. Export-only; diagnostic use.
+  function isInViewport(element) {
+    try {
+      const rect = element.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+      const vw = (typeof window !== 'undefined' ? window.innerWidth  : 0) || 0;
+      const vh = (typeof window !== 'undefined' ? window.innerHeight : 0) || 0;
+      return rect.bottom > 0 && rect.right > 0 && rect.top < vh && rect.left < vw;
+    } catch {
+      return true; // non-browser environment — assume in viewport
+    }
   }
 
   function getCandidateAttributes(element) {
@@ -438,8 +499,10 @@ const DOMMatcher = (() => {
   return {
     matchElement,
     isVisible,
+    isDisabled,
+    isInViewport,
     classifyActionType,
-    detectRegion
+    detectRegion,
   };
 })();
 

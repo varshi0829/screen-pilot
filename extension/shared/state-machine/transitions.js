@@ -41,6 +41,13 @@ export const TaskState = Object.freeze({
    */
   RECOVERING: 'RECOVERING',
 
+  /**
+   * Workflow interrupted by unexpected navigation, a back-button event,
+   * or an auth redirect. Waiting for the user to choose Resume or Stop.
+   * The session is preserved; re-planning happens if the user resumes.
+   */
+  PAUSED: 'PAUSED',
+
   /** Goal successfully completed. */
   COMPLETE: 'COMPLETE',
 
@@ -87,6 +94,38 @@ export const TaskEvent = Object.freeze({
   STEP_CORRECTED:  'STEP_CORRECTED',
   REPLAN_RECEIVED: 'REPLAN_RECEIVED',
   RECOVERY_FAILED: 'RECOVERY_FAILED',
+
+  // Architecture B — session resume and progressive planning
+  //
+  // SESSION_RESUME:   A valid session was found on content script init. Skip the
+  //                   goal overlay and go directly to PLANNING on the current page.
+  //
+  // REPLAN_TRIGGERED: The current plan is exhausted on the same page (no navigation
+  //                   occurred). The orchestrator calls /api/plan again immediately.
+  //                   This is the key Architecture B loop-back transition.
+  //
+  // WORKFLOW_PAUSED:  Navigation classification returned UNKNOWN or BACK_BUTTON,
+  //                   or the planner returned state=blocked.
+  //                   The session is preserved; the user must decide to Resume or Stop.
+  //
+  // USER_RESUMED:     User clicked "Resume" from the PAUSED banner.
+  //                   The orchestrator calls /api/plan on the current page with full history.
+  //
+  // PLAN_COMPLETE:    The planner returned state=complete — goal already achieved.
+  //                   Transitions directly from PLANNING to COMPLETE without executing
+  //                   any step. Architecture B only.
+  SESSION_RESUME:    'SESSION_RESUME',
+  REPLAN_TRIGGERED:  'REPLAN_TRIGGERED',
+  WORKFLOW_PAUSED:   'WORKFLOW_PAUSED',
+  USER_RESUMED:      'USER_RESUMED',
+  PLAN_COMPLETE:     'PLAN_COMPLETE',
+
+  // AMBIGUOUS_RECEIVED: Planner returned state=ambiguous while in PLANNING.
+  //   Multiple valid execution paths exist and cannot be disambiguated from the
+  //   screenshot alone. Session is paused (pauseReason='ambiguous') so the user
+  //   can provide a clarification. Clears when the user submits clarification and
+  //   USER_RESUMED fires to re-enter the plan loop.
+  AMBIGUOUS_RECEIVED: 'AMBIGUOUS_RECEIVED',
 });
 
 // ─── TRANSITION TABLE ─────────────────────────────────────────────────────────
@@ -100,17 +139,29 @@ export const TaskEvent = Object.freeze({
 export const TRANSITIONS = Object.freeze({
   [TaskState.IDLE]: {
     [TaskEvent.GOAL_SUBMITTED]:  TaskState.PLANNING,
+    // Architecture B: valid session found on page load — resume without showing overlay
+    [TaskEvent.SESSION_RESUME]:  TaskState.PLANNING,
+    // Architecture B: URL classification returned UNKNOWN/BACK_BUTTON before any step ran
+    [TaskEvent.WORKFLOW_PAUSED]: TaskState.PAUSED,
   },
 
   [TaskState.PLANNING]: {
     [TaskEvent.PLAN_RECEIVED]:   TaskState.EXECUTING,
     [TaskEvent.PLAN_FAILED]:     TaskState.ERROR,
     [TaskEvent.CANCEL_CLICKED]:  TaskState.IDLE,
+    // Architecture B: planner confirmed goal already achieved — no step required
+    [TaskEvent.PLAN_COMPLETE]:   TaskState.COMPLETE,
+    // Architecture B: planner returned blocked; session paused for user to resolve precondition
+    [TaskEvent.WORKFLOW_PAUSED]: TaskState.PAUSED,
+    // Architecture B: planner returned ambiguous; session paused for user clarification
+    [TaskEvent.AMBIGUOUS_RECEIVED]: TaskState.PAUSED,
   },
 
   [TaskState.EXECUTING]: {
     [TaskEvent.ELEMENT_READY]:     TaskState.AWAITING_USER,
     [TaskEvent.ELEMENT_NOT_FOUND]: TaskState.RECOVERING,
+    // Architecture B: plan exhausted after a non-navigation step; re-plan on same page
+    [TaskEvent.REPLAN_TRIGGERED]:  TaskState.PLANNING,
     [TaskEvent.CANCEL_CLICKED]:    TaskState.IDLE,
   },
 
@@ -135,6 +186,10 @@ export const TRANSITIONS = Object.freeze({
   },
 
   [TaskState.RECOVERING]: {
+    // Architecture B: element:not_found recovery — replan from current state
+    [TaskEvent.REPLAN_TRIGGERED]: TaskState.PLANNING,
+    // Architecture B: step-attempt budget exhausted while recovering
+    [TaskEvent.PLAN_FAILED]:      TaskState.ERROR,
     // Provider returned a corrected single step
     [TaskEvent.STEP_CORRECTED]:  TaskState.EXECUTING,
     // Provider returned a new full plan from current state
@@ -142,6 +197,12 @@ export const TRANSITIONS = Object.freeze({
     // Attempts exhausted, quota error, or provider failure
     [TaskEvent.RECOVERY_FAILED]: TaskState.ERROR,
     [TaskEvent.CANCEL_CLICKED]:  TaskState.IDLE,
+  },
+
+  // Architecture B: workflow interrupted; waiting for user decision
+  [TaskState.PAUSED]: {
+    [TaskEvent.USER_RESUMED]:   TaskState.PLANNING,  // re-plan from current page with full history
+    [TaskEvent.CANCEL_CLICKED]: TaskState.IDLE,
   },
 
   [TaskState.COMPLETE]: {

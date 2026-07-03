@@ -2,24 +2,24 @@
 
 /* ===== TOKENS ===== */
 #screenpilot-widget {
-  --sp-red: #FF0000;
-  --sp-red-dark: #CC0000;
-  --sp-red-glow: rgba(255, 0, 0, 0.15);
+  --sp-red: #CC2222;
+  --sp-red-dark: #AA1111;
+  --sp-red-glow: rgba(204, 34, 34, 0.20);
   --sp-green: #22C55E;
-  --sp-green-bg: rgba(34, 197, 94, 0.08);
+  --sp-green-bg: rgba(34, 197, 94, 0.10);
   --sp-amber: #F59E0B;
-  --sp-amber-bg: rgba(245, 158, 11, 0.08);
-  --sp-bg: #FFFFFF;
-  --sp-bg-2: #F8F9FA;
-  --sp-bg-3: #F1F3F5;
-  --sp-text: #111827;
-  --sp-text-2: #4B5563;
-  --sp-text-3: #9CA3AF;
-  --sp-border: rgba(0, 0, 0, 0.07);
-  --sp-border-2: rgba(0, 0, 0, 0.12);
-  --sp-shadow-sm: 0 1px 3px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.05);
-  --sp-shadow: 0 4px 16px rgba(0,0,0,.10), 0 1px 4px rgba(0,0,0,.06);
-  --sp-shadow-lg: 0 20px 48px rgba(0,0,0,.14), 0 4px 12px rgba(0,0,0,.08), 0 0 0 1px rgba(0,0,0,.05);
+  --sp-amber-bg: rgba(245, 158, 11, 0.10);
+  --sp-bg: #0d0d0d;
+  --sp-bg-2: #161616;
+  --sp-bg-3: #1e1e1e;
+  --sp-text: #f0f0f0;
+  --sp-text-2: #999999;
+  --sp-text-3: #444444;
+  --sp-border: rgba(255, 255, 255, 0.07);
+  --sp-border-2: rgba(255, 255, 255, 0.13);
+  --sp-shadow-sm: 0 1px 3px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.25);
+  --sp-shadow: 0 4px 16px rgba(0,0,0,.45), 0 1px 4px rgba(0,0,0,.30);
+  --sp-shadow-lg: 0 20px 48px rgba(0,0,0,.65), 0 4px 12px rgba(0,0,0,.40), 0 0 0 1px rgba(255,255,255,0.06);
   --sp-radius: 18px;
   --sp-radius-md: 12px;
   --sp-radius-sm: 8px;
@@ -448,12 +448,12 @@
 
 #screenpilot-widget .sp-confidence-warning {
   background: var(--sp-amber-bg);
-  color: #92400E;
+  color: #fbbf24;
 }
 
 #screenpilot-widget .sp-confidence-low {
-  background: rgba(239,68,68,0.08);
-  color: #991B1B;
+  background: rgba(204,34,34,0.10);
+  color: #f87171;
 }
 
 /* Step list */
@@ -547,17 +547,17 @@
 #screenpilot-widget .sp-status-bar.sp-status-idle .sp-status-dot { background: var(--sp-text-3); }
 
 #screenpilot-widget .sp-status-bar.sp-status-analyzing {
-  background: rgba(99,102,241,.07);
-  color: #4338CA;
+  background: rgba(99,102,241,.12);
+  color: #a5b4fc;
 }
 #screenpilot-widget .sp-status-bar.sp-status-analyzing .sp-status-dot {
-  background: #6366F1;
+  background: #818cf8;
   animation: sp-blink 1s ease-in-out infinite;
 }
 
 #screenpilot-widget .sp-status-bar.sp-status-observing {
   background: var(--sp-amber-bg);
-  color: #92400E;
+  color: #fcd34d;
 }
 #screenpilot-widget .sp-status-bar.sp-status-observing .sp-status-dot {
   background: var(--sp-amber);
@@ -566,21 +566,21 @@
 
 #screenpilot-widget .sp-status-bar.sp-status-highlighting {
   background: var(--sp-green-bg);
-  color: #166534;
+  color: #86efac;
 }
 #screenpilot-widget .sp-status-bar.sp-status-highlighting .sp-status-dot { background: var(--sp-green); }
 
 #screenpilot-widget .sp-status-bar.sp-status-complete {
   background: var(--sp-green-bg);
-  color: #166534;
+  color: #86efac;
 }
 #screenpilot-widget .sp-status-bar.sp-status-complete .sp-status-dot { background: var(--sp-green); }
 
 #screenpilot-widget .sp-status-bar.sp-status-error {
-  background: rgba(239,68,68,.07);
-  color: #991B1B;
+  background: rgba(204,34,34,.12);
+  color: #fca5a5;
 }
-#screenpilot-widget .sp-status-bar.sp-status-error .sp-status-dot { background: #EF4444; }
+#screenpilot-widget .sp-status-bar.sp-status-error .sp-status-dot { background: #f87171; }
 
 @keyframes sp-blink {
   0%, 100% { opacity: 1; }
@@ -607,7 +607,7 @@
 }
 
 #screenpilot-widget .sp-btn-cancel:hover {
-  background: #E5E7EB;
+  background: var(--sp-bg-3);
   color: var(--sp-text);
 }
 

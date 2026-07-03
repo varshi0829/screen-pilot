@@ -224,51 +224,121 @@ export class ExecutorEngine {
       return;
     }
 
-    const { element, score } = resolved;
-    this._activeElement = element;
+    const allCandidates = [resolved, ...(resolved.alternatives ?? [])];
+    let lastFailureReason = `No element matched "${step.targetElement?.text ?? '(no text)'}"`;
 
-    // ── 3. Highlight the element ──────────────────────────────────────────
-    const shown = await this._highlighter.show(element, step.description);
+    // ── 3–4. Try each ranked candidate in order ───────────────────────────
+    // For each: run _selfCheck then highlighter.show(). The first candidate
+    // that passes both becomes the active element. Failures silently advance
+    // to the next candidate — no event is emitted until all are exhausted.
+    for (let _ci = 0; _ci < allCandidates.length; _ci++) {
+      const candidate = allCandidates[_ci];
+      const { element, score } = candidate;
 
-    // Guard: abort() or a second start() may have changed status during the await.
-    if (this._status === 'aborted') return;
+      // ── [DIAG] Candidate identity ──────────────────────────────────────
+      {
+        const tag       = element.tagName?.toLowerCase() ?? '?';
+        const text      = (element.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 50);
+        const ariaLabel = element.getAttribute?.('aria-label') ?? '';
+        const id        = element.id ?? '';
+        const cls       = (typeof element.className === 'string' ? element.className : '').slice(0, 60);
+        console.log(
+          `[SP:Exec] Candidate ${_ci + 1}/${allCandidates.length} score=${score}` +
+          ` <${tag}> id="${id}" class="${cls}"` +
+          ` text="${text}" aria-label="${ariaLabel}"`
+        );
+      }
 
-    if (!shown) {
-      // Element resolved but became off-screen or detached before rendering.
-      this._activeElement = null;
-      this._status        = 'idle';
-      this._emit('element:not_found', {
-        step,
-        reason:     `Element resolved (score=${score}) but could not be highlighted — may be off-screen or detached`,
-        isOptional: step.optional ?? false,
-      });
+      // ── 3. Pre-highlight self-check ────────────────────────────────────
+      // Element may have been detached, disabled, or hidden by a React/Vue
+      // re-render in the microtask(s) between resolution and this check.
+      const check = this._selfCheck(element);
+      // ── [DIAG] Self-check result ───────────────────────────────────────
+      console.log(`[SP:Exec] _selfCheck → ok=${check.ok}${check.ok ? '' : ' reason="' + check.reason + '"'}`);
+      if (!check.ok) {
+        lastFailureReason = `Self-check failed before highlight: ${check.reason}`;
+        continue;
+      }
+
+      // ── [DIAG] Pre-show element state ─────────────────────────────────
+      {
+        let rect = null;
+        try { rect = element.getBoundingClientRect?.(); } catch { /* ignore */ }
+        console.log(
+          `[SP:Exec] pre-show state:` +
+          ` connected=${element.isConnected}` +
+          ` disabled=${element.disabled ?? element.getAttribute?.('disabled')}` +
+          ` aria-disabled="${element.getAttribute?.('aria-disabled') ?? ''}"` +
+          (rect ? ` rect={t:${rect.top.toFixed(0)},l:${rect.left.toFixed(0)},b:${rect.bottom.toFixed(0)},r:${rect.right.toFixed(0)},w:${rect.width.toFixed(0)},h:${rect.height.toFixed(0)}}` : ' rect=unavailable')
+        );
+      }
+
+      this._activeElement = element;
+
+      // ── 4. Highlight the element ───────────────────────────────────────
+      const shown = await this._highlighter.show(element, step.description);
+      // ── [DIAG] Show result ────────────────────────────────────────────
+      console.log(`[SP:Exec] highlighter.show() → ${shown}`);
+
+      // Guard: abort() or a second start() may have changed status during the await.
+      if (this._status === 'aborted') return;
+
+      if (!shown) {
+        // This candidate is off-screen or detached — try the next one.
+        this._activeElement = null;
+        lastFailureReason   = `Element resolved (score=${score}) but could not be highlighted — may be off-screen or detached`;
+        continue;
+      }
+
+      // ── 5. Refresh snapshot with highlighted element in context ────────
+      const elementText = this._elementAccessibleText(element);
+      this._preActionSnapshot = this._captureSnapshot(elementText);
+
+      // ── 6. Wait for user interaction ───────────────────────────────────
+      this._status = 'awaiting';
+      this._watchForUserAction(step);
+      this._emit('element:ready', { step, element, snapshot: this._preActionSnapshot });
       return;
     }
 
-    // ── 4. Refresh snapshot with highlighted element in context ───────────
-    const elementText = this._elementAccessibleText(element);
-    this._preActionSnapshot = this._captureSnapshot(elementText);
-
-    // ── 5. Wait for user interaction ──────────────────────────────────────
-    this._status = 'awaiting';
-    this._watchForUserAction(step);
-    this._emit('element:ready', { step, element, snapshot: this._preActionSnapshot });
+    // All candidates exhausted — report the last failure reason.
+    this._status = 'idle';
+    this._emit('element:not_found', {
+      step,
+      reason:     lastFailureReason,
+      isOptional: step.optional ?? false,
+    });
   }
 
   // ── Private — element resolution ──────────────────────────────────────────
 
   /**
    * Try the primary descriptor, then alternatives in order.
-   * Returns the first match that clears the minimum score threshold.
+   * Returns the first match that clears the score threshold AND the confidence threshold.
+   * Confidence is only enforced on the PRIMARY path; alternatives use score only.
    *
    * @param {import('../shared/types/index.js').PlanStep} step
-   * @returns {{ element: Element, score: number } | null}
+   * @returns {{ element: Element, score: number, confidence?: number } | null}
    */
   _resolveElement(step) {
     if (!step.targetElement) return null;
 
     const primary = this._domMatcher.matchElement(step.targetElement);
-    if (primary?.score >= ElementResolutionThreshold.PRIMARY) return primary;
+
+    if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
+      this._logCandidates(step.targetElement.text, primary.candidates);
+
+      // Confidence is normalised score / divisor — not an independent signal.
+      // CONFIDENCE=0.40 is equivalent to PRIMARY=60 at divisor=150. Raise only with data.
+      // ?? 1: missing confidence field (test mocks, old matchElement builds) → always passes.
+      const conf = primary.confidence ?? 1;
+      if (conf >= ElementResolutionThreshold.CONFIDENCE) return primary;
+
+      console.warn(
+        `[ExecutorEngine] Low-confidence primary match (${conf.toFixed(2)}) for ` +
+        `"${step.targetElement.text}" — score ${primary.score}, reason: ${primary.reason} — trying alternatives`
+      );
+    }
 
     for (const altText of (step.targetElement.alternatives ?? [])) {
       if (!altText?.trim()) continue;
@@ -277,6 +347,48 @@ export class ExecutorEngine {
     }
 
     return null;
+  }
+
+  /**
+   * Verify the element is still safe to highlight.
+   * Called after resolution but before highlighter.show() to catch elements that
+   * became detached or disabled between matching and highlighting (React/Vue re-renders).
+   *
+   * @param {Element} element
+   * @returns {{ ok: boolean, reason: string }}
+   */
+  _selfCheck(element) {
+    // isConnected is undefined in test mocks — treat undefined as connected
+    if (element.isConnected === false) {
+      return { ok: false, reason: 'Element detached from DOM after resolution' };
+    }
+
+    if (element.disabled === true || element.getAttribute?.('aria-disabled') === 'true') {
+      return { ok: false, reason: 'Element became disabled after resolution' };
+    }
+
+    try {
+      const rect = element.getBoundingClientRect?.();
+      if (rect && rect.width === 0 && rect.height === 0) {
+        return { ok: false, reason: 'Element has zero size — hidden after resolution' };
+      }
+    } catch { /* non-browser environment — skip size check */ }
+
+    return { ok: true, reason: '' };
+  }
+
+  /**
+   * Log top-N candidates for debugging when more than one candidate was found.
+   *
+   * @param {string} targetText
+   * @param {Array<{score: number, reason: string, matchType: string}>} candidates
+   */
+  _logCandidates(targetText, candidates) {
+    if (!candidates?.length || candidates.length === 1) return;
+    const lines = candidates.map((c, i) =>
+      `  [${i + 1}] score=${c.score} type=${c.matchType} — ${c.reason}`
+    );
+    console.log(`[ExecutorEngine] ${candidates.length} candidates for "${targetText}":\n${lines.join('\n')}`);
   }
 
   // ── Private — user action detection ──────────────────────────────────────

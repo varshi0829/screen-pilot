@@ -6,7 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:executor": "node extension/tests/executor-engine.test.mjs",
+    "test:session": "node extension/tests/session-store.test.mjs",
+    "test:nav-classifier": "node extension/tests/navigation-classifier.test.mjs",
+    "test:transitions": "node extension/tests/transitions.test.mjs",
+    "build:ext": "esbuild extension/v2-task.js --bundle --format=iife --outfile=extension/dist/v2-task.bundle.js && esbuild extension/playground/playground.js --bundle --format=iife --outfile=extension/dist/playground.bundle.js",
+    "build:ext:watch": "esbuild extension/v2-task.js --bundle --format=iife --outfile=extension/dist/v2-task.bundle.js --watch & esbuild extension/playground/playground.js --bundle --format=iife --outfile=extension/dist/playground.bundle.js --watch"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.105.0",
@@ -21,6 +27,7 @@
     "@types/node": "^20.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "esbuild": "^0.25.12",
     "eslint": "^9.0.0",
     "eslint-config-next": "^15.5.19",
     "playwright": "^1.61.0",

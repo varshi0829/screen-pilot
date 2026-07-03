@@ -54,9 +54,14 @@ const MOCK_SNAPSHOT = {
   capturedAt:             1_000_000,
 };
 
-function makeMatcher({ found = true, score = 85 } = {}) {
+function makeMatcher({ found = true, score = 85, confidence = undefined } = {}) {
   return {
-    matchElement: () => found ? { element: MOCK_ELEMENT, score, reason: 'exact', matchType: 'EXACT' } : null,
+    matchElement: () => {
+      if (!found) return null;
+      const r = { element: MOCK_ELEMENT, score, reason: 'exact', matchType: 'EXACT' };
+      if (confidence !== undefined) r.confidence = confidence;
+      return r;
+    },
   };
 }
 
@@ -643,6 +648,279 @@ await test('start() begins at plan.currentStepIndex when nonzero', async () => {
   ex.start(makePlan([step1, step2], { currentStepIndex: 1 }));
   const payload = await nextEvent(ex, 'element:ready');
   assert.equal(payload.step.id, 2);
+});
+
+// ── 11. _selfCheck ───────────────────────────────────────────────────────────
+//
+// _selfCheck runs synchronously AFTER _resolveElement returns a match and BEFORE
+// await highlighter.show(). Failures emit element:not_found synchronously during
+// start() — subscribe BEFORE start().
+
+await test('_selfCheck: isConnected=false emits element:not_found with detach reason', async () => {
+  const el  = { ...MOCK_ELEMENT, isConnected: false };
+  const ex  = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+  assert.ok(payload.reason.toLowerCase().includes('self-check'),
+    `reason should mention self-check, got: "${payload.reason}"`);
+  assert.ok(payload.reason.toLowerCase().includes('detach') ||
+            payload.reason.toLowerCase().includes('detached'),
+    `reason should mention detach, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'idle');
+});
+
+await test('_selfCheck: disabled=true emits element:not_found', async () => {
+  const el = { ...MOCK_ELEMENT, disabled: true };
+  const ex = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+  assert.ok(payload.reason.toLowerCase().includes('disabled'),
+    `reason should mention disabled, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'idle');
+});
+
+await test('_selfCheck: aria-disabled="true" emits element:not_found', async () => {
+  const el = {
+    ...MOCK_ELEMENT,
+    getAttribute: (attr) => attr === 'aria-disabled' ? 'true' : null,
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+  assert.ok(payload.reason.toLowerCase().includes('disabled'),
+    `reason should mention disabled, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'idle');
+});
+
+await test('_selfCheck: zero-rect element emits element:not_found', async () => {
+  const el = {
+    ...MOCK_ELEMENT,
+    getBoundingClientRect: () => ({ width: 0, height: 0 }),
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+  assert.ok(payload.reason.toLowerCase().includes('zero size') ||
+            payload.reason.toLowerCase().includes('hidden'),
+    `reason should mention zero size or hidden, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'idle');
+});
+
+await test('_selfCheck: healthy element passes all checks and highlight proceeds', async () => {
+  const el = { ...MOCK_ELEMENT, isConnected: true };
+  const ex = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  // element:ready fires after await highlighter.show() — register before OR after start()
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+  assert.equal(payload.element, el);
+  assert.equal(ex.getStatus(), 'awaiting');
+});
+
+await test('_selfCheck: isConnected=undefined passes (=== false strict check, not !isConnected)', async () => {
+  // MOCK_ELEMENT has no isConnected property; element.isConnected === false → undefined===false → false → passes
+  const el = { ...MOCK_ELEMENT, isConnected: undefined };
+  const ex = new ExecutorEngine({
+    domMatcher:      { matchElement: () => ({ element: el, score: 85, reason: 'exact', matchType: 'EXACT' }) },
+    highlighter:     makeHighlighter(),
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+  assert.equal(payload.element, el, 'element with isConnected=undefined must not be rejected');
+});
+
+// ── 12. Confidence gate ───────────────────────────────────────────────────────
+//
+// Confidence is enforced only on the PRIMARY path. Alternatives use score only.
+// CONFIDENCE=0.40 at divisor=150 is equivalent to PRIMARY=60 (no new behavioural gate).
+// element:not_found from confidence rejection fires synchronously — subscribe before start().
+
+await test('confidence: 0.467 (contains-match level) passes at CONFIDENCE=0.40 threshold', async () => {
+  // Validates the MODIFY: at old threshold 0.50, 0.467 would have been rejected.
+  // At 0.40, it passes. Regression test for the confidence fix.
+  const ex = makeExecutor({ confidence: 0.467 });
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+  assert.equal(payload.step.id, 1, 'contains-match confidence must not be rejected at 0.40');
+});
+
+await test('confidence: exactly 0.40 (minimum passing value) is accepted', async () => {
+  const ex = makeExecutor({ confidence: 0.40 });
+  ex.start(makePlan([makeStep()]));
+  await nextEvent(ex, 'element:ready');
+});
+
+await test('confidence: undefined (missing field) passes via ?? 1 backward-compat guard', async () => {
+  // All test mocks and pre-Phase-6 matchElement builds omit the confidence field.
+  // The ?? 1 guard must prevent regression by treating missing confidence as 1.0.
+  const ex = makeExecutor(); // no confidence in makeMatcher result
+  ex.start(makePlan([makeStep()]));
+  await nextEvent(ex, 'element:ready');
+});
+
+await test('confidence: 0.39 (below 0.40) rejected; element:not_found when no alternatives', async () => {
+  const ex      = makeExecutor({ confidence: 0.39 }); // score=85 passes PRIMARY; confidence fails gate
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()])); // makeStep alternatives=[]
+  const payload = await promise;
+  assert.equal(ex.getStatus(), 'idle');
+  assert.ok(payload.reason.includes('Submit'), `reason should name the target, got: "${payload.reason}"`);
+});
+
+await test('confidence: alternatives path uses score only (no confidence gate on RECOVERY)', async () => {
+  let callCount = 0;
+  const domMatcher = {
+    matchElement: (desc) => {
+      callCount++;
+      if (desc.text === 'Submit')
+        return { element: MOCK_ELEMENT, score: 85, confidence: 0.39, reason: 'exact', matchType: 'EXACT' };
+      if (desc.text === 'Send')
+        return { element: MOCK_ELEMENT, score: 55, reason: 'exact', matchType: 'EXACT' }; // no confidence
+      return null;
+    },
+  };
+  const ex   = new ExecutorEngine({ domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT });
+  const step = makeStep({ targetElement: { text: 'Submit', type: 'button', intent: 'submit', alternatives: ['Send'] } });
+
+  ex.start(makePlan([step]));
+  await nextEvent(ex, 'element:ready'); // alternative was accepted
+  assert.equal(callCount, 2, 'primary tried then one alternative');
+});
+
+// ── 13. Ranked-candidate fallback (BUG-003) ──────────────────────────────────
+//
+// When resolved.alternatives is populated, ExecutorEngine tries each candidate
+// in rank order before emitting element:not_found.
+// Self-check failures and highlight failures silently advance to the next candidate.
+
+const EL_PRIMARY  = { ...MOCK_ELEMENT, _id: 'primary'  };
+const EL_FALLBACK = { ...MOCK_ELEMENT, _id: 'fallback' };
+
+function makeMatcherWithAlternatives(primary, alts) {
+  return {
+    matchElement: () => ({
+      element:      primary,
+      score:        76,
+      confidence:   0.507,
+      reason:       'text contains match',
+      matchType:    'fuzzy',
+      alternatives: alts.map(el => ({ element: el, score: 76, reason: 'text contains match', matchType: 'fuzzy' })),
+    }),
+  };
+}
+
+await test('BUG-003: candidate #1 off-screen (highlight=false), candidate #2 succeeds', async () => {
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return el === EL_FALLBACK; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      makeMatcherWithAlternatives(EL_PRIMARY, [EL_FALLBACK]),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+
+  assert.equal(payload.element, EL_FALLBACK, 'must fall back to candidate #2');
+  assert.equal(hlCalls.length, 2,        'highlighter called once per candidate');
+  assert.equal(hlCalls[0], EL_PRIMARY,   'first call: primary');
+  assert.equal(hlCalls[1], EL_FALLBACK,  'second call: fallback');
+  assert.equal(ex.getStatus(), 'awaiting');
+});
+
+await test('BUG-003: candidate #1 disabled (self-check fails), candidate #2 succeeds', async () => {
+  const disabledEl = { ...MOCK_ELEMENT, disabled: true };
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return true; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      makeMatcherWithAlternatives(disabledEl, [EL_FALLBACK]),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+
+  assert.equal(payload.element, EL_FALLBACK, 'must skip disabled element and use fallback');
+  assert.equal(hlCalls.length, 1,       'highlighter not called for disabled element');
+  assert.equal(hlCalls[0], EL_FALLBACK, 'only fallback was highlighted');
+  assert.equal(ex.getStatus(), 'awaiting');
+});
+
+await test('BUG-003: candidate #1 detached (self-check fails), candidate #2 succeeds', async () => {
+  const detachedEl = { ...MOCK_ELEMENT, isConnected: false };
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return true; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      makeMatcherWithAlternatives(detachedEl, [EL_FALLBACK]),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+
+  assert.equal(payload.element, EL_FALLBACK, 'must skip detached element and use fallback');
+  assert.equal(hlCalls.length, 1,       'highlighter not called for detached element');
+  assert.equal(hlCalls[0], EL_FALLBACK, 'only fallback was highlighted');
+  assert.equal(ex.getStatus(), 'awaiting');
+});
+
+await test('BUG-003: all candidates fail highlight → element:not_found', async () => {
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return false; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher:      makeMatcherWithAlternatives(EL_PRIMARY, [EL_FALLBACK]),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+
+  assert.equal(ex.getStatus(), 'idle');
+  assert.equal(hlCalls.length, 2, 'both candidates were attempted');
+  assert.ok(
+    payload.reason.toLowerCase().includes('highlight'),
+    `reason should reference highlight failure, got: "${payload.reason}"`,
+  );
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

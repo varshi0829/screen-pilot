@@ -25,15 +25,13 @@
     },
     {
       "matches": ["<all_urls>"],
-      "js": ["v2-task.js"],
-      "run_at": "document_idle",
-      "type": "module"
+      "js": ["dist/v2-task.bundle.js"],
+      "run_at": "document_idle"
     },
     {
       "matches": ["<all_urls>"],
-      "js": ["playground/playground.js"],
-      "run_at": "document_idle",
-      "type": "module"
+      "js": ["dist/playground.bundle.js"],
+      "run_at": "document_idle"
     }
   ],
   "action": {
