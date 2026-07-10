@@ -72,6 +72,14 @@ type PlanRequest = {
     confidence?:          number;
   };
   clarifications?: string[];
+  pageControls?: Array<{
+    region:    string;
+    tag:       string;
+    text:      string;
+    ariaLabel: string;
+    title:     string;
+    imgAlt:    string;
+  }>;
   extensions?: {
     gemini?:     Record<string, unknown>;
     enterprise?: Record<string, unknown>;
@@ -165,7 +173,7 @@ async function callGeminiDirect(
     }],
     generationConfig: {
       temperature:     0.1,
-      maxOutputTokens: 4096,
+      maxOutputTokens: 2048,
       thinkingConfig:  { thinkingBudget: 0 }, // Gemini-specific: disable extended thinking
     },
   };
@@ -223,7 +231,7 @@ async function callOpenRouter(
       ],
     }],
     temperature: 0.1,
-    max_tokens:  4096,
+    max_tokens:  2048,
   };
 
   let upstream: Response;
@@ -420,6 +428,7 @@ export async function POST(req: NextRequest) {
   const {
     goal, page, previousPage, executionHistory, workflowMemory,
     recoveryContext, preferences, applicationMetadata, requestId, clarifications,
+    pageControls,
   } = body;
 
   if (!goal?.trim())            return errorResponse(reqId, "goal is required.",                   "INVALID_REQUEST",     400, t0);
@@ -440,6 +449,7 @@ export async function POST(req: NextRequest) {
     prompt = buildPlannerPrompt({
       goal, page, previousPage, executionHistory,
       workflowMemory, recoveryContext, preferences, applicationMetadata, clarifications,
+      pageControls,
     });
   } catch (err) {
     console.error(`[SP:PLAN] reqId=${reqId} prompt_build_error`, err);
@@ -562,6 +572,7 @@ function buildPlannerPrompt(req: {
   preferences?:         { confirmDestructiveActions?: boolean; maxSteps?: number; language?: string };
   applicationMetadata?: { application?: string; module?: string; workspace?: string; pageType?: string; navigationHierarchy?: string[]; confidence?: number };
   clarifications?:      string[];
+  pageControls?:        Array<{ region: string; tag: string; text: string; ariaLabel: string; title: string; imgAlt: string }>;
 }): string {
   const lines: string[] = [
     `Goal: ${req.goal}`,
@@ -605,6 +616,20 @@ function buildPlannerPrompt(req: {
     lines.push(`⚠ Recovery requested: ${req.recoveryContext.reason} (trigger: ${req.recoveryContext.trigger})`);
     if (req.recoveryContext.failedStepIntent) {
       lines.push(`Failed step intent: ${req.recoveryContext.failedStepIntent}`);
+    }
+  }
+
+  if (req.pageControls?.length) {
+    const entries = req.pageControls.map(c => {
+      const label   = c.text || c.ariaLabel || c.imgAlt || c.title;
+      const iconTag = !c.text ? ' (icon-only)' : '';
+      return label ? `[${c.region}] ${c.tag} → "${label}"${iconTag}` : null;
+    }).filter((e): e is string => e !== null);
+    if (entries.length) {
+      lines.push(
+        'Interactive controls on this page — use these exact strings for targetElement.text:',
+        ...entries,
+      );
     }
   }
 
@@ -686,7 +711,7 @@ Rules:
 - If a destructive action requires explicit user confirmation: result="NEEDS_USER", state="planned".
 - plannerSummary: 1–2 sentences on why this route was chosen (not a step list).
 - Match element text EXACTLY as visible in the screenshot.
-- targetElement.text must NEVER be null or empty. For icon-only or image elements (avatars, icon buttons, logo buttons) with no visible text: use the element's aria-label if shown in the screenshot, or the nearest visible label, or a short descriptive phrase that matches the element's accessible name (e.g. "View profile and more", "profile avatar", "notifications"). This string will be used to locate the element in the DOM — make it unique and matchable.
+- targetElement.text must NEVER be null or empty. When the Interactive controls list above is present: find the element in the list and copy its quoted string EXACTLY as targetElement.text — character-for-character, no paraphrasing. For icon-only entries (marked as such), the quoted string is the element's aria-label or img alt text — the only machine-readable DOM identifier for that button; generating a visual description instead will cause element:not_found. When the list is absent or the element is not listed: for icon-only or image elements use a short descriptive phrase.
 - alternatives[]: 2–3 fallback texts for the same element, ordered by likelihood.
 - If userClarifications are provided, they represent explicit preferences recorded during this session. Use them to resolve ambiguous paths. Do NOT return state="ambiguous" when a clarification directly addresses the choice — instead set state="planned" and mention the applied clarification in plannerSummary.`;
 }
