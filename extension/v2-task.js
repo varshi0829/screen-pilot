@@ -32,6 +32,11 @@ let _executor = null;
 let _taskContext = null;
 let _taskStartedAt = null;
 const MAX_CLARIFICATIONS = 5;
+// B5: transient backend failures that are safe to retry without clearing the session.
+// HTTP_ERROR is the adapter's fallback code for a non-OK HTTP response (5xx surface here);
+// 4xx validation failures carry their own specific errorCodes and are NOT retried.
+const RETRYABLE_PLAN_ERRORS = new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
+const MAX_PLAN_RETRIES = 2; // attempt 1 immediate, then retries at 1s and 2s
 const STATUS_ID = "sp-v2-status-banner";
 function showStatus(text, type = "info") {
   let el = document.getElementById(STATUS_ID);
@@ -41,7 +46,7 @@ function showStatus(text, type = "info") {
     el.style.cssText = [
       "position:fixed",
       "top:16px",
-      "right:16px",
+      "left:16px",
       "z-index:2147483647",
       "padding:10px 18px",
       "border-radius:10px",
@@ -316,6 +321,37 @@ async function captureScreenshot() {
   if (!resp?.success) throw new Error(resp?.error || "Screenshot capture failed");
   return { image: resp.image, mimeType: resp.mimeType || "image/png" };
 }
+function collectPageControls() {
+  if (!window.DOMMatcher) return [];
+  const selector = 'button, a[href], [role="button"], [role="menuitem"], '
+                 + 'input[type="submit"], input[type="button"], summary';
+  const seen    = new Set();
+  const buckets = { top_navigation: [], side_navigation: [], other: [] };
+  const LIMITS  = { top_navigation: 8, side_navigation: 8, other: 4 };
+  const SP_SEL  = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
+
+  for (const el of document.querySelectorAll(selector)) {
+    if (seen.has(el)) continue;
+    if (!window.DOMMatcher.isVisible(el)) continue;
+    if (el.closest?.(SP_SEL)) continue;
+    seen.add(el);
+
+    const text     = (el.innerText     || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    const ariaLabel = (el.getAttribute('aria-label') || '').trim().slice(0, 80);
+    const title    = (el.getAttribute('title')       || '').trim().slice(0, 80);
+    const imgAlt   = el.querySelector?.('img[alt]')?.getAttribute?.('alt')?.trim() ?? '';
+
+    if (!text && !ariaLabel && !title && !imgAlt) continue;
+
+    const region = window.DOMMatcher.detectRegion(el);
+    const key    = buckets[region] !== undefined ? region : 'other';
+    if (buckets[key].length >= LIMITS[key]) continue;
+    buckets[key].push({ region, tag: el.tagName, text, ariaLabel, title, imgAlt });
+  }
+
+  return [...buckets.top_navigation, ...buckets.side_navigation, ...buckets.other];
+}
+
 function buildPendingStepContext(step) {
   return {
     description: step.description,
@@ -360,9 +396,28 @@ function resolveOutcome(planResp) {
   if (planResp.state === "planned" && planResp.plan?.steps?.length) return "step_ready";
   return "ambiguous";
 }
+// A step whose completionCondition is "final" is the terminal step of the plan:
+// the goal is achieved the moment it succeeds. Emitted by the planner (route.ts).
+function isTerminalStep(step) {
+  return step?.completionCondition === "final";
+}
+// Present the completion card and clear the session. Reused by both terminal-step
+// paths (local validation and navigation-resume). Loads the session BEFORE clearing
+// so the card reports the true completed-step count.
+async function _showGoalCompleteCard(tabId, goal) {
+  const s = await SessionStore.load(tabId);
+  showCompletionCard({
+    goal,
+    steps: s?.completedSteps.length ?? 0,
+    startedAt: _taskStartedAt
+  });
+  await SessionStore.clear(tabId);
+}
 async function _runPlanLoop(tabId, myGen) {
   const { openRouterApiKey } = await chrome.storage.local.get('openRouterApiKey');
   const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? undefined });
+  // B5: consecutive retryable-failure counter, reset on every successful planner response.
+  let planRetryCount = 0;
   while (true) {
     if (_generation !== myGen) {
       console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} — exiting`);
@@ -401,7 +456,8 @@ async function _runPlanLoop(tabId, myGen) {
     }
     if (_generation !== myGen) return;
     const nClarifications = freshSession.clarifications?.length ?? 0;
-    console.log(`[SP:V2] [${ts()}] /api/plan  step=${freshSession.completedSteps.length + 1}  url=${window.location.href}  clarifications=${nClarifications}`);
+    const pageControls    = collectPageControls();
+    console.log(`[SP:V2] [${ts()}] /api/plan  step=${freshSession.completedSteps.length + 1}  url=${window.location.href}  clarifications=${nClarifications}  pageControls=${pageControls.length}`);
     let planResp;
     try {
       planResp = await adapter.plan({
@@ -426,7 +482,8 @@ async function _runPlanLoop(tabId, myGen) {
         },
         ...nClarifications && {
           clarifications: freshSession.clarifications.map((c) => c.text)
-        }
+        },
+        ...pageControls.length && { pageControls }
       });
     } catch (err) {
       console.error("[SP:V2] /api/plan failed:", err);
@@ -479,20 +536,48 @@ async function _runPlanLoop(tabId, myGen) {
       return;
     }
     if (outcome === "failed") {
-      applyEvent(TaskEvent.PLAN_FAILED, { reason: planResp.errorCode ?? "planner_failed" });
-      showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
-      await SessionStore.clear(tabId);
+      const errorCode = planResp.errorCode ?? "planner_failed";
+      const retryable = RETRYABLE_PLAN_ERRORS.has(errorCode);
+      // B5: retry transient backend failures with exponential backoff (1s, 2s) WITHOUT
+      // clearing the session. Backoff = 1000 * 2^(retry-1): retry 1 → 1s, retry 2 → 2s.
+      if (retryable && planRetryCount < MAX_PLAN_RETRIES) {
+        planRetryCount++;
+        const backoffMs = 1000 * Math.pow(2, planRetryCount - 1);
+        console.warn(`[SP:V2] [${ts()}] Retryable plan failure (${errorCode}) — retry ${planRetryCount}/${MAX_PLAN_RETRIES} in ${backoffMs}ms (session preserved)`);
+        showStatus("ScreenPilot · Reconnecting…", "planning");
+        await new Promise((r) => setTimeout(r, backoffMs));
+        continue;
+      }
+      applyEvent(TaskEvent.PLAN_FAILED, { reason: errorCode });
+      if (retryable) {
+        // B5: retries exhausted — surface the error but PRESERVE the session so the
+        // user can resume once connectivity returns. Do NOT clear.
+        showStatus(`ScreenPilot: ${planResp.error ?? "Connection problem — please try again"}`, "error");
+      } else {
+        showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
+        await SessionStore.clear(tabId);
+      }
       return;
     }
+    // B5: a usable planner response arrived — reset the retry counter for the next step.
+    planRetryCount = 0;
     const plannerStep = planResp.plan.steps[0];
     if (!plannerStep) {
       console.warn("[SP:V2] state=planned but steps is empty — treating as ambiguous");
       continue;
     }
     applyEvent(TaskEvent.PLAN_RECEIVED, { intent: plannerStep.intent });
+    // B2: hide the planning banner once a step is ready — it must not remain visible
+    // during EXECUTING/AWAITING_USER. The instruction/highlight UI takes over on element:ready.
+    hideStatus();
     await SessionStore.setPhase(tabId, "EXECUTING");
     const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
     if (result === "navigated" || result === "aborted") {
+      return;
+    }
+    if (result === "goal_complete") {
+      // Terminal step already fired FINAL_STEP_COMPLETE, showed the completion card,
+      // and cleared the session inside _executeStep. Stop — do NOT replan.
       return;
     }
     if (result === "element_not_found") {
@@ -577,6 +662,16 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
         urlAfter: post.url,
         completedAt: Date.now()
       });
+      if (isTerminalStep(plannerStep)) {
+        // Terminal step confirmed locally. Use the state machine's purpose-built
+        // VALIDATING → COMPLETE transition (FINAL_STEP_COMPLETE) and finish now —
+        // no replan, no waiting for a planner state=complete round-trip.
+        applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict });
+        if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
+        await _showGoalCompleteCard(tabId, goal);
+        done("goal_complete");
+        return;
+      }
       applyEvent(TaskEvent.VALIDATION_PASSED, { verdict });
       if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
       executor.advance();
@@ -620,6 +715,13 @@ export async function _bootstrapSession(tabId) {
         await SessionStore.completeStep(tabId, buildStepRecord(session.pendingStep));
         if (_generation !== myGen) return;
         applyEvent(TaskEvent.SESSION_RESUME);
+        if (isTerminalStep(session.pendingStep)) {
+          // The step that triggered this navigation was the terminal step — the goal
+          // is complete on arrival. PLANNING → COMPLETE without a planner round-trip.
+          applyEvent(TaskEvent.PLAN_COMPLETE);
+          await _showGoalCompleteCard(tabId, session.goal);
+          return;
+        }
         await _runPlanLoop(tabId, myGen);
       } else if (classification === NavClassification.REFRESH) {
         applyEvent(TaskEvent.SESSION_RESUME);

@@ -339,14 +339,16 @@
      */
     _resolveElement(step) {
       if (!step.targetElement) return null;
+      console.log("[SP:Target]", {
+        text: step.targetElement?.text,
+        type: step.targetElement?.type,
+        region: step.targetElement?.region,
+        alternatives: step.targetElement?.alternatives
+      });
       const primary = this._domMatcher.matchElement(step.targetElement);
       if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
         this._logCandidates(step.targetElement.text, primary.candidates);
-        const conf = primary.confidence ?? 1;
-        if (conf >= ElementResolutionThreshold.CONFIDENCE) return primary;
-        console.warn(
-          `[ExecutorEngine] Low-confidence primary match (${conf.toFixed(2)}) for "${step.targetElement.text}" \u2014 score ${primary.score}, reason: ${primary.reason} \u2014 trying alternatives`
-        );
+        return primary;
       }
       for (const altText of step.targetElement.alternatives ?? []) {
         if (!altText?.trim()) continue;
@@ -419,13 +421,32 @@ ${lines.join("\n")}`);
       this._cleanups.push(
         () => document.removeEventListener("click", clickHandler, { capture: true })
       );
-      const urlChangeHandler = () => {
+      const getHref = () => {
+        try {
+          return window.location?.href ?? "";
+        } catch {
+          return "";
+        }
+      };
+      const urlBeforeAction = getHref();
+      const urlChangeHandler = (newUrl) => {
         if (step.expectedOutcome !== void 0) {
           if (!step.expectedOutcome.urlChanges) return;
           const pattern = step.expectedOutcome.urlPattern;
           if (pattern) {
             try {
-              const { pathname, hash } = new URL(window.location.href);
+              const { pathname, hash } = new URL(newUrl);
+              if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
+            } catch {
+              return;
+            }
+          }
+        } else if (step.expectedPageState !== void 0) {
+          if (!step.expectedPageState.urlChanges) return;
+          const pattern = step.expectedPageState.urlPattern;
+          if (pattern) {
+            try {
+              const { pathname, hash } = new URL(newUrl);
               if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
             } catch {
               return;
@@ -434,11 +455,61 @@ ${lines.join("\n")}`);
         }
         onUserAction("url_change");
       };
-      window.addEventListener("popstate", urlChangeHandler);
-      window.addEventListener("hashchange", urlChangeHandler);
+      let originalPushState = null;
+      let originalReplaceState = null;
+      if (typeof history !== "undefined" && history?.pushState) {
+        originalPushState = history.pushState.bind(history);
+        originalReplaceState = history.replaceState.bind(history);
+        history.pushState = function(...args) {
+          originalPushState(...args);
+          const nextUrl = args[2] ? String(args[2]) : getHref();
+          urlChangeHandler(nextUrl);
+        };
+        history.replaceState = function(...args) {
+          originalReplaceState(...args);
+          const nextUrl = args[2] ? String(args[2]) : getHref();
+          urlChangeHandler(nextUrl);
+        };
+      }
       this._cleanups.push(() => {
-        window.removeEventListener("popstate", urlChangeHandler);
-        window.removeEventListener("hashchange", urlChangeHandler);
+        if (originalPushState) history.pushState = originalPushState;
+        if (originalReplaceState) history.replaceState = originalReplaceState;
+      });
+      const legacyUrlChangeHandler = () => urlChangeHandler(getHref());
+      window.addEventListener("popstate", legacyUrlChangeHandler);
+      window.addEventListener("hashchange", legacyUrlChangeHandler);
+      this._cleanups.push(() => {
+        window.removeEventListener("popstate", legacyUrlChangeHandler);
+        window.removeEventListener("hashchange", legacyUrlChangeHandler);
+      });
+      let pollInterval = null;
+      const startUrlPoll = () => {
+        if (pollInterval) return;
+        let elapsed = 0;
+        pollInterval = setInterval(() => {
+          elapsed += 100;
+          const currentHref = getHref();
+          if (currentHref && currentHref !== urlBeforeAction) {
+            urlChangeHandler(currentHref);
+          }
+          if (fired || elapsed >= 2e3) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+          }
+        }, 100);
+      };
+      const clickForPollHandler = (e) => {
+        if (e.target?.closest?.("#screenpilot-widget")) return;
+        if (!this._activeElement || !this._activeElement.contains(e.target)) return;
+        startUrlPoll();
+      };
+      document.addEventListener("click", clickForPollHandler, { capture: true });
+      this._cleanups.push(() => {
+        document.removeEventListener("click", clickForPollHandler, { capture: true });
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
       });
     }
     // ── Private — utilities ───────────────────────────────────────────────────
@@ -1306,9 +1377,9 @@ ${lines.join("\n")}`);
     if (pending?.urlBefore && currentUrl === pending.urlBefore) {
       return { classification: NavClassification.REFRESH, matchedStepIndex: null };
     }
-    const history = session.completedSteps ?? [];
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].urlAfter && currentUrl === history[i].urlAfter) {
+    const history2 = session.completedSteps ?? [];
+    for (let i = history2.length - 1; i >= 0; i--) {
+      if (history2[i].urlAfter && currentUrl === history2[i].urlAfter) {
         return { classification: NavClassification.BACK_BUTTON, matchedStepIndex: i };
       }
     }
@@ -1338,6 +1409,8 @@ ${lines.join("\n")}`);
   var _taskContext = null;
   var _taskStartedAt = null;
   var MAX_CLARIFICATIONS = 5;
+  var RETRYABLE_PLAN_ERRORS = /* @__PURE__ */ new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
+  var MAX_PLAN_RETRIES = 2;
   var STATUS_ID = "sp-v2-status-banner";
   function showStatus(text, type = "info") {
     let el = document.getElementById(STATUS_ID);
@@ -1347,7 +1420,7 @@ ${lines.join("\n")}`);
       el.style.cssText = [
         "position:fixed",
         "top:16px",
-        "right:16px",
+        "left:16px",
         "z-index:2147483647",
         "padding:10px 18px",
         "border-radius:10px",
@@ -1592,6 +1665,30 @@ ${lines.join("\n")}`);
     if (!resp?.success) throw new Error(resp?.error || "Screenshot capture failed");
     return { image: resp.image, mimeType: resp.mimeType || "image/png" };
   }
+  function collectPageControls() {
+    if (!window.DOMMatcher) return [];
+    const selector = 'button, a[href], [role="button"], [role="menuitem"], input[type="submit"], input[type="button"], summary';
+    const seen = /* @__PURE__ */ new Set();
+    const buckets = { top_navigation: [], side_navigation: [], other: [] };
+    const LIMITS = { top_navigation: 8, side_navigation: 8, other: 4 };
+    const SP_SEL = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
+    for (const el of document.querySelectorAll(selector)) {
+      if (seen.has(el)) continue;
+      if (!window.DOMMatcher.isVisible(el)) continue;
+      if (el.closest?.(SP_SEL)) continue;
+      seen.add(el);
+      const text = (el.innerText || "").trim().replace(/\s+/g, " ").slice(0, 80);
+      const ariaLabel = (el.getAttribute("aria-label") || "").trim().slice(0, 80);
+      const title = (el.getAttribute("title") || "").trim().slice(0, 80);
+      const imgAlt = el.querySelector?.("img[alt]")?.getAttribute?.("alt")?.trim() ?? "";
+      if (!text && !ariaLabel && !title && !imgAlt) continue;
+      const region = window.DOMMatcher.detectRegion(el);
+      const key = buckets[region] !== void 0 ? region : "other";
+      if (buckets[key].length >= LIMITS[key]) continue;
+      buckets[key].push({ region, tag: el.tagName, text, ariaLabel, title, imgAlt });
+    }
+    return [...buckets.top_navigation, ...buckets.side_navigation, ...buckets.other];
+  }
   function buildPendingStepContext(step) {
     return {
       description: step.description,
@@ -1636,9 +1733,22 @@ ${lines.join("\n")}`);
     if (planResp.state === "planned" && planResp.plan?.steps?.length) return "step_ready";
     return "ambiguous";
   }
+  function isTerminalStep(step) {
+    return step?.completionCondition === "final";
+  }
+  async function _showGoalCompleteCard(tabId, goal) {
+    const s = await SessionStore.load(tabId);
+    showCompletionCard({
+      goal,
+      steps: s?.completedSteps.length ?? 0,
+      startedAt: _taskStartedAt
+    });
+    await SessionStore.clear(tabId);
+  }
   async function _runPlanLoop(tabId, myGen) {
     const { openRouterApiKey } = await chrome.storage.local.get("openRouterApiKey");
     const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? void 0 });
+    let planRetryCount = 0;
     while (true) {
       if (_generation !== myGen) {
         console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} \u2014 exiting`);
@@ -1677,7 +1787,8 @@ ${lines.join("\n")}`);
       }
       if (_generation !== myGen) return;
       const nClarifications = freshSession.clarifications?.length ?? 0;
-      console.log(`[SP:V2] [${ts()}] /api/plan  step=${freshSession.completedSteps.length + 1}  url=${window.location.href}  clarifications=${nClarifications}`);
+      const pageControls = collectPageControls();
+      console.log(`[SP:V2] [${ts()}] /api/plan  step=${freshSession.completedSteps.length + 1}  url=${window.location.href}  clarifications=${nClarifications}  pageControls=${pageControls.length}`);
       let planResp;
       try {
         planResp = await adapter.plan({
@@ -1702,7 +1813,8 @@ ${lines.join("\n")}`);
           },
           ...nClarifications && {
             clarifications: freshSession.clarifications.map((c) => c.text)
-          }
+          },
+          ...pageControls.length && { pageControls }
         });
       } catch (err) {
         console.error("[SP:V2] /api/plan failed:", err);
@@ -1755,20 +1867,39 @@ ${lines.join("\n")}`);
         return;
       }
       if (outcome === "failed") {
-        applyEvent(TaskEvent.PLAN_FAILED, { reason: planResp.errorCode ?? "planner_failed" });
-        showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
-        await SessionStore.clear(tabId);
+        const errorCode = planResp.errorCode ?? "planner_failed";
+        const retryable = RETRYABLE_PLAN_ERRORS.has(errorCode);
+        if (retryable && planRetryCount < MAX_PLAN_RETRIES) {
+          planRetryCount++;
+          const backoffMs = 1e3 * Math.pow(2, planRetryCount - 1);
+          console.warn(`[SP:V2] [${ts()}] Retryable plan failure (${errorCode}) \u2014 retry ${planRetryCount}/${MAX_PLAN_RETRIES} in ${backoffMs}ms (session preserved)`);
+          showStatus("ScreenPilot \xB7 Reconnecting\u2026", "planning");
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        applyEvent(TaskEvent.PLAN_FAILED, { reason: errorCode });
+        if (retryable) {
+          showStatus(`ScreenPilot: ${planResp.error ?? "Connection problem \u2014 please try again"}`, "error");
+        } else {
+          showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
+          await SessionStore.clear(tabId);
+        }
         return;
       }
+      planRetryCount = 0;
       const plannerStep = planResp.plan.steps[0];
       if (!plannerStep) {
         console.warn("[SP:V2] state=planned but steps is empty \u2014 treating as ambiguous");
         continue;
       }
       applyEvent(TaskEvent.PLAN_RECEIVED, { intent: plannerStep.intent });
+      hideStatus();
       await SessionStore.setPhase(tabId, "EXECUTING");
       const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
       if (result === "navigated" || result === "aborted") {
+        return;
+      }
+      if (result === "goal_complete") {
         return;
       }
       if (result === "element_not_found") {
@@ -1856,6 +1987,16 @@ ${lines.join("\n")}`);
           urlAfter: post.url,
           completedAt: Date.now()
         });
+        if (isTerminalStep(plannerStep)) {
+          applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict });
+          if (_taskContext) {
+            _taskContext.steps.push({ description: step.description });
+            _taskContext.currentStep = null;
+          }
+          await _showGoalCompleteCard(tabId, goal);
+          done("goal_complete");
+          return;
+        }
         applyEvent(TaskEvent.VALIDATION_PASSED, { verdict });
         if (_taskContext) {
           _taskContext.steps.push({ description: step.description });
@@ -1902,6 +2043,11 @@ ${lines.join("\n")}`);
           await SessionStore.completeStep(tabId, buildStepRecord(session.pendingStep));
           if (_generation !== myGen) return;
           applyEvent(TaskEvent.SESSION_RESUME);
+          if (isTerminalStep(session.pendingStep)) {
+            applyEvent(TaskEvent.PLAN_COMPLETE);
+            await _showGoalCompleteCard(tabId, session.goal);
+            return;
+          }
           await _runPlanLoop(tabId, myGen);
         } else if (classification === NavClassification.REFRESH) {
           applyEvent(TaskEvent.SESSION_RESUME);

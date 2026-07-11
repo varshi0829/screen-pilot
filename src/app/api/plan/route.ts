@@ -703,6 +703,7 @@ Return ONLY valid JSON (no markdown, no explanation):
 Rules:
 - Return JSON only. No markdown.
 - Produce ALL steps — never just the next one.
+- The FINAL step of a successful plan MUST set "completionCondition": "final". Every earlier step keeps its mechanism value (url_change | dom_change | input_filled | element_disappears). The "final" marker lets the client detect goal completion the instant the last step succeeds — without an extra planner round-trip. Never mark more than one step "final", and never mark a non-final step "final".
 - Prefer the SHORTEST PATH. If a global navigation control on the current page can achieve the goal (header "+" menu, sidebar Create button, toolbar action), use it directly. Do NOT add steps to navigate to a dashboard or home page first.
   Examples of always-available global controls: GitHub "+" (new repo/issue/PR from any page), Gmail "Compose" (always in left sidebar), LinkedIn message icon (always in top nav), YouTube "Create" (always in top nav).
 - If the goal is already achieved: state="complete", plan.steps=[].
