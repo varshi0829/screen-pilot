@@ -1,100 +1,25 @@
-# E2E_SUCCESS_REPORT.md
+# Historical E2E Report
 
-**Date:** 2026-06-22
-
----
-
-## Summary
-
-✅ **ScreenPilot is fully functional via Vercel backend.**
+**Date:** 2026-08-21
 
 ---
 
-## End-to-End Flow Verified
+## Status
 
-| Step | Component | Status |
-|------|----------|--------|
-| 1 | Extension loads | ✅ |
-| 2 | User enters goal | ✅ |
-| 3 | Screenshot captured | ✅ |
-| 4 | POST to Vercel | ✅ |
-| 5 | Gemini receives request | ✅ |
-| 6 | Gemini returns response | ✅ |
-| 7 | Response parsed | ✅ |
-| 8 | Instruction displayed | ✅ |
+This file is kept for reference, but the earlier claim that the full browser E2E flow was independently verified via Vercel was not re-run in this workspace.
 
----
+## What Is Verified Here
 
-## Extension → Backend Flow
+- The extension and backend code paths build successfully.
+- The DOM matcher, executor, session store, goal verifier, and orchestrator tests pass locally.
+- Phase 4 and Phase 5 recovery/clarification flows pass locally.
 
-```
-Extension (vision-service.js)
-  ↓ POST https://screen-pilot-j1az.vercel.app/api/analyze
-Vercel Server (route.ts)
-  ↓ POST https://generativelanguage.googleapis.com/.../generateContent
-Gemini API
-  ↓ 200 OK
-Vercel Server
-  ↓ 200 OK
-Extension parses response
-  ↓
-UI displays instruction
-```
+## What Is Not Revalidated Here
 
----
+- A live Chrome session interacting with a real page.
+- End-to-end Gemini/OpenRouter traffic under production credentials.
+- User-facing multi-site demo flows.
 
-## Test Payload
+## Current Interpretation
 
-```json
-{
-  "screenshot": {
-    "image": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-    "mimeType": "image/png"
-  },
-  "goal": "test goal"
-}
-```
-
----
-
-## Response
-
-```json
-{
-  "candidates": [{
-    "content": {
-      "parts": [{
-        "text": "{\"screenSummary\": \"The screen is completely blank and green...\"}"
-      }]
-    }
-  }],
-  "modelVersion": "gemini-2.5-flash",
-  "responseId": "Mgs5aqGkJv-zjMcP8s-dyA4"
-}
-```
-
----
-
-## Remaining Issues
-
-| Issue | Severity | Status |
-|-------|----------|--------|
-| Local backend 403 | HIGH | Vercel works - use Vercel |
-| Shell env var conflict | MEDIUM | Documented |
-
----
-
-## Manual Test Steps
-
-1. Load extension: `chrome://extensions/` → Load unpacked → `extension/`
-2. Navigate to any website
-3. Click ScreenPilot icon → Enter goal → Press Go
-4. Verify instruction appears
-
----
-
-## Conclusion
-
-✅ **ScreenPilot is fully functional via Vercel backend.**
-
-The extension communicates with `https://screen-pilot-j1az.vercel.app/api/analyze` which successfully calls Gemini and returns navigation instructions.
+The repository is ready for demo work, but this file should not be treated as proof of browser-level E2E verification in this session.

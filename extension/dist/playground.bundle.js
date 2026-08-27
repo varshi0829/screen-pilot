@@ -58,6 +58,26 @@
     ELEMENT_DISAPPEARS: "element_disappears",
     FINAL: "final"
   });
+  var SuccessSignalType = Object.freeze({
+    URL_MATCHES: "url_matches",
+    // location matches urlPattern (post-action)
+    URL_LEAVES: "url_leaves",
+    // location no longer matches urlPattern (left the form)
+    TEXT_PRESENT: "text_present",
+    // visible page text contains `text` (e.g. "New key added")
+    ELEMENT_PRESENT: "element_present",
+    // a control/label with accessible `text` exists (e.g. key row)
+    ELEMENT_ABSENT: "element_absent"
+    // element_disappears (e.g. creation form closed)
+  });
+  var VerificationStrategy = Object.freeze({
+    LOCAL_SIGNALS: "local_signals",
+    // signals alone decide (navigation goals)
+    HYBRID: "hybrid",
+    // local first; if ambiguous, one AI-confirm turn
+    AI_CONFIRM: "ai_confirm"
+    // always confirm via a post-action planner turn
+  });
   var StepStatus = Object.freeze({
     PENDING: "pending",
     EXECUTING: "executing",
@@ -339,21 +359,26 @@
      */
     _resolveElement(step) {
       if (!step.targetElement) return null;
+      console.log("[SP:Target]", {
+        text: step.targetElement?.text,
+        type: step.targetElement?.type,
+        region: step.targetElement?.region,
+        alternatives: step.targetElement?.alternatives
+      });
       const primary = this._domMatcher.matchElement(step.targetElement);
       if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
         this._logCandidates(step.targetElement.text, primary.candidates);
-        const conf = primary.confidence ?? 1;
-        if (conf >= ElementResolutionThreshold.CONFIDENCE) return primary;
-        console.warn(
-          `[ExecutorEngine] Low-confidence primary match (${conf.toFixed(2)}) for "${step.targetElement.text}" \u2014 score ${primary.score}, reason: ${primary.reason} \u2014 trying alternatives`
-        );
+        return primary;
       }
+      let best = null;
       for (const altText of step.targetElement.alternatives ?? []) {
         if (!altText?.trim()) continue;
         const alt = this._domMatcher.matchElement({ ...step.targetElement, text: altText });
-        if (alt?.score >= ElementResolutionThreshold.RECOVERY) return alt;
+        if (alt?.score >= ElementResolutionThreshold.RECOVERY && (!best || alt.score > best.score)) {
+          best = alt;
+        }
       }
-      return null;
+      return best;
     }
     /**
      * Verify the element is still safe to highlight.
@@ -410,7 +435,9 @@ ${lines.join("\n")}`);
         this._activeElement = null;
         this._emit("user:acted", { step, trigger, timestamp: Date.now() });
       };
+      const isFillStep = step.phase === "fill_form" || step.completionCondition === "input_filled";
       const clickHandler = (e) => {
+        if (isFillStep) return;
         if (e.target?.closest?.("#screenpilot-widget")) return;
         if (!this._activeElement || !this._activeElement.contains(e.target)) return;
         onUserAction("click");
@@ -419,13 +446,81 @@ ${lines.join("\n")}`);
       this._cleanups.push(
         () => document.removeEventListener("click", clickHandler, { capture: true })
       );
-      const urlChangeHandler = () => {
+      if (isFillStep) {
+        const TEXT_INPUT_TYPES = /* @__PURE__ */ new Set(["text", "search", "email", "url", "tel", "password", "number", ""]);
+        const isTextLikeField = (el) => {
+          if (!el || typeof el.tagName !== "string") return false;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "textarea") return true;
+          if (el.isContentEditable === true) return true;
+          if (tag === "input") {
+            const type = (el.getAttribute?.("type") ?? "text").toLowerCase();
+            return TEXT_INPUT_TYPES.has(type);
+          }
+          return false;
+        };
+        const fieldValue = (el) => el.isContentEditable === true ? el.textContent ?? "" : el.value ?? "";
+        const inputHandler = (e) => {
+          console.log("[SP:FILL] activeElement", {
+            tag: this._activeElement?.tagName,
+            id: this._activeElement?.id,
+            className: this._activeElement?.className
+          });
+          console.log("[SP:FILL] target", {
+            tag: e.target?.tagName,
+            id: e.target?.id,
+            className: e.target?.className
+          });
+          console.log("[SP:FILL] contains", {
+            result: this._activeElement?.contains?.(e.target)
+          });
+          console.log("[SP:FILL] isTextLikeField", {
+            result: isTextLikeField(e.target)
+          });
+          console.log("[SP:FILL] value", {
+            value: fieldValue(e.target)
+          });
+          if (!this._activeElement) return;
+          const field = e.target;
+          if (!this._activeElement.contains(field)) return;
+          if (!isTextLikeField(field)) return;
+          if (fieldValue(field).trim().length === 0) return;
+          console.log("[SP:FILL] USER_ACTION_EMITTED");
+          onUserAction("input");
+        };
+        document.addEventListener("input", inputHandler, { capture: true });
+        document.addEventListener("change", inputHandler, { capture: true });
+        this._cleanups.push(() => {
+          document.removeEventListener("input", inputHandler, { capture: true });
+          document.removeEventListener("change", inputHandler, { capture: true });
+        });
+      }
+      const getHref = () => {
+        try {
+          return window.location?.href ?? "";
+        } catch {
+          return "";
+        }
+      };
+      const urlBeforeAction = getHref();
+      const urlChangeHandler = (newUrl) => {
         if (step.expectedOutcome !== void 0) {
           if (!step.expectedOutcome.urlChanges) return;
           const pattern = step.expectedOutcome.urlPattern;
           if (pattern) {
             try {
-              const { pathname, hash } = new URL(window.location.href);
+              const { pathname, hash } = new URL(newUrl);
+              if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
+            } catch {
+              return;
+            }
+          }
+        } else if (step.expectedPageState !== void 0) {
+          if (!step.expectedPageState.urlChanges) return;
+          const pattern = step.expectedPageState.urlPattern;
+          if (pattern) {
+            try {
+              const { pathname, hash } = new URL(newUrl);
               if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
             } catch {
               return;
@@ -434,11 +529,61 @@ ${lines.join("\n")}`);
         }
         onUserAction("url_change");
       };
-      window.addEventListener("popstate", urlChangeHandler);
-      window.addEventListener("hashchange", urlChangeHandler);
+      let originalPushState = null;
+      let originalReplaceState = null;
+      if (typeof history !== "undefined" && history?.pushState) {
+        originalPushState = history.pushState.bind(history);
+        originalReplaceState = history.replaceState.bind(history);
+        history.pushState = function(...args) {
+          originalPushState(...args);
+          const nextUrl = args[2] ? String(args[2]) : getHref();
+          urlChangeHandler(nextUrl);
+        };
+        history.replaceState = function(...args) {
+          originalReplaceState(...args);
+          const nextUrl = args[2] ? String(args[2]) : getHref();
+          urlChangeHandler(nextUrl);
+        };
+      }
       this._cleanups.push(() => {
-        window.removeEventListener("popstate", urlChangeHandler);
-        window.removeEventListener("hashchange", urlChangeHandler);
+        if (originalPushState) history.pushState = originalPushState;
+        if (originalReplaceState) history.replaceState = originalReplaceState;
+      });
+      const legacyUrlChangeHandler = () => urlChangeHandler(getHref());
+      window.addEventListener("popstate", legacyUrlChangeHandler);
+      window.addEventListener("hashchange", legacyUrlChangeHandler);
+      this._cleanups.push(() => {
+        window.removeEventListener("popstate", legacyUrlChangeHandler);
+        window.removeEventListener("hashchange", legacyUrlChangeHandler);
+      });
+      let pollInterval = null;
+      const startUrlPoll = () => {
+        if (pollInterval) return;
+        let elapsed = 0;
+        pollInterval = setInterval(() => {
+          elapsed += 100;
+          const currentHref = getHref();
+          if (currentHref && currentHref !== urlBeforeAction) {
+            urlChangeHandler(currentHref);
+          }
+          if (fired || elapsed >= 2e3) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+          }
+        }, 100);
+      };
+      const clickForPollHandler = (e) => {
+        if (e.target?.closest?.("#screenpilot-widget")) return;
+        if (!this._activeElement || !this._activeElement.contains(e.target)) return;
+        startUrlPoll();
+      };
+      document.addEventListener("click", clickForPollHandler, { capture: true });
+      this._cleanups.push(() => {
+        document.removeEventListener("click", clickForPollHandler, { capture: true });
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
       });
     }
     // ── Private — utilities ───────────────────────────────────────────────────
@@ -486,7 +631,7 @@ ${lines.join("\n")}`);
      * @param {import('../shared/types/index.js').PlanRequest} request
      * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
      */
-    async plan(request) {
+    async plan() {
       throw new Error(`${this.name} must implement plan(request)`);
     }
     /**
@@ -496,7 +641,7 @@ ${lines.join("\n")}`);
      * @param {import('../shared/types/index.js').RecoverRequest} request
      * @returns {Promise<import('../shared/types/index.js').RecoverResponse>}
      */
-    async recover(request) {
+    async recover() {
       throw new Error(`${this.name} must implement recover(request)`);
     }
     /**
@@ -506,7 +651,7 @@ ${lines.join("\n")}`);
      * @param {{ screenshot: { image: string, mimeType: string }, pageContext: object }} request
      * @returns {Promise<{ success: boolean, screenContext?: object, error?: string }>}
      */
-    async explain(request) {
+    async explain() {
       throw new Error(`${this.name} must implement explain(request)`);
     }
     /**
@@ -516,7 +661,7 @@ ${lines.join("\n")}`);
      * @param {{ screenshot: { image: string, mimeType: string }, question: string, pageContext: object }} request
      * @returns {Promise<{ success: boolean, answer?: string, confidence?: number, elementHint?: string, error?: string }>}
      */
-    async ask(request) {
+    async ask() {
       throw new Error(`${this.name} must implement ask(request)`);
     }
     /**
@@ -528,7 +673,7 @@ ${lines.join("\n")}`);
      * @param {object} request
      * @returns {{ inputTokens: number, outputTokens: number, estimatedUSD: number }}
      */
-    estimateCost(operation, request) {
+    estimateCost() {
       throw new Error(`${this.name} must implement estimateCost(operation, request)`);
     }
     /**
@@ -1673,7 +1818,7 @@ ${lines.join("\n")}`);
   function makeFallbackHighlighter() {
     let _el = null;
     return {
-      async show(element, text) {
+      async show(element) {
         if (_el) {
           _el.style.outline = "";
         }
@@ -1806,7 +1951,8 @@ ${lines.join("\n")}`);
     S.visible = false;
   }
   function toggle() {
-    S.visible ? close() : open();
+    if (S.visible) close();
+    else open();
   }
   var Playground = { open, close, toggle };
   window.__SP_PLAYGROUND = Playground;

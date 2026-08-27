@@ -20,9 +20,11 @@ export default function Copilot() {
   }, [screenshot, executeStep]);
 
   const handleScreenshotCapture = useCallback(() => {
-    // This would be connected to the browser extension in production
-    // For now, just a placeholder
-    console.log("Capture screenshot from extension");
+    // Placeholder capture keeps the demo flow usable without a browser hook.
+    setScreenshot({
+      image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Zr8kAAAAASUVORK5CYII=",
+      mimeType: "image/png",
+    });
   }, []);
 
   const getStatusColor = (status: CopilotStatus): string => {

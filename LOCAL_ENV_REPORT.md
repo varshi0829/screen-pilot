@@ -1,37 +1,23 @@
-# LOCAL_ENV_REPORT.md
+# Local Environment Note
 
-**Date:** 2026-06-22
+**Date:** 2026-08-21
 
 ---
 
-## Environment Status
+This file is retained as a historical environment note. The current workspace did not re-run the Gemini/OpenRouter credential check from June, so the exact API-key conflict described here is not revalidated in this session.
 
-| Item | Value |
-|------|-------|
-| `.env.local` key | `AQ.Ab8RN6...8Buw` |
-| Shell env var | `AIzaSyDA...8Buw` (OLD - overrides .env.local) |
-| Server port | 3001 (3000 was in use) |
-| Status | 403 PERMISSION_DENIED |
+## Current Verified State
 
-## Key Fingerprint
+- `npm run build` passes locally.
+- `npm run build:ext` passes locally.
+- The local unit suite passes.
+- The extension code now falls back to `chrome.storage.session` in tests when `chrome.storage.local` is absent.
 
-- Local: `AQ.Ab8RN...8Buw` (new key from .env.local)
-- Issue: Shell env var `GEMINI_API_KEY` overrides `.env.local`
+## Remaining External Dependency
 
-## Root Cause
+- Live Gemini/OpenRouter verification still depends on a valid API key and quota in the active environment.
 
-The shell environment has `GEMINI_API_KEY=AIzaSyDAQ.Ab8RN6JmgJT67z6V8WBqKMXMcqSu1GnfvH8TcwAbhvCxLN8Buw` which overrides `.env.local`.
+## Notes
 
-When running with `unset GEMINI_API_KEY`, the local server uses the new key but returns 403 (project denied access).
-
-## Test Results
-
-| Endpoint | Status | Response |
-|----------|--------|---------|
-| localhost:3001 | 403 | PERMISSION_DENIED |
-
-## Conclusion
-
-Local environment has API key conflict. The new key `AQ.Ab8RN6...` is valid but the project has been denied access to Gemini API.
-
-Vercel backend is working correctly (see VERCEL_ENV_REPORT.md).
+- The extension backend URL remains hardcoded in `extension/services/vision-service.js`.
+- If you need local API verification, set the backend to the local Next.js dev server and provide a valid Gemini key in `.env.local`.

@@ -76,9 +76,17 @@ const DOMMatcher = (() => {
     };
   }
 
+  // "+", "＋", or the word "plus" denote a generic create/add action but carry no
+  // matchable text — "+" tokenizes to an empty set (split on non-alphanumerics),
+  // which collapses the semantic, synonym and token-similarity passes and leaves
+  // only degenerate substring / Levenshtein matching.  Seed the new/create/add
+  // synonym family so icon-only create buttons (aria-label "Create new…") resolve
+  // on the primary pass instead of scoring 0 and falling through to alternatives.
+  const ADD_GLYPHS = new Set(['+', '＋', 'plus']);
+
   function buildTargetDescriptor(targetElement) {
     const normalized = normalizeText(targetElement.text);
-    const tokens = tokenize(normalized);
+    const tokens = ADD_GLYPHS.has(normalized) ? ['add', 'new', 'create'] : tokenize(normalized);
     const expandedTokens = expandTokens(tokens);
     const phraseVariants = buildPhraseVariants(normalized, expandedTokens);
 
@@ -93,40 +101,49 @@ const DOMMatcher = (() => {
 
   function scoreElement(element, target, targetType, targetRegion) {
     const attributes = getCandidateAttributes(element);
-    let aggregateScore = 0;
-    let bestReason = '';
-    let bestMatchType = '';
-    const matchedReasons = [];
+
+    // Use the single best-matching attribute as the base score, weighted by that
+    // attribute's reliability weight.  Summing all matching attributes was causing
+    // false amplification: an element whose innerText contains the query *and* whose
+    // aria-label also matches would score 2× vs a perfectly-labelled icon button that
+    // only has an aria-label match.  The best attribute already captures match quality;
+    // secondary attributes add noise, not signal.
+    let bestWeightedScore = 0;
+    let bestReason        = '';
+    let bestMatchType     = '';
 
     for (const attribute of attributes) {
       const scored = scoreAttributeValue(attribute.value, attribute.label, target);
-      if (!scored) {
-        continue;
+      if (!scored) continue;
+
+      const weighted = scored.score * attribute.weight;
+      if (weighted > bestWeightedScore) {
+        bestWeightedScore = weighted;
+        bestReason        = scored.reason;
+        bestMatchType     = scored.matchType;
+      } else {
+        // Keep track of the best match type even from lower-weight attributes
+        bestMatchType = chooseMatchType(bestMatchType, scored.matchType);
       }
-
-      aggregateScore += scored.score * attribute.weight;
-      matchedReasons.push(scored.reason);
-
-      if (!bestReason || scored.score > aggregateScore) {
-        bestReason = scored.reason;
-      }
-
-      bestMatchType = chooseMatchType(bestMatchType, scored.matchType);
     }
 
-    if (aggregateScore <= 0) {
+    if (bestWeightedScore <= 0) {
       return null;
     }
 
+    // Secondary signals are additive bonuses, each capped so they cannot individually
+    // swing the winner.  The cap prevents a strong semantic container from overriding
+    // a much better attribute match on a different element.
     const semantic  = scoreSemanticContainer(element, target, targetType);
     const typeBonus = scoreTypeAffinity(element, targetType);
     const region    = scoreRegion(element, targetRegion);
+
     const finalScore = Math.min(
-      Math.round(aggregateScore + semantic.score + typeBonus.score + region.score),
+      Math.round(bestWeightedScore + semantic.score + typeBonus.score + region.score),
       200
     );
 
-    const reasonParts = matchedReasons.slice(0, 3);
+    const reasonParts = [bestReason];
     if (semantic.reason)  reasonParts.push(semantic.reason);
     if (typeBonus.reason) reasonParts.push(typeBonus.reason);
     if (region.reason)    reasonParts.push(region.reason);
@@ -184,18 +201,83 @@ const DOMMatcher = (() => {
     }
   }
 
+  // Resolve the visible label text associated with a form control, WITHOUT ever
+  // returning the label element itself as a candidate — this only supplies a text
+  // signal for an element that is already a legitimate editable control (Phase 24B
+  // guarantees candidate generation stays restricted to input/textarea/
+  // contenteditable/role=textbox; this helper must never widen that set).
+  //
+  // Resolution order:
+  //   A. element.labels — native, live, and covers BOTH <label for="id"> and
+  //      wrapping <label>text<input></label> with a single browser-provided API.
+  //   B. aria-labelledby — resolve every referenced id and concatenate their text,
+  //      for controls whose accessible name comes from a separate node that isn't
+  //      a <label> at all.
+  //   C. No association found — return '' (a no-op attribute value; scoreAttributeValue
+  //      already short-circuits on empty values).
+  function getAssociatedLabelText(element) {
+    if (element.labels && element.labels.length) {
+      return Array.from(element.labels)
+        .map((label) => label.innerText || label.textContent || '')
+        .join(' ')
+        .trim();
+    }
+
+    const labelledBy = element.getAttribute?.('aria-labelledby');
+    if (labelledBy && typeof document !== 'undefined') {
+      return labelledBy
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((el) => el.innerText || el.textContent || '')
+        .join(' ')
+        .trim();
+    }
+
+    return '';
+  }
+
   function getCandidateAttributes(element) {
+    // innerText on an icon-only button (e.g. <button><svg>…</svg></button>) returns
+    // whitespace, unicode symbols, or raw SVG text nodes — none of which are meaningful
+    // for matching.  Strip to an empty string so these elements aren't penalised (or
+    // falsely rewarded) on the text attribute; their aria-label will carry the match.
+    const rawText = element.innerText || element.textContent || '';
+    const cleanText = rawText.replace(/[\u200b-\u200d\ufeff]/g, '') // zero-width chars
+                             .replace(/[^\S\n]+/g, ' ')              // collapse whitespace
+                             .trim();
+    // Treat the text as empty when it consists only of punctuation / symbols with no
+    // alphabetic or numeric content — covers "+" alone, "•", decorative separators, etc.
+    const meaningfulText = /[a-z0-9]/i.test(cleanText) ? cleanText : '';
+
+    // Icon-only elements (no visible text) rely entirely on aria-label for identity.
+    // The comment above already states this intent; the weight was never adjusted to
+    // reflect it, causing icon buttons to lose to sidebar links that share the same
+    // label as plain visible text.  Boost only when meaningfulText is empty so that
+    // text-bearing elements are completely unaffected.
+    const ariaLabelWeight = meaningfulText === '' ? 1.6 : 1.1;
+
+    // Accessible name from a descendant img[alt] — covers <button><img alt="…"></button>
+    // where the ARIA accessible name is computed from the child img, not an explicit
+    // aria-label on the button itself.  Optional chaining guards non-browser environments.
+    const childImgAlt  = element.querySelector?.('img[alt]')?.getAttribute?.('alt')?.trim() ?? '';
+    const imgAltWeight = meaningfulText === '' ? 1.4 : 0.7;
+
     return [
-      { label: 'text', value: element.innerText || element.textContent, weight: 1 },
-      { label: 'aria-label', value: element.getAttribute('aria-label'), weight: 1.1 },
-      { label: 'title', value: element.getAttribute('title'), weight: 0.9 },
-      { label: 'placeholder', value: element.getAttribute('placeholder'), weight: 0.95 },
-      { label: 'role', value: element.getAttribute('role'), weight: 0.7 },
-      { label: 'name', value: element.getAttribute('name'), weight: 0.85 },
-      { label: 'id', value: element.getAttribute('id'), weight: 0.8 },
-      { label: 'data-testid', value: element.getAttribute('data-testid'), weight: 1.15 },
-      { label: 'data-test', value: element.getAttribute('data-test'), weight: 1.05 },
-      { label: 'data-cy', value: element.getAttribute('data-cy'), weight: 1.05 }
+      { label: 'text',        value: meaningfulText,                              weight: 1             },
+      { label: 'aria-label',  value: element.getAttribute('aria-label'),          weight: ariaLabelWeight },
+      { label: 'title',       value: element.getAttribute('title'),               weight: 0.9  },
+      { label: 'placeholder', value: element.getAttribute('placeholder'),         weight: 0.95 },
+      { label: 'role',        value: element.getAttribute('role'),                weight: 0.7  },
+      { label: 'name',        value: element.getAttribute('name'),                weight: 0.85 },
+      { label: 'id',          value: element.getAttribute('id'),                  weight: 0.8  },
+      { label: 'data-testid', value: element.getAttribute('data-testid'),         weight: 1.15 },
+      { label: 'data-test',   value: element.getAttribute('data-test'),           weight: 1.05 },
+      { label: 'data-cy',     value: element.getAttribute('data-cy'),             weight: 1.05 },
+      { label: 'symbol-text', value: cleanText !== meaningfulText ? cleanText : '', weight: 0.9  },
+      { label: 'img-alt',     value: childImgAlt,                                 weight: imgAltWeight },
+      { label: 'associated-label', value: getAssociatedLabelText(element),        weight: 1.1  },
     ];
   }
 
@@ -204,6 +286,15 @@ const DOMMatcher = (() => {
     if (!normalizedValue) {
       return null;
     }
+
+    // A pure-symbol target (e.g. "+", "#", ">", "*") normalizes to punctuation with no
+    // alphanumeric content. Such a needle is meaningless for the substring/edit-distance
+    // fallbacks: "+".includes-matches every element whose text contains a literal "+"
+    // (including <main>, "C++", "+1,204"), producing a flat 70→62 field whose winner is
+    // decided by DOM order. Gate those two fallbacks so a symbol target can only match
+    // via the exact/token/synonym paths (icon create buttons resolve via their aria-label
+    // synonym match; unrelated "+"-bearing nodes score nothing). See Phase 24 audit.
+    const targetHasAlnum = /[a-z0-9]/i.test(target.normalized);
 
     if (normalizedValue === target.normalized) {
       return buildScore(110, `${label} exact match`, 'exact');
@@ -223,7 +314,7 @@ const DOMMatcher = (() => {
       return buildScore(72 + Math.round(tokenSimilarity * 20), `${label} token similarity ${tokenSimilarity.toFixed(2)}`, 'fuzzy');
     }
 
-    if (normalizedValue.includes(target.normalized) || target.normalized.includes(normalizedValue)) {
+    if (targetHasAlnum && (normalizedValue.includes(target.normalized) || target.normalized.includes(normalizedValue))) {
       return buildScore(70, `${label} contains match`, 'fuzzy');
     }
 
@@ -232,15 +323,17 @@ const DOMMatcher = (() => {
       return buildScore(92, `${label} synonym token match`, 'synonym');
     }
 
-    const distance = levenshteinDistance(normalizedValue, target.normalized);
-    if (distance <= 2) {
-      return buildScore(64 - distance * 8, `${label} fuzzy match`, 'fuzzy');
+    if (targetHasAlnum) {
+      const distance = levenshteinDistance(normalizedValue, target.normalized);
+      if (distance <= 2) {
+        return buildScore(64 - distance * 8, `${label} fuzzy match`, 'fuzzy');
+      }
     }
 
     return null;
   }
 
-  function scoreSemanticContainer(element, target, targetType) {
+  function scoreSemanticContainer(element, target) {
     const container = element.closest('form, nav, header, main, section, article, li, td, tr, label, [role="dialog"], [role="menu"], [role="navigation"], [aria-label]');
     if (!container || container === element) {
       return { score: 0, reason: '' };
@@ -310,6 +403,18 @@ const DOMMatcher = (() => {
       input: ['input', 'textarea', '[contenteditable="true"]', '[role="textbox"]'],
       menu: ['[role="menuitem"]', '[aria-haspopup="menu"]', '[role="button"]', 'button', 'a']
     };
+
+    // Editable controls are ALWAYS one of these four selectors — there is no
+    // legitimate text-entry element reachable only through a generic attribute
+    // selector like [id] or [aria-label]. Restricting type:"input" to exactly
+    // this list (instead of unioning with `common`) structurally prevents
+    // non-editable elements (labels, wrapper divs) from ever becoming candidates,
+    // rather than relying on a scoring bonus that a strong text match on the
+    // wrong element can still outweigh. See Phase 24B audit — a <label> was
+    // winning over the real <input> via the generic [id] selector in `common`.
+    if (type === "input") {
+      return preferred.input;
+    }
 
     return Array.from(new Set([...(preferred[type] || []), ...common]));
   }
@@ -392,7 +497,8 @@ const DOMMatcher = (() => {
 
   function isScreenPilotNode(node) {
     return Boolean(node.closest?.(
-      '#screenpilot-widget, #screenpilot-highlight, #screenpilot-spotlight, #screenpilot-arrow, #screenpilot-bubble'
+      '#screenpilot-widget, #screenpilot-highlight, #screenpilot-spotlight, #screenpilot-arrow, #screenpilot-bubble,' +
+      '[id^="sp-"], [id^="screenpilot-"], [class*="sp-"], [data-screenpilot]'
     ));
   }
 

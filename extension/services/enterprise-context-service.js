@@ -131,7 +131,7 @@
           confidence:          appMatch ? appMatch.confidence : 0,
           detectedAt:          Date.now(),
         };
-      } catch (e) {
+      } catch {
         return { application: null, module: null, workspace: null, pageType: 'other', navigationHierarchy: [], confidence: 0, detectedAt: Date.now() };
       }
     },

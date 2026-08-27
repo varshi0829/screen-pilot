@@ -103,6 +103,9 @@ type PlannerOutput = {
   blockers?:       string[];
   plannerSummary?: string;
   confidence:      number;
+  // Phase 23A: optional, plan-level goal-completion contract. Passed through
+  // verbatim — never validated, coerced, or acted upon in this phase.
+  goalCompletionCriteria?: Record<string, unknown>;
   plan?: {
     goalType:       string;
     confidence:     number;
@@ -231,7 +234,7 @@ async function callOpenRouter(
       ],
     }],
     temperature: 0.1,
-    max_tokens:  2048,
+    max_tokens:  1200,
   };
 
   let upstream: Response;
@@ -335,6 +338,8 @@ function assemblePlanResponse(
     planVersion:      1,
     confidence:       parsed.plan!.confidence ?? parsed.confidence ?? 0,
     createdAt:        now,
+    // Phase 23A: preserve verbatim when present; undefined when absent. Not evaluated.
+    goalCompletionCriteria: parsed.goalCompletionCriteria,
   } : undefined;
 
   if (!planApplicable && parsed.plan != null) {
@@ -367,6 +372,8 @@ function assemblePlanResponse(
     result,
     state,
     plan,
+    // Phase 23A: echo at the top level too (undefined when the planner omits it).
+    goalCompletionCriteria: parsed.goalCompletionCriteria,
     interpretation: parsed.interpretation,
     blockers:       parsed.blockers ?? [],
     plannerSummary: parsed.plannerSummary,
@@ -608,8 +615,8 @@ function buildPlannerPrompt(req: {
   }
 
   if (req.workflowMemory?.extractedData && Object.keys(req.workflowMemory.extractedData).length) {
-    // TODO(bug-12): No size limit on extractedData. Truncate to ~500 chars before Phase 3.
-    lines.push(`Extracted data: ${JSON.stringify(req.workflowMemory.extractedData)}`);
+    const extractedData = JSON.stringify(req.workflowMemory.extractedData);
+    lines.push(`Extracted data: ${extractedData.length > 500 ? `${extractedData.slice(0, 497)}...` : extractedData}`);
   }
 
   if (req.recoveryContext) {
@@ -635,7 +642,9 @@ function buildPlannerPrompt(req: {
 
   const maxSteps    = req.preferences?.maxSteps ?? 10;
   const confirmDest = req.preferences?.confirmDestructiveActions !== false;
-  // TODO(bug-11): preferences.language is never injected into the prompt.
+  if (req.preferences?.language) {
+    lines.push(`Preferred language: ${req.preferences.language}`);
+  }
   // TODO(bug-13): step.phase is advisory; validate against enum in the Phase 3 executor.
 
   return `${lines.join("\n")}
@@ -697,6 +706,16 @@ Return ONLY valid JSON (no markdown, no explanation):
         "reversible": true
       }
     ]
+  },
+  "goalCompletionCriteria": {
+    "goalType": "action",
+    "match": "all",
+    "verificationStrategy": "local_signals",
+    "requiresEffect": true,
+    "successSignals": [
+      { "type": "url_matches", "urlPattern": "/test" },
+      { "type": "element_present", "text": "test" }
+    ]
   }
 }
 
@@ -706,7 +725,21 @@ Rules:
 - The FINAL step of a successful plan MUST set "completionCondition": "final". Every earlier step keeps its mechanism value (url_change | dom_change | input_filled | element_disappears). The "final" marker lets the client detect goal completion the instant the last step succeeds — without an extra planner round-trip. Never mark more than one step "final", and never mark a non-final step "final".
 - Prefer the SHORTEST PATH. If a global navigation control on the current page can achieve the goal (header "+" menu, sidebar Create button, toolbar action), use it directly. Do NOT add steps to navigate to a dashboard or home page first.
   Examples of always-available global controls: GitHub "+" (new repo/issue/PR from any page), Gmail "Compose" (always in left sidebar), LinkedIn message icon (always in top nav), YouTube "Create" (always in top nav).
-- If the goal is already achieved: state="complete", plan.steps=[].
+- If the goal is already achieved: state="complete", plan.steps=[]. "Already achieved" means the goal's OUTCOME is visible on the current screen right now (the repository already exists, the SSH key is already listed, the message was sent). Arriving on a settings page, a list page, a creation page, or an empty form is NOT completion — do NOT return state="complete" and do NOT mark any step "final" merely because you navigated to the correct page.
+- Before emitting a fill_form step, check whether the target field's CURRENT value, as visible in the screenshot, already matches the value you intend to enter. If the value is already correct, do NOT emit that fill_form step again. Proceed directly to the next incomplete step.
+- For "create"/"add"/"new"/"compose"/"upload" goals, the plan MUST carry through to the terminal action, not just navigate to the surface that hosts it. After reaching the creation surface, include: (a) the step that opens/clicks the create control (e.g. "New SSH key", "New repository", "Compose"), then (b) fill_form steps for every required input the goal specifies, then (c) the final submit step (e.g. "Add SSH key", "Create repository", "Send"). Only that final submit step is marked "final".
+  Example — goal "create a repository called test" from the dashboard: [open the create "+" menu] → ["New repository"] → [fill the "Repository name" field with "test" (phase:fill_form, completionCondition:input_filled)] → ["Create repository" (phase:submit, completionCondition:final)].
+  Example — goal "add an SSH key" from anywhere: [avatar/profile menu] → ["Settings"] → ["SSH and GPG keys"] → ["New SSH key"] → [fill the key fields] → ["Add SSH key" (completionCondition:final)]. Never stop at "SSH and GPG keys".
+- goalCompletionCriteria (OPTIONAL, top-level field alongside "plan", for "action" goals — create/add/new/change/send/upload): emit a plan-level contract describing the goal's OBSERVABLE OUTCOME on the page that exists AFTER the terminal action. Shape: { "goalType":"action", "match":"all", "verificationStrategy":"local_signals", "requiresEffect":true, "successSignals":[ … ] }. Each successSignal is exactly one of:
+  - { "type":"url_matches",     "urlPattern":"<substring the post-action URL contains>" }
+  - { "type":"url_leaves",      "urlPattern":"<substring the URL should no longer contain>" }
+  - { "type":"text_present",    "text":"<visible text that appears on success>" }
+  - { "type":"element_present", "text":"<accessible label/text present on success>" }
+  - { "type":"element_absent",  "text":"<accessible label that disappears on success>" }
+  Signals MUST be checkable AFTER the final action, never on the pre-action page. Prefer two signals: a URL transition AND a mutation signal (text/element). Omit goalCompletionCriteria entirely for pure navigation goals, or when you cannot state a reliable post-action signal.
+  Example "add a new ssh key": { "goalType":"action","match":"all","verificationStrategy":"local_signals","requiresEffect":true,"successSignals":[ {"type":"url_matches","urlPattern":"/settings/keys"}, {"type":"text_present","text":"SSH keys"} ] }
+  Example "create repository named test": { "goalType":"action","match":"all","verificationStrategy":"local_signals","requiresEffect":true,"successSignals":[ {"type":"url_matches","urlPattern":"/test"}, {"type":"element_present","text":"test"} ] }
+- To fill a text field, set phase:"fill_form", completionCondition:"input_filled", type:"input", and put the exact value to enter in targetElement.intent (e.g. "enter 'test'").
 - If blocked (not logged in, permission denied): result="OK", state="blocked", list blockers[], plan omitted.
 - If multiple valid paths exist and user must choose: result="NEEDS_USER", state="ambiguous".
 - If a destructive action requires explicit user confirmation: result="NEEDS_USER", state="planned".

@@ -58,6 +58,26 @@
     ELEMENT_DISAPPEARS: "element_disappears",
     FINAL: "final"
   });
+  var SuccessSignalType = Object.freeze({
+    URL_MATCHES: "url_matches",
+    // location matches urlPattern (post-action)
+    URL_LEAVES: "url_leaves",
+    // location no longer matches urlPattern (left the form)
+    TEXT_PRESENT: "text_present",
+    // visible page text contains `text` (e.g. "New key added")
+    ELEMENT_PRESENT: "element_present",
+    // a control/label with accessible `text` exists (e.g. key row)
+    ELEMENT_ABSENT: "element_absent"
+    // element_disappears (e.g. creation form closed)
+  });
+  var VerificationStrategy = Object.freeze({
+    LOCAL_SIGNALS: "local_signals",
+    // signals alone decide (navigation goals)
+    HYBRID: "hybrid",
+    // local first; if ambiguous, one AI-confirm turn
+    AI_CONFIRM: "ai_confirm"
+    // always confirm via a post-action planner turn
+  });
   var StepStatus = Object.freeze({
     PENDING: "pending",
     EXECUTING: "executing",
@@ -350,12 +370,15 @@
         this._logCandidates(step.targetElement.text, primary.candidates);
         return primary;
       }
+      let best = null;
       for (const altText of step.targetElement.alternatives ?? []) {
         if (!altText?.trim()) continue;
         const alt = this._domMatcher.matchElement({ ...step.targetElement, text: altText });
-        if (alt?.score >= ElementResolutionThreshold.RECOVERY) return alt;
+        if (alt?.score >= ElementResolutionThreshold.RECOVERY && (!best || alt.score > best.score)) {
+          best = alt;
+        }
       }
-      return null;
+      return best;
     }
     /**
      * Verify the element is still safe to highlight.
@@ -412,7 +435,9 @@ ${lines.join("\n")}`);
         this._activeElement = null;
         this._emit("user:acted", { step, trigger, timestamp: Date.now() });
       };
+      const isFillStep = step.phase === "fill_form" || step.completionCondition === "input_filled";
       const clickHandler = (e) => {
+        if (isFillStep) return;
         if (e.target?.closest?.("#screenpilot-widget")) return;
         if (!this._activeElement || !this._activeElement.contains(e.target)) return;
         onUserAction("click");
@@ -421,6 +446,55 @@ ${lines.join("\n")}`);
       this._cleanups.push(
         () => document.removeEventListener("click", clickHandler, { capture: true })
       );
+      if (isFillStep) {
+        const TEXT_INPUT_TYPES = /* @__PURE__ */ new Set(["text", "search", "email", "url", "tel", "password", "number", ""]);
+        const isTextLikeField = (el) => {
+          if (!el || typeof el.tagName !== "string") return false;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "textarea") return true;
+          if (el.isContentEditable === true) return true;
+          if (tag === "input") {
+            const type = (el.getAttribute?.("type") ?? "text").toLowerCase();
+            return TEXT_INPUT_TYPES.has(type);
+          }
+          return false;
+        };
+        const fieldValue = (el) => el.isContentEditable === true ? el.textContent ?? "" : el.value ?? "";
+        const inputHandler = (e) => {
+          console.log("[SP:FILL] activeElement", {
+            tag: this._activeElement?.tagName,
+            id: this._activeElement?.id,
+            className: this._activeElement?.className
+          });
+          console.log("[SP:FILL] target", {
+            tag: e.target?.tagName,
+            id: e.target?.id,
+            className: e.target?.className
+          });
+          console.log("[SP:FILL] contains", {
+            result: this._activeElement?.contains?.(e.target)
+          });
+          console.log("[SP:FILL] isTextLikeField", {
+            result: isTextLikeField(e.target)
+          });
+          console.log("[SP:FILL] value", {
+            value: fieldValue(e.target)
+          });
+          if (!this._activeElement) return;
+          const field = e.target;
+          if (!this._activeElement.contains(field)) return;
+          if (!isTextLikeField(field)) return;
+          if (fieldValue(field).trim().length === 0) return;
+          console.log("[SP:FILL] USER_ACTION_EMITTED");
+          onUserAction("input");
+        };
+        document.addEventListener("input", inputHandler, { capture: true });
+        document.addEventListener("change", inputHandler, { capture: true });
+        this._cleanups.push(() => {
+          document.removeEventListener("input", inputHandler, { capture: true });
+          document.removeEventListener("change", inputHandler, { capture: true });
+        });
+      }
       const getHref = () => {
         try {
           return window.location?.href ?? "";
@@ -557,7 +631,7 @@ ${lines.join("\n")}`);
      * @param {import('../shared/types/index.js').PlanRequest} request
      * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
      */
-    async plan(request) {
+    async plan() {
       throw new Error(`${this.name} must implement plan(request)`);
     }
     /**
@@ -567,7 +641,7 @@ ${lines.join("\n")}`);
      * @param {import('../shared/types/index.js').RecoverRequest} request
      * @returns {Promise<import('../shared/types/index.js').RecoverResponse>}
      */
-    async recover(request) {
+    async recover() {
       throw new Error(`${this.name} must implement recover(request)`);
     }
     /**
@@ -577,7 +651,7 @@ ${lines.join("\n")}`);
      * @param {{ screenshot: { image: string, mimeType: string }, pageContext: object }} request
      * @returns {Promise<{ success: boolean, screenContext?: object, error?: string }>}
      */
-    async explain(request) {
+    async explain() {
       throw new Error(`${this.name} must implement explain(request)`);
     }
     /**
@@ -587,7 +661,7 @@ ${lines.join("\n")}`);
      * @param {{ screenshot: { image: string, mimeType: string }, question: string, pageContext: object }} request
      * @returns {Promise<{ success: boolean, answer?: string, confidence?: number, elementHint?: string, error?: string }>}
      */
-    async ask(request) {
+    async ask() {
       throw new Error(`${this.name} must implement ask(request)`);
     }
     /**
@@ -599,7 +673,7 @@ ${lines.join("\n")}`);
      * @param {object} request
      * @returns {{ inputTokens: number, outputTokens: number, estimatedUSD: number }}
      */
-    estimateCost(operation, request) {
+    estimateCost() {
       throw new Error(`${this.name} must implement estimateCost(operation, request)`);
     }
     /**
@@ -962,13 +1036,20 @@ ${lines.join("\n")}`);
   function nowMs() {
     return Date.now();
   }
+  function getStorageArea() {
+    return chrome.storage?.local ?? chrome.storage?.session ?? null;
+  }
   async function _read(tabId) {
     const key = sessionKey(tabId);
-    const result = await chrome.storage.local.get(key);
+    const storage = getStorageArea();
+    if (!storage) throw new Error("chrome.storage.local/session is unavailable");
+    const result = await storage.get(key);
     return result[key] ?? null;
   }
   async function _write(tabId, session) {
-    await chrome.storage.local.set({ [sessionKey(tabId)]: session });
+    const storage = getStorageArea();
+    if (!storage) throw new Error("chrome.storage.local/session is unavailable");
+    await storage.set({ [sessionKey(tabId)]: session });
   }
   var SessionStore = {
     /**
@@ -998,6 +1079,11 @@ ${lines.join("\n")}`);
         lastProgressAt: t,
         pendingStep: null,
         clarifications: [],
+        // Phase 23A: plan-level goal-completion contract, persisted so it survives
+        // navigation / reload / bootstrap resume. Additive and optional — set later
+        // via patchSession when a plan carrying it is accepted. NOT a schema bump, so
+        // existing sessions (which lack this field) still load unchanged.
+        goalCompletionCriteria: null,
         phase: "PLANNING",
         createdAt: t,
         updatedAt: t,
@@ -1017,11 +1103,11 @@ ${lines.join("\n")}`);
       const session = await _read(tabId);
       if (!session) return null;
       if (session.schemaVersion !== SCHEMA_VERSION) {
-        chrome.storage.local.remove(sessionKey(tabId));
+        await getStorageArea()?.remove(sessionKey(tabId));
         return null;
       }
       if (nowMs() > session.expiresAt) {
-        chrome.storage.local.remove(sessionKey(tabId));
+        await getStorageArea()?.remove(sessionKey(tabId));
         return null;
       }
       return session;
@@ -1033,7 +1119,7 @@ ${lines.join("\n")}`);
      * @returns {Promise<void>}
      */
     async clear(tabId) {
-      await chrome.storage.local.remove(sessionKey(tabId));
+      await getStorageArea()?.remove(sessionKey(tabId));
     },
     /**
      * Scan all stored sessions and remove those that have expired.
@@ -1042,12 +1128,14 @@ ${lines.join("\n")}`);
      * @returns {Promise<number>} count of sessions removed
      */
     async cleanupExpired() {
-      const all = await chrome.storage.local.get(null);
+      const storage = getStorageArea();
+      if (!storage) return 0;
+      const all = await storage.get(null);
       const now = nowMs();
       const keys = Object.keys(all).filter(
         (k) => k.startsWith(KEY_PREFIX) && now > (all[k]?.expiresAt ?? 0)
       );
-      if (keys.length) await chrome.storage.local.remove(keys);
+      if (keys.length) await storage.remove(keys);
       return keys.length;
     },
     /**
@@ -1354,6 +1442,133 @@ ${lines.join("\n")}`);
   SessionStore.setPendingStep = SessionStore.markPendingStep;
   SessionStore.appendCompletedStep = SessionStore.completeStep;
 
+  // extension/services/goal-verifier.js
+  function normalize(value) {
+    return typeof value === "string" ? value.replace(/\s+/g, " ").trim().toLowerCase() : "";
+  }
+  function hrefIncludes(loc, pattern) {
+    if (!pattern) return null;
+    const href = loc && loc.href || "";
+    return href.includes(pattern);
+  }
+  function textPresent(doc, text) {
+    const needle = normalize(text);
+    if (!needle) return null;
+    const body = doc && doc.body ? doc.body.innerText || doc.body.textContent || "" : "";
+    return normalize(body).includes(needle);
+  }
+  function elementPresent(doc, text) {
+    const needle = normalize(text);
+    if (!needle) return null;
+    if (!doc || typeof doc.querySelectorAll !== "function") return null;
+    for (const el of doc.querySelectorAll("[aria-label],[title],img[alt]")) {
+      const name = normalize(
+        el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("alt") || ""
+      );
+      if (name.includes(needle)) return true;
+    }
+    for (const el of doc.querySelectorAll('a,button,[role="button"],[role="link"],h1,h2,h3,summary,li,td,strong,span')) {
+      if (normalize(el.textContent || "").includes(needle)) return true;
+    }
+    return false;
+  }
+  function evaluateSignal(signal, doc, loc) {
+    const type = signal && signal.type;
+    const target = (signal && (signal.urlPattern ?? signal.text)) ?? "";
+    let passed;
+    switch (type) {
+      case "url_matches":
+        passed = loc ? hrefIncludes(loc, signal.urlPattern) : null;
+        break;
+      case "url_leaves": {
+        const inc = loc ? hrefIncludes(loc, signal.urlPattern) : null;
+        passed = inc === null ? null : !inc;
+        break;
+      }
+      case "text_present":
+        passed = textPresent(doc, signal.text);
+        break;
+      case "element_present":
+        passed = elementPresent(doc, signal.text);
+        break;
+      case "element_absent": {
+        const pres = elementPresent(doc, signal.text);
+        passed = pres === null ? null : !pres;
+        break;
+      }
+      default:
+        passed = null;
+    }
+    return { type: type || "unknown", target, passed };
+  }
+  var GoalVerifier = {
+    /**
+     * Evaluate goalCompletionCriteria against the current page.
+     *
+     * @param {import('../shared/types/index.js').GoalCompletionCriteria} criteria
+     * @param {{ doc?: Document, loc?: Location }} [env] - injectable for tests
+     * @returns {{ satisfied: boolean, verdict: 'satisfied'|'unsatisfied'|'unknown',
+     *             matchedSignals: number, totalSignals: number,
+     *             details: Array<{type: string, target: string, passed: boolean|null}> }}
+     */
+    evaluate(criteria, env = {}) {
+      const doc = env.doc ?? (typeof document !== "undefined" ? document : null);
+      const loc = env.loc ?? (typeof location !== "undefined" ? location : null);
+      const signals = Array.isArray(criteria && criteria.successSignals) ? criteria.successSignals : [];
+      const totalSignals = signals.length;
+      if (totalSignals === 0) {
+        return { satisfied: false, verdict: "unknown", matchedSignals: 0, totalSignals: 0, details: [] };
+      }
+      const details = signals.map((s) => evaluateSignal(s, doc, loc));
+      const matchedSignals = details.filter((d) => d.passed === true).length;
+      const anyUnknown = details.some((d) => d.passed === null);
+      const match = criteria && criteria.match === "any" ? "any" : "all";
+      const satisfied = match === "any" ? matchedSignals >= 1 : matchedSignals === totalSignals;
+      let verdict;
+      if (satisfied) verdict = "satisfied";
+      else if (anyUnknown) verdict = "unknown";
+      else verdict = "unsatisfied";
+      return { satisfied, verdict, matchedSignals, totalSignals, details };
+    },
+    /**
+     * Phase 26 — completion gate. Decides whether the verifier may DRIVE completion
+     * (as opposed to Phase 23C's log-only shadow mode). All safety rules live here:
+     *   1. criteria must exist,
+     *   2. requiresEffect must be explicitly true (navigation-only goals stay on the
+     *      legacy planner-completion path),
+     *   3. evaluate() must return satisfied (match rule already enforced there),
+     *   4. optional confidenceThreshold must be met (matched/total ratio).
+     * Returns { complete, reason, verdict } — never throws.
+     *
+     * @param {import('../shared/types/index.js').GoalCompletionCriteria|null} criteria
+     * @param {{ doc?: Document, loc?: Location }} [env]
+     */
+    shouldComplete(criteria, env = {}) {
+      const result = (() => {
+        try {
+          if (!criteria) return { complete: false, reason: "no_criteria", verdict: null };
+          if (criteria.requiresEffect !== true) return { complete: false, reason: "no_effect_contract", verdict: null };
+          const verdict = this.evaluate(criteria, env);
+          if (!verdict.satisfied) return { complete: false, reason: "unsatisfied", verdict };
+          if (typeof criteria.confidenceThreshold === "number" && verdict.totalSignals > 0 && verdict.matchedSignals / verdict.totalSignals < criteria.confidenceThreshold) {
+            return { complete: false, reason: "below_confidence_threshold", verdict };
+          }
+          return { complete: true, reason: "signals_satisfied", verdict };
+        } catch {
+          return { complete: false, reason: "evaluation_error", verdict: null };
+        }
+      })();
+      console.log("[SP:GoalVerifier]", {
+        complete: result.complete,
+        reason: result.reason,
+        matchedSignals: result.verdict?.matchedSignals,
+        totalSignals: result.verdict?.totalSignals,
+        details: result.verdict?.details
+      });
+      return result;
+    }
+  };
+
   // extension/services/navigation-classifier.js
   var NavClassification = Object.freeze({
     WORKFLOW_NAVIGATION: "WORKFLOW_NAVIGATION",
@@ -1412,6 +1627,9 @@ ${lines.join("\n")}`);
   var RETRYABLE_PLAN_ERRORS = /* @__PURE__ */ new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
   var MAX_PLAN_RETRIES = 2;
   var STATUS_ID = "sp-v2-status-banner";
+  function getStorageArea2() {
+    return chrome.storage?.local ?? chrome.storage?.session ?? null;
+  }
   function showStatus(text, type = "info") {
     let el = document.getElementById(STATUS_ID);
     if (!el) {
@@ -1419,8 +1637,8 @@ ${lines.join("\n")}`);
       el.id = STATUS_ID;
       el.style.cssText = [
         "position:fixed",
-        "top:16px",
-        "left:16px",
+        "bottom:16px",
+        "right:16px",
         "z-index:2147483647",
         "padding:10px 18px",
         "border-radius:10px",
@@ -1456,7 +1674,7 @@ ${lines.join("\n")}`);
     el.id = STATUS_ID;
     el.style.cssText = [
       "position:fixed",
-      "top:16px",
+      "bottom:16px",
       "right:16px",
       "z-index:2147483647",
       "width:272px",
@@ -1478,13 +1696,62 @@ ${lines.join("\n")}`);
     el.innerHTML = `<div style="padding:8px 12px 6px;border-bottom:1px solid rgba(255,255,255,0.05)"><div style="font-size:10px;font-weight:700;color:#cc2222;letter-spacing:0.1em;text-transform:uppercase">ScreenPilot</div><div style="font-size:11px;color:#888;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${ctx.goal || ""}</div></div>` + (stepsHtml || currentHtml ? `<div style="padding:6px 12px">${stepsHtml}${currentHtml}</div>` : "") + `<div style="padding:3px 12px 7px;font-size:10px;color:#333">${progress}</div>`;
     document.body.appendChild(el);
   }
+  var CONFETTI_ID = "sp-v2-confetti";
+  function launchConfetti() {
+    document.getElementById(CONFETTI_ID)?.remove();
+    const canvas = document.createElement("canvas");
+    canvas.id = CONFETTI_ID;
+    canvas.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646";
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      canvas.remove();
+      return;
+    }
+    const colors = ["#cc2222", "#3a7d44", "#f0c000", "#ffffff", "#e07a2a"];
+    const parts = Array.from({ length: 140 }, () => ({
+      x: Math.random() * canvas.width,
+      y: -20 - Math.random() * canvas.height * 0.3,
+      r: 4 + Math.random() * 5,
+      c: colors[Math.random() * colors.length | 0],
+      vx: -2 + Math.random() * 4,
+      vy: 2 + Math.random() * 4,
+      rot: Math.random() * Math.PI,
+      vr: -0.2 + Math.random() * 0.4
+    }));
+    const start = performance.now();
+    const DURATION = 3500;
+    function frame(now) {
+      if (!canvas.isConnected) return;
+      const elapsed = now - start;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (const p of parts) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.05;
+        p.rot += p.vr;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.globalAlpha = Math.max(0, 1 - elapsed / DURATION);
+        ctx.fillStyle = p.c;
+        ctx.fillRect(-p.r / 2, -p.r / 2, p.r, p.r * 0.6);
+        ctx.restore();
+      }
+      if (elapsed < DURATION) requestAnimationFrame(frame);
+      else canvas.remove();
+    }
+    requestAnimationFrame(frame);
+  }
   function showCompletionCard(data) {
     hideStatus();
     const card = document.createElement("div");
     card.id = STATUS_ID;
     card.style.cssText = [
       "position:fixed",
-      "top:16px",
+      "bottom:16px",
       "right:16px",
       "z-index:2147483647",
       "width:272px",
@@ -1495,15 +1762,10 @@ ${lines.join("\n")}`);
       "border:1px solid rgba(255,255,255,0.08)",
       "overflow:hidden"
     ].join(";");
-    const elapsed = data.startedAt ? Math.round((Date.now() - data.startedAt) / 1e3) : null;
-    const timeText = elapsed != null ? elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : "";
-    card.innerHTML = `<div style="padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,0.05);text-align:center"><div style="font-size:18px;color:#3a7d44;margin-bottom:3px">\u2713</div><div style="font-size:11px;font-weight:700;color:#3a7d44;letter-spacing:0.08em;text-transform:uppercase">Task Completed</div></div><div style="padding:10px 14px 8px"><div style="font-size:11px;color:#999;line-height:1.4">${data.goal || "Goal completed"}</div><div style="display:flex;gap:12px;margin-top:6px"><span style="font-size:10px;color:#555">Steps: <span style="color:#777">${data.steps}</span></span>` + (timeText ? `<span style="font-size:10px;color:#555">Time: <span style="color:#777">${timeText}</span></span>` : "") + `</div></div><div style="padding:0 14px 12px"><button id="sp-v2-newtask-btn" style="width:100%;padding:7px;background:#cc2222;color:#fff;border:none;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0.03em">Start New Task</button></div>`;
+    card.innerHTML = `<div style="padding:14px 16px 8px;text-align:center"><div style="font-size:22px;margin-bottom:4px">\u{1F389}</div><div style="font-size:12px;font-weight:700;color:#3a7d44;letter-spacing:0.08em;text-transform:uppercase">Task Complete</div></div><div style="padding:0 16px 16px"><div style="font-size:11px;color:#777;margin-bottom:3px">Successfully completed:</div><div style="font-size:12px;color:#f0f0f0;line-height:1.4">${data.goal || "Goal completed"}</div></div>`;
     document.body.appendChild(card);
-    document.getElementById("sp-v2-newtask-btn").addEventListener("click", () => {
-      hideStatus();
-      openV2Overlay();
-    });
-    setTimeout(hideStatus, 1e4);
+    launchConfetti();
+    setTimeout(hideStatus, 4e3);
   }
   var PAUSED_ID = "sp-v2-paused-banner";
   function showPausedBanner(session) {
@@ -1690,6 +1952,7 @@ ${lines.join("\n")}`);
     return [...buckets.top_navigation, ...buckets.side_navigation, ...buckets.other];
   }
   function buildPendingStepContext(step) {
+    const snap = capturePageSnapshot("");
     return {
       description: step.description,
       intent: step.intent,
@@ -1697,6 +1960,7 @@ ${lines.join("\n")}`);
       expectedUrlPattern: step.expectedPageState?.urlPattern ?? null,
       expectedUrlChanges: step.expectedPageState?.urlChanges ?? false,
       urlBefore: window.location.href,
+      domHashBefore: snap.domHash,
       stepStartedAt: Date.now()
     };
   }
@@ -1706,6 +1970,8 @@ ${lines.join("\n")}`);
       intent: pendingStep.intent,
       completionCondition: pendingStep.completionCondition,
       urlBefore: pendingStep.urlBefore,
+      domHashBefore: pendingStep.domHashBefore ?? null,
+      // carry through for dedup guard
       urlAfter: window.location.href,
       completedAt: Date.now()
     };
@@ -1746,7 +2012,8 @@ ${lines.join("\n")}`);
     await SessionStore.clear(tabId);
   }
   async function _runPlanLoop(tabId, myGen) {
-    const { openRouterApiKey } = await chrome.storage.local.get("openRouterApiKey");
+    const storage = getStorageArea2();
+    const { openRouterApiKey } = storage ? await storage.get("openRouterApiKey") : { openRouterApiKey: void 0 };
     const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? void 0 });
     let planRetryCount = 0;
     while (true) {
@@ -1761,6 +2028,30 @@ ${lines.join("\n")}`);
         return;
       }
       if (_generation !== myGen) return;
+      try {
+        const lastStep = session.completedSteps[session.completedSteps.length - 1];
+        const currentSnap = capturePageSnapshot("");
+        console.log(`[SP:V2:DIAG] Plan loop entry \u2014 completedSteps=${session.completedSteps.length} stepAttemptCount=${session.stepAttemptCount} phase=${session.phase}`, {
+          pendingStep: session.pendingStep ? { intent: session.pendingStep.intent, domHashBefore: session.pendingStep.domHashBefore } : null,
+          lastCompletedStep: lastStep ? { intent: lastStep.intent, domHashBefore: lastStep.domHashBefore, urlBefore: lastStep.urlBefore } : null,
+          currentUrl: currentSnap.url,
+          currentDomHash: currentSnap.domHash
+        });
+      } catch {
+      }
+      {
+        const gate = GoalVerifier.shouldComplete(session.goalCompletionCriteria);
+        if (gate.complete) {
+          console.log("[SP:GoalCompletion]", {
+            source: "verifier",
+            satisfied: true,
+            signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+          });
+          applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
+          await _showGoalCompleteCard(tabId, session.goal);
+          return;
+        }
+      }
       const { isStuck: budgetExhausted, reason: budgetReason } = await SessionStore.incrementPlannerAttemptOnly(tabId);
       if (budgetExhausted) {
         applyEvent(TaskEvent.PLAN_FAILED, { reason: budgetReason });
@@ -1825,8 +2116,38 @@ ${lines.join("\n")}`);
       }
       if (_generation !== myGen) return;
       console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${planResp.plannerSummary ?? ""}"`);
+      if (planResp.plan?.steps?.length) {
+        const s0 = planResp.plan.steps[0];
+        console.log(`[SP:V2:DIAG] Planner step[0]:`, {
+          intent: s0.intent,
+          description: s0.description,
+          targetText: s0.targetElement?.text,
+          completionCondition: s0.completionCondition,
+          urlChanges: s0.expectedPageState?.urlChanges,
+          urlPattern: s0.expectedPageState?.urlPattern
+        });
+      }
       const outcome = resolveOutcome(planResp);
       if (outcome === "goal_reached") {
+        const criteria = freshSession.goalCompletionCriteria;
+        if (criteria?.requiresEffect === true) {
+          const gate = GoalVerifier.shouldComplete(criteria);
+          console.log("[SP:GoalCompletionGate]", {
+            requiresEffect: criteria.requiresEffect,
+            verifierComplete: gate.complete,
+            verifierReason: gate.reason
+          });
+          if (!gate.complete) {
+            console.log("[SP:GoalCompletion]", {
+              source: "planner",
+              state: "complete",
+              accepted: false,
+              reason: gate.reason
+            });
+            continue;
+          }
+        }
+        console.log("[SP:GoalCompletion]", { source: "planner", state: "complete" });
         applyEvent(TaskEvent.PLAN_COMPLETE);
         showCompletionCard({
           goal: freshSession.goal,
@@ -1851,7 +2172,7 @@ ${lines.join("\n")}`);
         const { isStuck, reason } = await SessionStore.incrementAmbiguousAttempt(tabId);
         if (isStuck) {
           applyEvent(TaskEvent.PLAN_FAILED, { reason: "ambiguous_limit_reached" });
-          showStatus("ScreenPilot: Cannot determine next step \u2014 goal is too ambiguous", "error");
+          showStatus(reason ? `ScreenPilot: Cannot determine next step \u2014 ${reason}` : "ScreenPilot: Cannot determine next step \u2014 goal is too ambiguous", "error");
           await SessionStore.clear(tabId);
           return;
         }
@@ -1893,10 +2214,59 @@ ${lines.join("\n")}`);
         continue;
       }
       applyEvent(TaskEvent.PLAN_RECEIVED, { intent: plannerStep.intent });
+      {
+        const latestCompleted = freshSession.completedSteps[freshSession.completedSteps.length - 1];
+        if (latestCompleted && latestCompleted.intent === plannerStep.intent) {
+          const currentSnap = capturePageSnapshot("");
+          const urlSame = currentSnap.url === latestCompleted.urlBefore;
+          let domHashSame;
+          if (latestCompleted.domHashBefore != null) {
+            domHashSame = currentSnap.domHash === latestCompleted.domHashBefore;
+          } else if (freshSession.pendingStep?.domHashBefore != null) {
+            domHashSame = currentSnap.domHash === freshSession.pendingStep.domHashBefore;
+          } else {
+            domHashSame = false;
+          }
+          console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${latestCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? "none"}`);
+          if (urlSame && domHashSame) {
+            console.warn(
+              `[SP:V2] Dedup guard FIRED: planner returned same intent="${plannerStep.intent}" as last completed step with identical page state \u2014 page did not change after that action`
+            );
+            const { isStuck, reason } = await SessionStore.incrementStepAttempt(tabId);
+            if (isStuck) {
+              applyEvent(TaskEvent.PLAN_FAILED, { reason });
+              showStatus(`ScreenPilot: ${reason}`, "error");
+              await SessionStore.clear(tabId);
+              return;
+            }
+            await new Promise((r) => setTimeout(r, 500));
+            continue;
+          } else {
+            console.log(`[SP:V2] Dedup check PASSED: same intent but page state changed (urlSame=${urlSame} domHashSame=${domHashSame}) \u2014 allowing re-execution`);
+          }
+        }
+      }
+      const goalCompletionCriteria = planResp.goalCompletionCriteria ?? planResp.plan.goalCompletionCriteria;
+      if (goalCompletionCriteria && !freshSession.goalCompletionCriteria) {
+        await SessionStore.patchSession(tabId, { goalCompletionCriteria });
+        console.log("[SP:GoalCompletionCriteria]", {
+          goalType: goalCompletionCriteria.goalType,
+          match: goalCompletionCriteria.match,
+          verificationStrategy: goalCompletionCriteria.verificationStrategy,
+          requiresEffect: goalCompletionCriteria.requiresEffect,
+          successSignals: goalCompletionCriteria.successSignals
+        });
+      }
+      await _shadowGoalVerify(tabId, "PLAN_RECEIVED", false);
       hideStatus();
       await SessionStore.setPhase(tabId, "EXECUTING");
       const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
       if (result === "navigated" || result === "aborted") {
+        if (result === "navigated") {
+          setTimeout(() => {
+            _bootstrapSession(tabId);
+          }, 800);
+        }
         return;
       }
       if (result === "goal_complete") {
@@ -1912,11 +2282,34 @@ ${lines.join("\n")}`);
         }
         await SessionStore.setPhase(tabId, "PLANNING");
         applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
+        await _shadowGoalVerify(tabId, "REPLAN", false);
         await new Promise((r) => setTimeout(r, 500));
         continue;
       }
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
+      await _shadowGoalVerify(tabId, "REPLAN", false);
+    }
+  }
+  async function _shadowGoalVerify(tabId, trigger, legacyComplete) {
+    try {
+      const session = await SessionStore.load(tabId);
+      const criteria = session?.goalCompletionCriteria;
+      if (!criteria) return;
+      const verdict = GoalVerifier.evaluate(criteria);
+      console.log(`[SP:GoalVerifier] trigger=${trigger}`, {
+        satisfied: verdict.satisfied,
+        matchedSignals: verdict.matchedSignals,
+        totalSignals: verdict.totalSignals,
+        details: verdict.details
+      });
+      console.log("[SP:GoalAgreement]", {
+        trigger,
+        legacyComplete: !!legacyComplete,
+        verifierComplete: verdict.satisfied
+      });
+    } catch (err) {
+      console.warn("[SP:GoalVerifier] shadow evaluation error (ignored):", err);
     }
   }
   async function _executeStep(tabId, plannerStep, goal, myGen) {
@@ -1979,15 +2372,39 @@ ${lines.join("\n")}`);
         const pre = executor.getPreActionSnapshot();
         const post = capturePageSnapshot("");
         const verdict = validateStep(pre, post);
+        console.log(`[SP:V2] user:acted verdict=${verdict} domHashBefore=${pre?.domHash} domHashAfter=${post.domHash} urlBefore=${pre?.url} urlAfter=${post.url}`);
         await SessionStore.completeStep(tabId, {
           description: step.description,
           intent: plannerStep.intent,
           completionCondition: step.completionCondition,
           urlBefore: pre?.url ?? window.location.href,
+          domHashBefore: pre?.domHash ?? null,
+          // stored so dedup guard works post-completion
           urlAfter: post.url,
           completedAt: Date.now()
         });
+        await _shadowGoalVerify(tabId, "STEP_COMPLETED", isTerminalStep(plannerStep));
+        {
+          const s26 = await SessionStore.load(tabId);
+          const gate = GoalVerifier.shouldComplete(s26?.goalCompletionCriteria);
+          if (gate.complete) {
+            console.log("[SP:GoalCompletion]", {
+              source: "verifier",
+              satisfied: true,
+              signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+            });
+            applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict, source: "verifier" });
+            if (_taskContext) {
+              _taskContext.steps.push({ description: step.description });
+              _taskContext.currentStep = null;
+            }
+            await _showGoalCompleteCard(tabId, goal);
+            done("goal_complete");
+            return;
+          }
+        }
         if (isTerminalStep(plannerStep)) {
+          console.log("[SP:GoalCompletion]", { source: "planner", state: "final_step" });
           applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict });
           if (_taskContext) {
             _taskContext.steps.push({ description: step.description });
@@ -2050,6 +2467,25 @@ ${lines.join("\n")}`);
           }
           await _runPlanLoop(tabId, myGen);
         } else if (classification === NavClassification.REFRESH) {
+          const pendingStep = session.pendingStep;
+          if (pendingStep?.domHashBefore != null) {
+            const currentSnap = capturePageSnapshot("");
+            const domChanged = currentSnap.domHash !== pendingStep.domHashBefore;
+            console.log(`[SP:V2] REFRESH path: domHashBefore=${pendingStep.domHashBefore} domHashNow=${currentSnap.domHash} domChanged=${domChanged}`);
+            if (domChanged) {
+              console.log(`[SP:V2] REFRESH: DOM changed since step start \u2014 completing step and replanning`);
+              await SessionStore.completeStep(tabId, buildStepRecord(pendingStep));
+              if (_generation !== myGen) return;
+              applyEvent(TaskEvent.SESSION_RESUME);
+              if (isTerminalStep(pendingStep)) {
+                applyEvent(TaskEvent.PLAN_COMPLETE);
+                await _showGoalCompleteCard(tabId, session.goal);
+                return;
+              }
+              await _runPlanLoop(tabId, myGen);
+              return;
+            }
+          }
           applyEvent(TaskEvent.SESSION_RESUME);
           await _runPlanLoop(tabId, myGen);
         } else {

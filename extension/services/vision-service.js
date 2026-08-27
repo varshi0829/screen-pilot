@@ -6,7 +6,7 @@ import { ScreenContextService } from './screen-context.js';
 export const VisionService = (() => {
   'use strict';
 
-  const BACKEND_URL        = 'https://screen-pilot-j1az.vercel.app/api/analyze';
+  const DEFAULT_BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
   const MAX_ATTEMPTS       = 3;
 
@@ -96,6 +96,7 @@ export const VisionService = (() => {
     try {
       const sessionId = await getOrCreateSessionId();
       const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
+      const backendUrl = await resolveBackendUrl();
 
       const keyType = geminiApiKey ? 'user' : 'shared';
       if (geminiApiKey) { _m.userKey++; } else { _m.sharedKey++; }
@@ -114,7 +115,7 @@ export const VisionService = (() => {
       };
       if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
 
-      const res = await fetch(BACKEND_URL, {
+      const res = await fetch(backendUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -151,6 +152,12 @@ export const VisionService = (() => {
     const id = crypto.randomUUID();
     await chrome.storage.local.set({ sessionId: id });
     return id;
+  }
+
+  async function resolveBackendUrl() {
+    const stored = await chrome.storage.local.get('screenPilotBackendUrl');
+    const override = typeof stored.screenPilotBackendUrl === 'string' ? stored.screenPilotBackendUrl.trim() : '';
+    return override || DEFAULT_BACKEND_URL;
   }
 
   // ─── RESPONSE PARSERS ──────────────────────────────────────────────────────
@@ -319,7 +326,7 @@ export const VisionService = (() => {
     return { success: false, error, retryable };
   }
 
-  return { analyzeScreenshot, explainScreen, askQuestion };
+  return { analyzeScreenshot, explainScreen, askQuestion, __resolveBackendUrlForTests: resolveBackendUrl };
 })();
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -868,7 +868,7 @@ function highlightStepElement(step) {
 function makeFallbackHighlighter() {
   let _el = null;
   return {
-    async show(element, text) {
+    async show(element) {
       if (_el) { _el.style.outline = ''; }
       if (!element) return false;
       element.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1014,7 +1014,8 @@ function close() {
 }
 
 function toggle() {
-  S.visible ? close() : open();
+  if (S.visible) close();
+  else open();
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

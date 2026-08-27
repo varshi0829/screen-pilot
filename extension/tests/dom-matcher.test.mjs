@@ -59,6 +59,8 @@ function makeEl({
   isConnected  = true,
   id           = null,
   dataTestid   = null,
+  childImgAlt  = null,   // simulates <img alt="…"> inside the element
+  isSpNode     = false,  // simulates element inside a ScreenPilot overlay (#sp-* or screenpilot-*)
 } = {}) {
   const parent = {
     tagName:       parentTag,
@@ -89,6 +91,9 @@ function makeEl({
       return null;
     },
     closest: (sel) => {
+      // ScreenPilot self-match filter: return truthy when this element is marked as a
+      // ScreenPilot node AND the selector asks about sp-* / screenpilot-* membership.
+      if (isSpNode && (sel.includes('sp-') || sel.includes('screenpilot'))) return {};
       // Simulate detectRegion() walking closest(landmark-selectors)
       // detectRegion looks for: dialog, [aria-modal], menu/listbox roles, form, footer,
       // toolbar, main, aside, header, nav — in that priority order.
@@ -97,13 +102,17 @@ function makeEl({
       if (sel.includes('main')   && parentTag === 'MAIN')   return parent;
       if (sel.includes('nav')    && parentTag === 'NAV')    return parent;
       if (sel.includes('form')   && parentTag === 'FORM')   return parent;
-      // screenpilot overlay check
-      if (sel.includes('screenpilot')) return null;
       return null;
     },
     parentElement:         parent,
     getBoundingClientRect: () => ({ ...DEFAULT_RECT, ...rect }),
     checkVisibility:       () => visible,
+    querySelector: (sel) => {
+      if (sel === 'img[alt]' && childImgAlt !== null) {
+        return { getAttribute: (a) => a === 'alt' ? childImgAlt : null };
+      }
+      return null;
+    },
   };
 }
 
@@ -161,6 +170,39 @@ await test('aria-label: element with junk text but good aria-label is matched', 
   const r = DM.matchElement({ text: 'Close dialog', type: 'button' });
   assert.ok(r, 'should match via aria-label over symbol text');
   assert.ok(r.score >= 100);
+});
+
+await test('icon-only boost: aria-label button in correct region beats exact-text sidebar link', async () => {
+  // Regression for the GitHub avatar-vs-Profile-link mismatch (Phase 4.1 audit).
+  //
+  // Sidebar <a>Profile</a> in <nav left=0> → detectRegion='side_navigation':
+  //   text exact 110×1.0=110  |  type(<a>+menu)=+10  |  region mismatch=-8  →  112
+  //
+  // Avatar <button aria-label="View profile and more"> in <header> → top_navigation:
+  //   no text → ariaLabelWeight=1.6; contains match 70×1.6=112  |  type=+10  |  region match=+20  →  142
+  //
+  // Avatar must win; before the fix it scored 107 (weight=1.1) and lost.
+  const sidebarLink = makeEl({
+    text:       'Profile',
+    tag:        'A',
+    parentTag:  'NAV',
+    parentLeft: 0,       // left < 160 → detectRegion returns 'side_navigation'
+  });
+  const avatarButton = makeEl({
+    text:       '',
+    ariaLabel:  'View profile and more',
+    tag:        'BUTTON',
+    parentTag:  'HEADER', // → detectRegion returns 'top_navigation'
+  });
+
+  setElems(sidebarLink, avatarButton);
+  const r = DM.matchElement({ text: 'profile', type: 'menu', region: 'top_navigation' });
+
+  assert.ok(r, 'should resolve an element');
+  assert.equal(r.element, avatarButton,
+    `avatar button must win; got tagName=${r.element.tagName} innerText="${r.element.innerText}"`);
+  assert.ok(r.score >= 140,
+    `avatar score ${r.score} must be ≥ 140 (sidebar scores 112 in this shim; need clear margin)`);
 });
 
 // ── 4. Hidden element excluded ────────────────────────────────────────────────
@@ -432,6 +474,292 @@ await test('detectRegion: <nav> at left=0 is classified as side_navigation (know
     `mismatch penalty must reduce score: penalised=${rPenalised.score} < baseline=${rExpected.score}`);
   assert.equal(rExpected.score - rPenalised.score, 8,
     `score delta should be exactly 8 (the REGION_MISMATCH_PENALTY constant)`);
+});
+
+// ── 14. img-alt accessible name ───────────────────────────────────────────────
+
+await test('img-alt: icon-only button matched via child img alt', async () => {
+  // <button><img alt="User avatar"></button> — no aria-label, no visible text.
+  // The ARIA accessible name is computed from the child img per the ARIA spec.
+  // img-alt weight=1.4 (icon-only): 110 × 1.4 = 154 + type(+10) + region(+20) = 184.
+  const avatarBtn = makeEl({
+    text:        '',
+    ariaLabel:   null,
+    childImgAlt: 'User avatar',
+    tag:         'BUTTON',
+    parentTag:   'HEADER',
+  });
+  setElems(avatarBtn);
+  const r = DM.matchElement({ text: 'User avatar', type: 'button', region: 'top_navigation' });
+  assert.ok(r,                   'should match via img-alt');
+  assert.equal(r.element, avatarBtn, 'matched element must be the avatar button');
+  assert.ok(r.score >= 140,      `score ${r.score} should be ≥ 140`);
+});
+
+await test('img-alt: aria-label takes priority over img-alt when both match', async () => {
+  // When a button has both aria-label and child img alt, aria-label wins.
+  // aria-label weight=1.6 (icon-only): 110 × 1.6 = 176
+  // img-alt    weight=1.4 (icon-only): 110 × 1.4 = 154
+  // scoreElement() picks the highest weighted score — aria-label always wins.
+  const el = makeEl({
+    text:        '',
+    ariaLabel:   'User avatar',
+    childImgAlt: 'User avatar',
+    tag:         'BUTTON',
+    parentTag:   'HEADER',
+  });
+  setElems(el);
+  const r = DM.matchElement({ text: 'User avatar', type: 'button', region: 'top_navigation' });
+  assert.ok(r, 'should match');
+  // Score must reflect aria-label weight (1.6), not img-alt weight (1.4):
+  // 110 × 1.6 = 176 + type(+10) + region(+20) = 206 → capped at 200.
+  assert.equal(r.score, 200, `score ${r.score} should be 200 (aria-label wins, capped)`);
+});
+
+await test('img-alt: text-bearing button has img-alt weight suppressed to 0.7', async () => {
+  // When a button has both visible text and a decorative img, the text is the primary label.
+  // img-alt weight drops to 0.7 to prevent decorative alts from outscoring visible text.
+  // "save" text: 110 × 1.0 = 110  vs  "icon" img-alt: 110 × 0.7 = 77
+  const el = makeEl({
+    text:        'Save',
+    childImgAlt: 'icon',
+    tag:         'BUTTON',
+    parentTag:   'MAIN',
+  });
+  setElems(el);
+  // Target matches visible text "Save" — must win over img-alt "icon"
+  const rText = DM.matchElement({ text: 'Save', type: 'button' });
+  assert.ok(rText, 'should match via text');
+  assert.ok(rText.score >= 110, `text score ${rText.score} should be ≥ 110`);
+
+  // Target matches img-alt "icon" only — must score lower than a text match
+  const rImgAlt = DM.matchElement({ text: 'icon', type: 'button' });
+  assert.ok(rImgAlt, 'should also match via img-alt');
+  assert.ok(rImgAlt.score < rText.score,
+    `img-alt score ${rImgAlt.score} must be lower than text score ${rText.score}`);
+});
+
+await test('img-alt: absent img yields no contribution (no regression on existing elements)', async () => {
+  // Elements without a child img[alt] must behave identically to before the change.
+  // querySelector returns null → childImgAlt = '' → scoreAttributeValue returns null.
+  const el = makeEl({ text: 'Submit', ariaLabel: null, childImgAlt: null, tag: 'BUTTON' });
+  setElems(el);
+  const r = DM.matchElement({ text: 'Submit', type: 'button' });
+  assert.ok(r, 'should match via text');
+  // text exact match: 110 × 1.0 = 110 + type(+10) = 120 (no region hint)
+  assert.equal(r.score, 120, `score ${r.score} must be exactly 120 — same as pre-change`);
+});
+
+// ── 15. ScreenPilot self-match filter ────────────────────────────────────────
+
+await test('self-match guard: sp-v2-status-banner excluded from candidates', async () => {
+  // Regression for [SP:Exec] Candidate 1/1 score=90 <div id="sp-v2-status-banner">.
+  // The status banner enters via the [id] selector in getCandidateSelectors(), then
+  // slips through isScreenPilotNode() because the old filter only listed the 5
+  // screenpilot-* IDs and had no pattern for sp-v2-* elements.
+  const spBanner = makeEl({
+    text:     'ScreenPilot · Planning…',
+    tag:      'DIV',
+    id:       'sp-v2-status-banner',
+    isSpNode: true,
+  });
+  setElems(spBanner);
+  const r = DM.matchElement({ text: 'Planning', type: 'button' });
+  assert.equal(r, null, 'sp-v2-status-banner must be excluded — isScreenPilotNode must return true for [id^="sp-"]');
+});
+
+await test('self-match guard: sp-* element excluded even when it outscores a page element', async () => {
+  // Both elements have exact text "Create", but the sp-* one must be excluded regardless
+  // of score. The real page element must win.
+  const spBtn  = makeEl({ text: 'Create', tag: 'BUTTON', id: 'sp-v2-create-btn', isSpNode: true  });
+  const pageEl = makeEl({ text: 'Create', tag: 'BUTTON', id: null,               isSpNode: false });
+  setElems(spBtn, pageEl);
+  const r = DM.matchElement({ text: 'Create', type: 'button' });
+  assert.ok(r,                   'real page element must still match');
+  assert.equal(r.element, pageEl, 'winner must be the real page element, not the sp-* button');
+});
+
+await test('self-match guard: non-sp element with matching text is unaffected', async () => {
+  // Confirm the fix does not suppress legitimate page elements.
+  const el = makeEl({ text: 'Submit', tag: 'BUTTON', id: 'page-submit-btn', isSpNode: false });
+  setElems(el);
+  const r = DM.matchElement({ text: 'Submit', type: 'button' });
+  assert.ok(r, 'real page element must still match after the sp-* filter is applied');
+  assert.equal(r.element, el, 'page element must be returned');
+});
+
+// ── Phase 24A: pure-symbol target collapse ─────────────────────────────────────
+//
+// A pure-symbol target ("+", "#", ">", "*") must NOT reach the substring/Levenshtein
+// fallbacks — those made every "+"-bearing node (<main>, "C++", "+1,204") score 62 and
+// let DOM order pick <main>. Symbol targets may only match via exact/token/synonym.
+
+await test('symbol target "+": <main>, "C++", "+123" do NOT match (no substring collapse)', async () => {
+  setElems(
+    makeEl({ text: 'Star 12 Fork 3 C++ 98.7% +1,204 −56', tag: 'MAIN', id: 'js-repo-pjax-container', parentTag: 'MAIN' }),
+    makeEl({ text: 'C++',    tag: 'A',    parentTag: 'MAIN' }),
+    makeEl({ text: '+123',   tag: 'SPAN', id: 'diffstat', parentTag: 'MAIN' }),
+  );
+  const r = DM.matchElement({ text: '+', type: 'button', region: 'top_navigation' });
+  assert.equal(r, null, 'pure "+" must not substring-match "+"-bearing text → element_not_found');
+});
+
+await test('symbol target "+": still matches "Create new…" via the synonym path', async () => {
+  setElems(makeEl({ text: '', ariaLabel: 'Create new…', tag: 'BUTTON', parentTag: 'HEADER' }));
+  const r = DM.matchElement({ text: '+', type: 'button', region: 'top_navigation' });
+  assert.ok(r, 'the icon create button must still resolve');
+  assert.ok(r.score >= 100, `expected strong synonym score, got ${r.score}`);
+});
+
+await test('symbol target "+": create button wins and "+"-noise is not even a candidate', async () => {
+  const noise = makeEl({ text: 'C++ 98.7% +1,204', tag: 'MAIN', id: 'js-repo-pjax-container', parentTag: 'MAIN' });
+  const create = makeEl({ text: '', ariaLabel: 'Create new…', tag: 'BUTTON', parentTag: 'HEADER' });
+  setElems(noise, create);
+  const r = DM.matchElement({ text: '+', type: 'button', region: 'top_navigation' });
+  assert.equal(r.element, create, 'winner must be the create button');
+  assert.equal(r.candidates.length, 1, '"+"-bearing noise must be filtered out entirely');
+});
+
+await test('symbol target "#": does not substring-match a "#tag" node', async () => {
+  setElems(makeEl({ text: '#trending', tag: 'A', parentTag: 'MAIN' }));
+  const r = DM.matchElement({ text: '#', type: 'link', region: 'main_content' });
+  assert.equal(r, null, 'pure "#" must not substring-match "#trending"');
+});
+
+await test('alphanumeric target: contains fallback still works (no regression)', async () => {
+  setElems(makeEl({ text: 'Settings', tag: 'A', parentTag: 'NAV' }));
+  const r = DM.matchElement({ text: 'ettings', type: 'link', region: 'side_navigation' });
+  assert.ok(r, 'a real alphanumeric substring target must still contains-match');
+});
+
+// ── Phase 24B: type:"input" candidate-selector restriction ────────────────────
+//
+// The querySelectorAll mock (`() => _candidates`) ignores the selector string
+// entirely, so scoring-level tests can't exercise this fix — a label placed
+// into _candidates would be "found" by the stub regardless of the generated
+// selector. These tests capture the actual selector string passed to
+// querySelectorAll to verify getCandidateSelectors() itself, independent of
+// scoring (which was explicitly NOT touched by this fix).
+
+await test('type:"input": generated selector excludes [id]/[aria-label]/[data-testid]/select — labels and wrappers can never become candidates', async () => {
+  let capturedSelector = null;
+  const originalQSA = document.querySelectorAll;
+  document.querySelectorAll = (sel) => { capturedSelector = sel; return originalQSA(sel); };
+  try {
+    setElems(makeEl({ text: 'Repository name', tag: 'INPUT' }));
+    DM.matchElement({ text: 'Repository name', type: 'input', region: 'form' });
+  } finally {
+    document.querySelectorAll = originalQSA;
+  }
+  assert.equal(
+    capturedSelector,
+    'input,textarea,[contenteditable="true"],[role="textbox"]',
+    'type:"input" must query ONLY the editable-control selectors'
+  );
+  assert.ok(!capturedSelector.includes('[id]'),          'must not include [id] (this is what let the <label id="..."> in)');
+  assert.ok(!capturedSelector.includes('[aria-label]'),  'must not include [aria-label]');
+  assert.ok(!capturedSelector.includes('[data-testid]'), 'must not include [data-testid]');
+  assert.ok(!capturedSelector.includes('select'),         'must not include select');
+  assert.ok(!capturedSelector.includes('button'),         'must not include button');
+});
+
+await test('type:"button"/"link"/"menu": selector generation is unchanged (still preferred + common union)', async () => {
+  const cases = [
+    { type: 'button', text: 'Submit', tag: 'BUTTON' },
+    { type: 'link',    text: 'Home',   tag: 'A' },
+    { type: 'menu',    text: 'More',   tag: 'BUTTON' },
+  ];
+  for (const { type, text, tag } of cases) {
+    let capturedSelector = null;
+    const originalQSA = document.querySelectorAll;
+    document.querySelectorAll = (sel) => { capturedSelector = sel; return originalQSA(sel); };
+    try {
+      setElems(makeEl({ text, tag }));
+      DM.matchElement({ text, type });
+    } finally {
+      document.querySelectorAll = originalQSA;
+    }
+    assert.ok(capturedSelector.includes('[id]'),         `type:"${type}" must still include [id] (unchanged)`);
+    assert.ok(capturedSelector.includes('[aria-label]'), `type:"${type}" must still include [aria-label] (unchanged)`);
+    assert.ok(capturedSelector.includes('select'),        `type:"${type}" must still include select (unchanged)`);
+  }
+});
+
+await test('type:"input": a real <input> still matches normally (no regression)', async () => {
+  setElems(makeEl({ tag: 'INPUT', text: '', ariaLabel: 'Repository name' }));
+  const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+  assert.ok(r, 'real input must still match');
+  assert.ok(r.score >= 100, `expected a strong match, got ${r?.score}`);
+});
+
+// ── Associated-label scoring (Option B) ────────────────────────────────────────
+//
+// The label itself must NEVER be a candidate (Phase 24B guarantee, unaffected —
+// getCandidateSelectors('input') is untouched). These tests confirm the WINNING
+// element is always the <input>, using label text only as a scoring signal.
+
+await test('Case 1: <label for="repo"> resolves via element.labels — input matches, label never a candidate', async () => {
+  const input = makeEl({ tag: 'INPUT', id: 'repo', text: '', ariaLabel: null });
+  input.labels = [{ innerText: 'Repository name', textContent: 'Repository name' }];
+  setElems(input);
+  const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+  assert.ok(r, 'input must match via its associated label text');
+  assert.equal(r.element, input, 'winner must be the input, never a label');
+  assert.ok(r.score >= 100, `expected a strong (exact) match, got ${r?.score}`);
+  assert.ok(r.reason.includes('associated-label'), `reason should cite associated-label, got "${r.reason}"`);
+});
+
+await test('Case 2: wrapping <label>text<input></label> also resolves via element.labels', async () => {
+  // Implicit label association (no `for`/`id` needed) — element.labels covers this
+  // natively in a real browser; the mock here simulates that same resolved list.
+  const input = makeEl({ tag: 'INPUT', text: '', ariaLabel: null });
+  input.labels = [{ innerText: 'Repository name', textContent: 'Repository name' }];
+  setElems(input);
+  const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+  assert.ok(r, 'input must match via its wrapping label text');
+  assert.equal(r.element, input, 'winner must be the input, never a label');
+});
+
+await test('Case 3: aria-labelledby fallback resolves and concatenates referenced ids', async () => {
+  const originalGetById = document.getElementById;
+  document.getElementById = (id) => (id === 'label-id' ? { innerText: 'Repository name', textContent: 'Repository name' } : null);
+  try {
+    const input = makeEl({ tag: 'INPUT', text: '', ariaLabel: null });
+    const originalGetAttribute = input.getAttribute;
+    input.getAttribute = (attr) => (attr === 'aria-labelledby' ? 'label-id' : originalGetAttribute(attr));
+    setElems(input);
+    const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+    assert.ok(r, 'input must match via aria-labelledby resolution');
+    assert.equal(r.element, input, 'winner must be the input');
+  } finally {
+    document.getElementById = originalGetById;
+  }
+});
+
+await test('Case 4: input with no label association behaves unchanged (own aria-label still wins)', async () => {
+  // No .labels, no aria-labelledby — getAssociatedLabelText() must return '' (a no-op)
+  // and NOT interfere with the element's own attribute scoring.
+  setElems(makeEl({ tag: 'INPUT', text: '', ariaLabel: 'Repository name' }));
+  const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+  assert.ok(r, 'input must still match via its own aria-label, unaffected by the new signal');
+  assert.ok(r.score >= 100, `expected a strong match, got ${r?.score}`);
+});
+
+await test('defense-in-depth: input outranks a same-text label even in a mixed candidate pool', async () => {
+  // Actual candidate-pool EXCLUSION of labels is a selector-generation guarantee
+  // (Phase 24B, getCandidateSelectors('input')) — this mock's querySelectorAll
+  // ignores the selector string entirely (see the Phase 24B selector-capture
+  // tests above), so it cannot re-prove that exclusion here. What this DOES
+  // prove: even in the worst case where a label ends up scored alongside the
+  // input, the input's new associated-label signal (weight 1.1) plus its
+  // type-affinity bonus now outrank the label's raw exact-text match (weight 1,
+  // no type bonus) — a genuine second line of defense beyond selector exclusion.
+  const label = makeEl({ tag: 'LABEL', id: 'repository-name-input-label', text: 'Repository name' });
+  const input = makeEl({ tag: 'INPUT', id: 'repo' });
+  input.labels = [{ innerText: 'Repository name', textContent: 'Repository name' }];
+  setElems(label, input);
+  const r = DM.matchElement({ text: 'Repository name', type: 'input' });
+  assert.equal(r.element, input, 'winner must be the input, outranking the label even when both are scored');
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

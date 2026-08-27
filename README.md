@@ -2,7 +2,7 @@
 
 A Chrome extension that guides users through any web software step by step. Click the icon on any tab, type what you want to do, and ScreenPilot captures the page, sends it to Gemini 2.5 Flash, and puts a pulsing highlight on exactly what to click next.
 
-No API key required. No per-site configuration. No hardcoded workflows.
+Requires a Gemini API key for backend requests. No per-site configuration. No hardcoded workflows.
 
 ---
 
@@ -69,12 +69,18 @@ Point the extension at your local backend while developing:
 
 In `extension/services/vision-service.js`, change:
 ```js
-const BACKEND_URL = 'https://screen-pilot.vercel.app/api/analyze';
+const BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
 // → 
 const BACKEND_URL = 'http://localhost:3000/api/analyze';
 ```
 
 Then load the `extension/` folder via `chrome://extensions/ → Load unpacked`.
+
+You can also change the backend URL from the extension popup:
+
+1. Open ScreenPilot
+2. Go to `Settings`
+3. Set `Backend URL` to your local or deployed endpoint
 
 ---
 
@@ -104,7 +110,7 @@ There are no `if (url.includes('gmail'))` branches. No per-site element selector
 
 - Receives `{ screenshot, goal, pageContext, taskState }` from the extension
 - Builds the Gemini prompt server-side (never exposes the API key)
-- Rate-limits to 12 requests per minute per session UUID
+- Rate-limits requests per session UUID; the analyzer route currently uses a higher dev limit than the public launch target
 - Returns Gemini's raw response; parsing stays in the extension
 
 ### Content script (`extension/content.js`)

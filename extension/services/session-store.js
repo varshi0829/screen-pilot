@@ -42,14 +42,22 @@ function nowMs() {
   return Date.now();
 }
 
+function getStorageArea() {
+  return chrome.storage?.local ?? chrome.storage?.session ?? null;
+}
+
 async function _read(tabId) {
   const key    = sessionKey(tabId);
-  const result = await chrome.storage.local.get(key);
+  const storage = getStorageArea();
+  if (!storage) throw new Error('chrome.storage.local/session is unavailable');
+  const result = await storage.get(key);
   return result[key] ?? null;
 }
 
 async function _write(tabId, session) {
-  await chrome.storage.local.set({ [sessionKey(tabId)]: session });
+  const storage = getStorageArea();
+  if (!storage) throw new Error('chrome.storage.local/session is unavailable');
+  await storage.set({ [sessionKey(tabId)]: session });
 }
 
 export const SessionStore = {
@@ -80,6 +88,11 @@ export const SessionStore = {
       lastProgressAt:            t,
       pendingStep:               null,
       clarifications:            [],
+      // Phase 23A: plan-level goal-completion contract, persisted so it survives
+      // navigation / reload / bootstrap resume. Additive and optional — set later
+      // via patchSession when a plan carrying it is accepted. NOT a schema bump, so
+      // existing sessions (which lack this field) still load unchanged.
+      goalCompletionCriteria:    null,
       phase:                     'PLANNING',
       createdAt:                 t,
       updatedAt:                 t,
@@ -101,12 +114,12 @@ export const SessionStore = {
     if (!session) return null;
 
     if (session.schemaVersion !== SCHEMA_VERSION) {
-      chrome.storage.local.remove(sessionKey(tabId));
+      await getStorageArea()?.remove(sessionKey(tabId));
       return null;
     }
 
     if (nowMs() > session.expiresAt) {
-      chrome.storage.local.remove(sessionKey(tabId));
+      await getStorageArea()?.remove(sessionKey(tabId));
       return null;
     }
 
@@ -120,7 +133,7 @@ export const SessionStore = {
    * @returns {Promise<void>}
    */
   async clear(tabId) {
-    await chrome.storage.local.remove(sessionKey(tabId));
+    await getStorageArea()?.remove(sessionKey(tabId));
   },
 
   /**
@@ -130,12 +143,14 @@ export const SessionStore = {
    * @returns {Promise<number>} count of sessions removed
    */
   async cleanupExpired() {
-    const all  = await chrome.storage.local.get(null);
+    const storage = getStorageArea();
+    if (!storage) return 0;
+    const all  = await storage.get(null);
     const now  = nowMs();
     const keys = Object.keys(all).filter(
       k => k.startsWith(KEY_PREFIX) && now > (all[k]?.expiresAt ?? 0)
     );
-    if (keys.length) await chrome.storage.local.remove(keys);
+    if (keys.length) await storage.remove(keys);
     return keys.length;
   },
 

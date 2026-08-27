@@ -369,6 +369,106 @@ await test('click on an off-target element does not advance the step', async () 
   ex.abort();
 });
 
+// ── 5b. fill_form auto-advance (Phase 20) ─────────────────────────────────────
+//
+// Fill steps (phase==='fill_form' or completionCondition==='input_filled') advance
+// on meaningful text input — no click, blur, Enter, or navigation required.
+
+const fillStep = (over = {}) => makeStep({
+  phase:               'fill_form',
+  completionCondition: 'input_filled',
+  targetElement:       { text: 'Repository name', type: 'input_field', intent: "enter 'test'", alternatives: [] },
+  ...over,
+});
+const textField = (value, type = 'text') => ({
+  tagName: 'INPUT', isContentEditable: false, value,
+  getAttribute: (a) => (a === 'type' ? type : null),
+});
+const silent = (ex) => Promise.race([
+  nextEvent(ex, 'user:acted').then(() => 'fired'),
+  new Promise(r => setTimeout(() => r('silent'), 100)),
+]);
+
+await test('fill_form: non-empty text input emits user:acted with trigger=input', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('input', { target: textField('test') });
+  const payload = await acted;
+
+  assert.equal(payload.trigger, 'input');
+  assert.equal(payload.step.id, 1);
+  ex.abort();
+});
+
+await test('fill_form: change event on a text field also advances', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep({ phase: 'fill_form', completionCondition: 'dom_change' })])); // only phase marks it
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('change', { target: textField('my-repo') });
+  assert.equal((await acted).trigger, 'input');
+  ex.abort();
+});
+
+await test('fill_form: empty / whitespace value does NOT advance', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  mockDocument.dispatch('input', { target: textField('   ') });
+  assert.equal(await silent(ex), 'silent', 'whitespace-only input must not advance');
+  ex.abort();
+});
+
+await test('fill_form: click into the field does NOT advance (typing required)', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  mockDocument.dispatch('click', { target: { closest: () => null } });
+  assert.equal(await silent(ex), 'silent', 'focus-click on a fill field must not advance');
+  ex.abort();
+});
+
+await test('fill_form: contenteditable with text advances', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('input', { target: { tagName: 'DIV', isContentEditable: true, textContent: 'hello', getAttribute: () => null } });
+  assert.equal((await acted).trigger, 'input');
+  ex.abort();
+});
+
+await test('fill_form SAFETY: checkbox / select do NOT auto-advance', async () => {
+  for (const field of [
+    { tagName: 'INPUT',  isContentEditable: false, value: 'on',  getAttribute: (a) => (a === 'type' ? 'checkbox' : null) },
+    { tagName: 'SELECT', isContentEditable: false, value: 'opt', getAttribute: () => null },
+  ]) {
+    const ex = makeExecutor();
+    ex.start(makePlan([fillStep()]));
+    await nextEvent(ex, 'element:ready');
+    mockDocument.dispatch('change', { target: field });
+    assert.equal(await silent(ex), 'silent', `${field.tagName} must not auto-advance`);
+    ex.abort();
+  }
+});
+
+await test('non-fill step: input event does NOT advance (watcher not registered)', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([makeStep()])); // phase 'submit', completionCondition 'dom_change'
+  await nextEvent(ex, 'element:ready');
+
+  mockDocument.dispatch('input', { target: textField('typed') });
+  assert.equal(await silent(ex), 'silent', 'non-fill steps ignore input events');
+  ex.abort();
+});
+
 // ── Direction-aware popstate guard (v3 steps with expectedOutcome) ────────────
 //
 // For v3 steps that declare expectedOutcome.urlPattern, popstate/hashchange
@@ -610,13 +710,19 @@ await test('handler error does not prevent other handlers from running', async (
 
 // ── 9. Alternative resolution ─────────────────────────────────────────────────
 
-await test('falls back to first alternative when primary score is below threshold', async () => {
+await test('evaluates ALL alternatives and keeps the highest-scoring match', async () => {
+  // Regression for the Phase 17 "+" misranking: the old loop returned the FIRST
+  // alternative to clear RECOVERY, so an early weak-but-valid alternative ('Send',
+  // 55) would win over a later, stronger one ('Go', 70). The best must now win.
+  const SEND_EL = { getAttribute: () => 'Send', innerText: 'Send', closest: () => null, contains: () => true };
+  const GO_EL   = { getAttribute: () => 'Go',   innerText: 'Go',   closest: () => null, contains: () => true };
   let callCount = 0;
   const domMatcher = {
     matchElement: (desc) => {
       callCount++;
       if (desc.text === 'Submit') return { element: MOCK_ELEMENT, score: 30 }; // below PRIMARY=60
-      if (desc.text === 'Send')   return { element: MOCK_ELEMENT, score: 55 }; // above RECOVERY=50
+      if (desc.text === 'Send')   return { element: SEND_EL, score: 55 };       // above RECOVERY, but weaker
+      if (desc.text === 'Go')     return { element: GO_EL,   score: 70 };       // strongest alternative
       return null;
     },
   };
@@ -624,8 +730,9 @@ await test('falls back to first alternative when primary score is below threshol
   const step = makeStep({ targetElement: { text: 'Submit', type: 'button', intent: 'submit', alternatives: ['Send', 'Go'] } });
 
   ex.start(makePlan([step]));
-  await nextEvent(ex, 'element:ready');
-  assert.equal(callCount, 2, 'should try primary then first passing alternative');
+  const payload = await nextEvent(ex, 'element:ready');
+  assert.equal(callCount, 3, 'should evaluate primary + both alternatives (no first-past-the-post short-circuit)');
+  assert.equal(payload.element, GO_EL, 'should resolve the highest-scoring alternative, not the first passing one');
 });
 
 await test('emits element:not_found when all alternatives also fail', async () => {
@@ -782,16 +889,23 @@ await test('confidence: undefined (missing field) passes via ?? 1 backward-compa
   await nextEvent(ex, 'element:ready');
 });
 
-await test('confidence: 0.39 (below 0.40) rejected; element:not_found when no alternatives', async () => {
-  const ex      = makeExecutor({ confidence: 0.39 }); // score=85 passes PRIMARY; confidence fails gate
-  const promise = nextEvent(ex, 'element:not_found');
-  ex.start(makePlan([makeStep()])); // makeStep alternatives=[]
+await test('confidence: 0.39 (below 0.40) — primary is still returned when score >= PRIMARY', async () => {
+  // Confidence is a normalised view of the same score (score / CONFIDENCE_DIVISOR).
+  // Since P0-3, the confidence gate was removed from _resolveElement.  When score
+  // passes PRIMARY (≥60) the element is returned regardless of the confidence value.
+  // The old behaviour of rejecting at confidence=0.39 was counterproductive — it would
+  // discard a correct match (score=85) in favour of a 50-scoring alternative.
+  const ex      = makeExecutor({ confidence: 0.39 }); // score=85, confidence 0.39 but score passes
+  const promise = nextEvent(ex, 'element:ready');      // should succeed now
+  ex.start(makePlan([makeStep()]));
   const payload = await promise;
-  assert.equal(ex.getStatus(), 'idle');
-  assert.ok(payload.reason.includes('Submit'), `reason should name the target, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'awaiting');
+  assert.ok(payload.step, 'element:ready carries the step');
 });
 
-await test('confidence: alternatives path uses score only (no confidence gate on RECOVERY)', async () => {
+await test('confidence: alternatives path uses score only — primary at score=85 succeeds directly', async () => {
+  // With the confidence gate removed, the primary (score=85, confidence=0.39) is
+  // returned immediately without trying alternatives.  callCount must be 1.
   let callCount = 0;
   const domMatcher = {
     matchElement: (desc) => {
@@ -807,8 +921,8 @@ await test('confidence: alternatives path uses score only (no confidence gate on
   const step = makeStep({ targetElement: { text: 'Submit', type: 'button', intent: 'submit', alternatives: ['Send'] } });
 
   ex.start(makePlan([step]));
-  await nextEvent(ex, 'element:ready'); // alternative was accepted
-  assert.equal(callCount, 2, 'primary tried then one alternative');
+  await nextEvent(ex, 'element:ready'); // primary accepted directly
+  assert.equal(callCount, 1, 'primary accepted on first matchElement call — no alternative tried');
 });
 
 // ── 13. Ranked-candidate fallback (BUG-003) ──────────────────────────────────

@@ -10,6 +10,18 @@ const _store = {};
 
 global.chrome = {
   storage: {
+    local: {
+      async get(key) {
+        if (typeof key === 'string') return { [key]: _store[key] };
+        if (Array.isArray(key))     return Object.fromEntries(key.map(k => [k, _store[k]]));
+        return { ..._store };
+      },
+      async set(obj)    { Object.assign(_store, obj); },
+      async remove(key) {
+        const keys = Array.isArray(key) ? key : [key];
+        for (const k of keys) delete _store[k];
+      },
+    },
     session: {
       async get(key) {
         if (typeof key === 'string') return { [key]: _store[key] };
@@ -65,7 +77,6 @@ global.window = {
 
 const {
   _bootstrapSession,
-  __getState,
   __resetState,
   __setTabId,
   __handleClarification,

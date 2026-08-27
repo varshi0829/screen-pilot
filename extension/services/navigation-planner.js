@@ -179,9 +179,8 @@ export const NavigationPlanner = (() => {
    * Determine if goal is achievable from current state.
    * @returns { currentState, targetState, gap, navigationNeeded }
    */
-  function analyzeGoalGap(goal, currentState, targetContext = {}) {
+  function analyzeGoalGap(goal, currentState) {
     const goalNormalized = normalizeGoal(goal);
-    const currentActivity = (currentState.currentActivity || '').toLowerCase();
 
     // Check if goal is directly achievable
     const isDirectlyAchievable = checkDirectAchievement(goalNormalized, currentState);

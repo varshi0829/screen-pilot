@@ -1,6 +1,8 @@
 // ScreenPilot - Popup Script
 
 document.addEventListener('DOMContentLoaded', () => {
+  const DEFAULT_BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
+
   // ── Tab switching ─────────────────────────────────────────────────────────────
   document.querySelectorAll('.sp-tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -115,7 +117,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Settings tab ──────────────────────────────────────────────────────────────
   async function loadSettings() {
-    const { openRouterApiKey } = await chrome.storage.local.get('openRouterApiKey');
+    const { openRouterApiKey, screenPilotBackendUrl } = await chrome.storage.local.get(['openRouterApiKey', 'screenPilotBackendUrl']);
     const statusEl = document.getElementById('key-status');
     const inputEl  = document.getElementById('openrouter-key-input');
     if (openRouterApiKey) {
@@ -126,6 +128,19 @@ document.addEventListener('DOMContentLoaded', () => {
       inputEl.placeholder = 'sk-or-...';
       statusEl.textContent = 'No key set — using shared quota (may hit limits)';
       statusEl.className = 'sp-key-status';
+    }
+
+    const backendInput = document.getElementById('backend-url-input');
+    const backendStatus = document.getElementById('backend-status');
+    if (screenPilotBackendUrl) {
+      backendInput.value = screenPilotBackendUrl;
+      backendStatus.textContent = 'Using configured backend URL';
+      backendStatus.className = 'sp-key-status saved';
+    } else {
+      backendInput.value = '';
+      backendInput.placeholder = DEFAULT_BACKEND_URL;
+      backendStatus.textContent = 'Using the deployed backend URL by default';
+      backendStatus.className = 'sp-key-status';
     }
   }
 
@@ -152,6 +167,39 @@ document.addEventListener('DOMContentLoaded', () => {
     inputEl.value = '';
     inputEl.placeholder = 'sk-or-...';
     statusEl.textContent = 'Key cleared — using shared quota';
+    statusEl.className = 'sp-key-status';
+  });
+
+  document.getElementById('save-backend-btn').addEventListener('click', async () => {
+    const inputEl = document.getElementById('backend-url-input');
+    const statusEl = document.getElementById('backend-status');
+    const value = inputEl.value.trim();
+    if (!value) {
+      await chrome.storage.local.remove('screenPilotBackendUrl');
+      inputEl.placeholder = DEFAULT_BACKEND_URL;
+      statusEl.textContent = 'Backend URL cleared — using deployed default';
+      statusEl.className = 'sp-key-status';
+      return;
+    }
+    try {
+      const url = new URL(value);
+      if (!/^https?:$/.test(url.protocol)) throw new Error('Backend URL must use http or https');
+      await chrome.storage.local.set({ screenPilotBackendUrl: url.toString().replace(/\/$/, '') });
+      statusEl.textContent = 'Backend URL saved';
+      statusEl.className = 'sp-key-status saved';
+    } catch {
+      statusEl.textContent = 'Enter a valid http(s) URL';
+      statusEl.className = 'sp-key-status error';
+    }
+  });
+
+  document.getElementById('clear-backend-btn').addEventListener('click', async () => {
+    await chrome.storage.local.remove('screenPilotBackendUrl');
+    const inputEl = document.getElementById('backend-url-input');
+    const statusEl = document.getElementById('backend-status');
+    inputEl.value = '';
+    inputEl.placeholder = DEFAULT_BACKEND_URL;
+    statusEl.textContent = 'Backend URL cleared — using deployed default';
     statusEl.className = 'sp-key-status';
   });
 });

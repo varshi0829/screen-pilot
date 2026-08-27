@@ -334,7 +334,6 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
 // ─── MEMORY: SYNTHETIC RESPONSE ──────────────────────────────────────────────
 
 async function _buildMemoryResponse(workflow, confidence, message, sender) {
-  const taskId    = StateManager.getState()?.taskId;
   const firstStep = workflow.steps[0];
   if (!firstStep) return analyzeGoal({ ...message, _skipMemory: true }, sender);
 
@@ -596,7 +595,7 @@ async function startV2Task(message, sender) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'START_V2_TASK' });
     return { success: true };
-  } catch (err) {
+  } catch {
     return { success: false, error: 'Content script not reachable. Please reload the page.' };
   }
 }

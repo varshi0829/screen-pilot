@@ -8,6 +8,7 @@ import { VercelBackendAdapter }                   from './providers/vercel-backe
 import { capturePageSnapshot }                    from './lib/page-snapshot.js';
 import { TaskState, TaskEvent, transition }       from './shared/state-machine/transitions.js';
 import { SessionStore }                           from './services/session-store.js';
+import { GoalVerifier }                           from './services/goal-verifier.js';
 import { classifyNavigation, NavClassification }  from './services/navigation-classifier.js';
 
 let _state = TaskState.IDLE;
@@ -38,15 +39,26 @@ const MAX_CLARIFICATIONS = 5;
 const RETRYABLE_PLAN_ERRORS = new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
 const MAX_PLAN_RETRIES = 2; // attempt 1 immediate, then retries at 1s and 2s
 const STATUS_ID = "sp-v2-status-banner";
+
+function getStorageArea() {
+  return chrome.storage?.local ?? chrome.storage?.session ?? null;
+}
+
 function showStatus(text, type = "info") {
   let el = document.getElementById(STATUS_ID);
   if (!el) {
     el = document.createElement("div");
     el.id = STATUS_ID;
+    // Bottom-right, matching the task panel / completion card (Phase 19). The banner
+    // used to sit top-left, where it visually obstructed highlighted targets and
+    // tooltips during AWAITING_USER (the element:ready fallback keeps it on screen
+    // for the whole step after a navigation resets _taskContext). Highlighted
+    // elements are scrolled to viewport center, so the bottom-right corner never
+    // covers the target, its tooltip, or the click area. (Phase 25)
     el.style.cssText = [
       "position:fixed",
-      "top:16px",
-      "left:16px",
+      "bottom:16px",
+      "right:16px",
       "z-index:2147483647",
       "padding:10px 18px",
       "border-radius:10px",
@@ -80,9 +92,12 @@ function showTaskPanel(ctx) {
   document.getElementById(STATUS_ID)?.remove();
   const el = document.createElement("div");
   el.id = STATUS_ID;
+  // Bottom-right so the progress panel never covers the element being instructed.
+  // GitHub's create menu / avatar / notifications live in the top-right; a top-right
+  // panel overlapped exactly the controls we point at (Phase 19, Issue 1).
   el.style.cssText = [
     "position:fixed",
-    "top:16px",
+    "bottom:16px",
     "right:16px",
     "z-index:2147483647",
     "width:272px",
@@ -118,13 +133,60 @@ function showTaskPanel(ctx) {
     `<div style="padding:3px 12px 7px;font-size:10px;color:#333">${progress}</div>`;
   document.body.appendChild(el);
 }
+const CONFETTI_ID = "sp-v2-confetti";
+// Self-contained canvas confetti — no external assets (CSP-safe for content scripts).
+// Fires a single burst that fades and removes its own canvas well before the
+// completion card auto-dismisses.
+function launchConfetti() {
+  document.getElementById(CONFETTI_ID)?.remove();
+  const canvas = document.createElement("canvas");
+  canvas.id = CONFETTI_ID;
+  canvas.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646";
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) { canvas.remove(); return; }
+  const colors = ["#cc2222", "#3a7d44", "#f0c000", "#ffffff", "#e07a2a"];
+  const parts = Array.from({ length: 140 }, () => ({
+    x: Math.random() * canvas.width,
+    y: -20 - Math.random() * canvas.height * 0.3,
+    r: 4 + Math.random() * 5,
+    c: colors[(Math.random() * colors.length) | 0],
+    vx: -2 + Math.random() * 4,
+    vy: 2 + Math.random() * 4,
+    rot: Math.random() * Math.PI,
+    vr: -0.2 + Math.random() * 0.4
+  }));
+  const start = performance.now();
+  const DURATION = 3500;
+  function frame(now) {
+    if (!canvas.isConnected) return;
+    const elapsed = now - start;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const p of parts) {
+      p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.rot += p.vr;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.globalAlpha = Math.max(0, 1 - elapsed / DURATION);
+      ctx.fillStyle = p.c;
+      ctx.fillRect(-p.r / 2, -p.r / 2, p.r, p.r * 0.6);
+      ctx.restore();
+    }
+    if (elapsed < DURATION) requestAnimationFrame(frame);
+    else canvas.remove();
+  }
+  requestAnimationFrame(frame);
+}
 function showCompletionCard(data) {
   hideStatus();
   const card = document.createElement("div");
   card.id = STATUS_ID;
+  // Bottom-right (matches the progress panel) so completion never covers page controls.
   card.style.cssText = [
     "position:fixed",
-    "top:16px",
+    "bottom:16px",
     "right:16px",
     "z-index:2147483647",
     "width:272px",
@@ -135,31 +197,19 @@ function showCompletionCard(data) {
     "border:1px solid rgba(255,255,255,0.08)",
     "overflow:hidden"
   ].join(";");
-  const elapsed = data.startedAt ? Math.round((Date.now() - data.startedAt) / 1000) : null;
-  const timeText = elapsed != null
-    ? (elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`)
-    : "";
   card.innerHTML =
-    `<div style="padding:12px 14px 10px;border-bottom:1px solid rgba(255,255,255,0.05);text-align:center">` +
-    `<div style="font-size:18px;color:#3a7d44;margin-bottom:3px">✓</div>` +
-    `<div style="font-size:11px;font-weight:700;color:#3a7d44;letter-spacing:0.08em;text-transform:uppercase">Task Completed</div>` +
+    `<div style="padding:14px 16px 8px;text-align:center">` +
+    `<div style="font-size:22px;margin-bottom:4px">🎉</div>` +
+    `<div style="font-size:12px;font-weight:700;color:#3a7d44;letter-spacing:0.08em;text-transform:uppercase">Task Complete</div>` +
     `</div>` +
-    `<div style="padding:10px 14px 8px">` +
-    `<div style="font-size:11px;color:#999;line-height:1.4">${data.goal || "Goal completed"}</div>` +
-    `<div style="display:flex;gap:12px;margin-top:6px">` +
-    `<span style="font-size:10px;color:#555">Steps: <span style="color:#777">${data.steps}</span></span>` +
-    (timeText ? `<span style="font-size:10px;color:#555">Time: <span style="color:#777">${timeText}</span></span>` : "") +
-    `</div></div>` +
-    `<div style="padding:0 14px 12px">` +
-    `<button id="sp-v2-newtask-btn" style="width:100%;padding:7px;background:#cc2222;color:#fff;` +
-    `border:none;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0.03em">` +
-    `Start New Task</button></div>`;
+    `<div style="padding:0 16px 16px">` +
+    `<div style="font-size:11px;color:#777;margin-bottom:3px">Successfully completed:</div>` +
+    `<div style="font-size:12px;color:#f0f0f0;line-height:1.4">${data.goal || "Goal completed"}</div>` +
+    `</div>`;
   document.body.appendChild(card);
-  document.getElementById("sp-v2-newtask-btn").addEventListener("click", () => {
-    hideStatus();
-    openV2Overlay();
-  });
-  setTimeout(hideStatus, 10000);
+  launchConfetti();
+  // Auto-dismiss after 4 seconds. Session clearing is handled by the caller.
+  setTimeout(hideStatus, 4000);
 }
 const PAUSED_ID = "sp-v2-paused-banner";
 function showPausedBanner(session) {
@@ -353,6 +403,10 @@ function collectPageControls() {
 }
 
 function buildPendingStepContext(step) {
+  // Capture domHashBefore so the bootstrap REFRESH path can detect whether the
+  // action already produced a DOM change (menu opened, modal appeared, etc.)
+  // even when the URL stayed the same.
+  const snap = capturePageSnapshot('');
   return {
     description: step.description,
     intent: step.intent,
@@ -360,6 +414,7 @@ function buildPendingStepContext(step) {
     expectedUrlPattern: step.expectedPageState?.urlPattern ?? null,
     expectedUrlChanges: step.expectedPageState?.urlChanges ?? false,
     urlBefore: window.location.href,
+    domHashBefore: snap.domHash,
     stepStartedAt: Date.now()
   };
 }
@@ -369,6 +424,7 @@ function buildStepRecord(pendingStep) {
     intent: pendingStep.intent,
     completionCondition: pendingStep.completionCondition,
     urlBefore: pendingStep.urlBefore,
+    domHashBefore: pendingStep.domHashBefore ?? null,  // carry through for dedup guard
     urlAfter: window.location.href,
     completedAt: Date.now()
   };
@@ -414,7 +470,8 @@ async function _showGoalCompleteCard(tabId, goal) {
   await SessionStore.clear(tabId);
 }
 async function _runPlanLoop(tabId, myGen) {
-  const { openRouterApiKey } = await chrome.storage.local.get('openRouterApiKey');
+  const storage = getStorageArea();
+  const { openRouterApiKey } = storage ? await storage.get('openRouterApiKey') : { openRouterApiKey: undefined };
   const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? undefined });
   // B5: consecutive retryable-failure counter, reset on every successful planner response.
   let planRetryCount = 0;
@@ -430,6 +487,37 @@ async function _runPlanLoop(tabId, myGen) {
       return;
     }
     if (_generation !== myGen) return;
+    // Diagnostic: log full session state at each plan loop entry
+    try {
+      const lastStep = session.completedSteps[session.completedSteps.length - 1];
+      const currentSnap = capturePageSnapshot('');
+      console.log(`[SP:V2:DIAG] Plan loop entry — completedSteps=${session.completedSteps.length} stepAttemptCount=${session.stepAttemptCount} phase=${session.phase}`, {
+        pendingStep:       session.pendingStep ? { intent: session.pendingStep.intent, domHashBefore: session.pendingStep.domHashBefore } : null,
+        lastCompletedStep: lastStep ? { intent: lastStep.intent, domHashBefore: lastStep.domHashBefore, urlBefore: lastStep.urlBefore } : null,
+        currentUrl:        currentSnap.url,
+        currentDomHash:    currentSnap.domHash,
+      });
+    } catch { /* non-browser environment — skip diagnostic snapshot */ }
+    // Phase 26 — verifier-driven completion. If the goal's persisted completion
+    // contract is already satisfied on the current page (requiresEffect goals only,
+    // gated by GoalVerifier.shouldComplete), finish NOW — no planner round-trip.
+    // This is the "I already finished the task, why is ScreenPilot still running?"
+    // fix: after the terminal action navigates, the next plan-loop entry sees the
+    // post-effect page and completes immediately. Legacy planner completion
+    // (state="complete") below remains the fallback for everything else.
+    {
+      const gate = GoalVerifier.shouldComplete(session.goalCompletionCriteria);
+      if (gate.complete) {
+        console.log("[SP:GoalCompletion]", {
+          source: "verifier",
+          satisfied: true,
+          signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+        });
+        applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
+        await _showGoalCompleteCard(tabId, session.goal);
+        return;
+      }
+    }
     const { isStuck: budgetExhausted, reason: budgetReason } = await SessionStore.incrementPlannerAttemptOnly(tabId);
     if (budgetExhausted) {
       applyEvent(TaskEvent.PLAN_FAILED, { reason: budgetReason });
@@ -494,8 +582,47 @@ async function _runPlanLoop(tabId, myGen) {
     }
     if (_generation !== myGen) return;
     console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${planResp.plannerSummary ?? ""}"`);
+    // Diagnostic: log full planner response step details
+    if (planResp.plan?.steps?.length) {
+      const s0 = planResp.plan.steps[0];
+      console.log(`[SP:V2:DIAG] Planner step[0]:`, {
+        intent:         s0.intent,
+        description:    s0.description,
+        targetText:     s0.targetElement?.text,
+        completionCondition: s0.completionCondition,
+        urlChanges:     s0.expectedPageState?.urlChanges,
+        urlPattern:     s0.expectedPageState?.urlPattern,
+      });
+    }
     const outcome = resolveOutcome(planResp);
     if (outcome === "goal_reached") {
+      // Phase 27 — do NOT trust the planner's self-reported completion unconditionally
+      // when an action-goal contract exists — verify it against the live page first.
+      // Navigation-only goals (no criteria, or requiresEffect !== true) are UNCHANGED:
+      // they still complete immediately on state="complete", exactly as before.
+      const criteria = freshSession.goalCompletionCriteria;
+      if (criteria?.requiresEffect === true) {
+        const gate = GoalVerifier.shouldComplete(criteria);
+        // Diagnostic only — logs the gate's inputs/outputs before the accept/reject
+        // decision below is made. No control flow depends on this log.
+        console.log("[SP:GoalCompletionGate]", {
+          requiresEffect:  criteria.requiresEffect,
+          verifierComplete: gate.complete,
+          verifierReason:   gate.reason
+        });
+        if (!gate.complete) {
+          console.log("[SP:GoalCompletion]", {
+            source: "planner", state: "complete", accepted: false, reason: gate.reason
+          });
+          // Reject the claim and loop back for another planning pass. The existing
+          // planner-attempt budget check (top of this same loop, above) already
+          // bounds total retries for the whole task — no new counter is introduced.
+          continue;
+        }
+      }
+      // Phase 26: legacy completion path — unchanged behavior, now logged for parity
+      // with the verifier path so completion source is always attributable.
+      console.log("[SP:GoalCompletion]", { source: "planner", state: "complete" });
       applyEvent(TaskEvent.PLAN_COMPLETE);
       showCompletionCard({
         goal: freshSession.goal,
@@ -518,12 +645,12 @@ async function _runPlanLoop(tabId, myGen) {
     }
     if (outcome === "ambiguous") {
       const { isStuck, reason } = await SessionStore.incrementAmbiguousAttempt(tabId);
-      if (isStuck) {
-        applyEvent(TaskEvent.PLAN_FAILED, { reason: "ambiguous_limit_reached" });
-        showStatus("ScreenPilot: Cannot determine next step — goal is too ambiguous", "error");
-        await SessionStore.clear(tabId);
-        return;
-      }
+    if (isStuck) {
+      applyEvent(TaskEvent.PLAN_FAILED, { reason: "ambiguous_limit_reached" });
+      showStatus(reason ? `ScreenPilot: Cannot determine next step — ${reason}` : "ScreenPilot: Cannot determine next step — goal is too ambiguous", "error");
+      await SessionStore.clear(tabId);
+      return;
+    }
       await SessionStore.patchSession(tabId, {
         pauseReason: "ambiguous",
         ambiguitySummary: planResp.plannerSummary ?? "Multiple valid paths exist for this goal"
@@ -567,12 +694,106 @@ async function _runPlanLoop(tabId, myGen) {
       continue;
     }
     applyEvent(TaskEvent.PLAN_RECEIVED, { intent: plannerStep.intent });
+
+    // ── Deduplication guard ───────────────────────────────────────────────────
+    // If the planner returned the same intent as the most recently completed step,
+    // AND the current page state is identical to the pre-action baseline of that step,
+    // the action did not advance the workflow — do NOT re-execute it.
+    //
+    // This catches the case where the planner ignores completedSteps and returns
+    // the same step again (e.g. "open_create_menu" after the menu already opened).
+    //
+    // A re-execution IS allowed when:
+    //   (a) the intent differs from the last completed step, OR
+    //   (b) the URL has changed since that step ran, OR
+    //   (c) the domHash has changed since that step ran (menu opened, modal appeared, etc.)
+    //
+    // Critical: the fallback for domHash comparison must NOT be urlSame. GitHub's "+"
+    // menu opens without a URL change, so urlSame=true even when the state DID change.
+    // We use latestCompleted.domHashBefore (stored when the step completed) to compare
+    // against the current domHash. If the DOM changed, the step genuinely advanced state
+    // and the planner should return a different next step — let it through.
+    {
+      const latestCompleted = freshSession.completedSteps[freshSession.completedSteps.length - 1];
+      if (latestCompleted && latestCompleted.intent === plannerStep.intent) {
+        const currentSnap = capturePageSnapshot('');
+        const urlSame     = currentSnap.url === latestCompleted.urlBefore;
+
+        // Use domHashBefore from the completed step record (stored by user:acted handler
+        // and buildStepRecord). If absent (old session format), compare against the
+        // pendingStep's domHashBefore if still available, else treat as "changed" (safe
+        // default: don't block a step whose pre-action baseline we cannot verify).
+        let domHashSame;
+        if (latestCompleted.domHashBefore != null) {
+          domHashSame = currentSnap.domHash === latestCompleted.domHashBefore;
+        } else if (freshSession.pendingStep?.domHashBefore != null) {
+          domHashSame = currentSnap.domHash === freshSession.pendingStep.domHashBefore;
+        } else {
+          // No baseline available — cannot confirm state is unchanged.
+          // Default to allowing the step through (don't block on insufficient data).
+          domHashSame = false;
+        }
+
+        console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${latestCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
+
+        if (urlSame && domHashSame) {
+          console.warn(
+            `[SP:V2] Dedup guard FIRED: planner returned same intent="${plannerStep.intent}" as last completed step` +
+            ` with identical page state — page did not change after that action`
+          );
+          // Bump the step attempt counter so the stuck-workflow detector can still
+          // fire if this dedup cycle repeats MAX_STEP_ATTEMPTS times.
+          const { isStuck, reason } = await SessionStore.incrementStepAttempt(tabId);
+          if (isStuck) {
+            applyEvent(TaskEvent.PLAN_FAILED, { reason });
+            showStatus(`ScreenPilot: ${reason}`, "error");
+            await SessionStore.clear(tabId);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        } else {
+          console.log(`[SP:V2] Dedup check PASSED: same intent but page state changed (urlSame=${urlSame} domHashSame=${domHashSame}) — allowing re-execution`);
+        }
+      }
+    }
+    // Phase 23A — Goal Completion foundation (SCHEMA ONLY). Persist the plan-level
+    // completion contract once so it survives navigation / reload / bootstrap resume,
+    // and emit a single diagnostic log. This does NOT drive any runtime or completion
+    // decision — GoalVerifier / shadow mode arrive in later phases.
+    const goalCompletionCriteria = planResp.goalCompletionCriteria ?? planResp.plan.goalCompletionCriteria;
+    if (goalCompletionCriteria && !freshSession.goalCompletionCriteria) {
+      await SessionStore.patchSession(tabId, { goalCompletionCriteria });
+      // Phase 23B shadow mode: log the FULL contract. Still NOT evaluated anywhere.
+      console.log("[SP:GoalCompletionCriteria]", {
+        goalType:             goalCompletionCriteria.goalType,
+        match:                goalCompletionCriteria.match,
+        verificationStrategy: goalCompletionCriteria.verificationStrategy,
+        requiresEffect:       goalCompletionCriteria.requiresEffect,
+        successSignals:       goalCompletionCriteria.successSignals
+      });
+    }
+    // Phase 23C shadow trigger: PLAN_RECEIVED (legacy is never "complete" here).
+    await _shadowGoalVerify(tabId, "PLAN_RECEIVED", false);
     // B2: hide the planning banner once a step is ready — it must not remain visible
     // during EXECUTING/AWAITING_USER. The instruction/highlight UI takes over on element:ready.
     hideStatus();
     await SessionStore.setPhase(tabId, "EXECUTING");
     const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
     if (result === "navigated" || result === "aborted") {
+      if (result === "navigated") {
+        // Phase 26B — soft-navigation resume bridge. The progression contract used
+        // to be "a navigated step destroys the document; the fresh content script
+        // calls _bootstrapSession". Turbo/pjax sites (GitHub) swap the body without
+        // an unload, so bootstrap never re-ran and the session froze on the stale
+        // step (Phase 26A audit). If this document is still alive shortly after a
+        // navigated step, resume via the exact same bootstrap path a fresh content
+        // script would take: classification → completeStep → replan. On a real
+        // unload this timer dies with the document and never fires, so hard-reload
+        // behavior is unchanged. Generation safety is _bootstrapSession's own:
+        // it increments _generation and self-guards, same as its init invocation.
+        setTimeout(() => { _bootstrapSession(tabId); }, 800);
+      }
       return;
     }
     if (result === "goal_complete") {
@@ -590,11 +811,38 @@ async function _runPlanLoop(tabId, myGen) {
       }
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
+      await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
       await new Promise((r) => setTimeout(r, 500));
       continue;
     }
     await SessionStore.setPhase(tabId, "PLANNING");
     applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
+    await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
+  }
+}
+// Phase 23C — SHADOW MODE goal verification. Read-only: evaluates the persisted
+// goalCompletionCriteria against the live page and logs the verdict plus a
+// legacy-vs-verifier agreement line. It NEVER triggers completion, changes state,
+// or influences control flow — any error is swallowed so it cannot affect runtime.
+async function _shadowGoalVerify(tabId, trigger, legacyComplete) {
+  try {
+    const session  = await SessionStore.load(tabId);
+    const criteria = session?.goalCompletionCriteria;
+    if (!criteria) return; // no contract to shadow (e.g. a pure navigation goal)
+    const verdict = GoalVerifier.evaluate(criteria);
+    console.log(`[SP:GoalVerifier] trigger=${trigger}`, {
+      satisfied:      verdict.satisfied,
+      matchedSignals: verdict.matchedSignals,
+      totalSignals:   verdict.totalSignals,
+      details:        verdict.details
+    });
+    console.log("[SP:GoalAgreement]", {
+      trigger,
+      legacyComplete:   !!legacyComplete,
+      verifierComplete: verdict.satisfied
+    });
+  } catch (err) {
+    console.warn("[SP:GoalVerifier] shadow evaluation error (ignored):", err);
   }
 }
 async function _executeStep(tabId, plannerStep, goal, myGen) {
@@ -654,18 +902,45 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       const pre = executor.getPreActionSnapshot();
       const post = capturePageSnapshot("");
       const verdict = validateStep(pre, post);
+      console.log(`[SP:V2] user:acted verdict=${verdict} domHashBefore=${pre?.domHash} domHashAfter=${post.domHash} urlBefore=${pre?.url} urlAfter=${post.url}`);
       await SessionStore.completeStep(tabId, {
         description: step.description,
         intent: plannerStep.intent,
         completionCondition: step.completionCondition,
         urlBefore: pre?.url ?? window.location.href,
+        domHashBefore: pre?.domHash ?? null,   // stored so dedup guard works post-completion
         urlAfter: post.url,
         completedAt: Date.now()
       });
+      // Phase 23C shadow trigger: STEP_COMPLETED. legacyComplete reflects whether the
+      // legacy path would declare the goal done at this step (i.e. it is the terminal
+      // step). This is the key agreement datapoint.
+      await _shadowGoalVerify(tabId, "STEP_COMPLETED", isTerminalStep(plannerStep));
+      // Phase 26 — verifier-driven completion after a non-navigation step settles.
+      // If the goal's effect is already observable (requiresEffect contract satisfied),
+      // complete now — even when this step was NOT the planner-labeled terminal step.
+      // State is VALIDATING here, so FINAL_STEP_COMPLETE → COMPLETE is a valid edge.
+      {
+        const s26 = await SessionStore.load(tabId);
+        const gate = GoalVerifier.shouldComplete(s26?.goalCompletionCriteria);
+        if (gate.complete) {
+          console.log("[SP:GoalCompletion]", {
+            source: "verifier",
+            satisfied: true,
+            signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+          });
+          applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict, source: "verifier" });
+          if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
+          await _showGoalCompleteCard(tabId, goal);
+          done("goal_complete");
+          return;
+        }
+      }
       if (isTerminalStep(plannerStep)) {
         // Terminal step confirmed locally. Use the state machine's purpose-built
         // VALIDATING → COMPLETE transition (FINAL_STEP_COMPLETE) and finish now —
         // no replan, no waiting for a planner state=complete round-trip.
+        console.log("[SP:GoalCompletion]", { source: "planner", state: "final_step" });
         applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict });
         if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
         await _showGoalCompleteCard(tabId, goal);
@@ -724,6 +999,39 @@ export async function _bootstrapSession(tabId) {
         }
         await _runPlanLoop(tabId, myGen);
       } else if (classification === NavClassification.REFRESH) {
+        // Standard refresh: user reloaded the page without acting. Re-show the same step.
+        // BUT — for non-navigation steps (dom_change / menu-open) the executor fires
+        // done("navigated") when expectsNavigation=true was incorrectly set by the planner,
+        // which skips completeStep(). On bootstrap we can detect the action DID succeed
+        // by comparing the current domHash against the pre-action domHash stored in
+        // pendingStep.domHashBefore. If the DOM changed, the action completed — record
+        // it and replan to the next step instead of replaying the same action.
+        //
+        // This is the primary fix for the "+" menu re-highlighting bug: the planner
+        // labels the step urlChanges:true, user:acted fires done("navigated"), no
+        // completeStep() runs, bootstrap sees REFRESH (URL unchanged), and without this
+        // guard it replans with empty completedSteps, returning the same "+" step.
+        const pendingStep = session.pendingStep;
+        if (pendingStep?.domHashBefore != null) {
+          const currentSnap = capturePageSnapshot('');
+          const domChanged = currentSnap.domHash !== pendingStep.domHashBefore;
+          console.log(`[SP:V2] REFRESH path: domHashBefore=${pendingStep.domHashBefore} domHashNow=${currentSnap.domHash} domChanged=${domChanged}`);
+          if (domChanged) {
+            // The action already produced a state change — treat as completed.
+            console.log(`[SP:V2] REFRESH: DOM changed since step start — completing step and replanning`);
+            await SessionStore.completeStep(tabId, buildStepRecord(pendingStep));
+            if (_generation !== myGen) return;
+            applyEvent(TaskEvent.SESSION_RESUME);
+            if (isTerminalStep(pendingStep)) {
+              applyEvent(TaskEvent.PLAN_COMPLETE);
+              await _showGoalCompleteCard(tabId, session.goal);
+              return;
+            }
+            await _runPlanLoop(tabId, myGen);
+            return;
+          }
+        }
+        // DOM unchanged — genuine refresh, re-execute the same step.
         applyEvent(TaskEvent.SESSION_RESUME);
         await _runPlanLoop(tabId, myGen);
       } else {
@@ -938,4 +1246,9 @@ export function __resetState() {
 export function __setTabId(id) {
   _tabId = id;
 }
+export {
+  _handleClarification as __handleClarification,
+  _handleResume as __handleResume,
+  _handleStop as __handleStop,
+};
 console.log('[SP:V2] Ready — popup: "Open ScreenPilot"  console: __SP_V2_RUN("goal")');

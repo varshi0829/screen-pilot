@@ -38,6 +38,29 @@ export const CompletionCondition = Object.freeze({
   FINAL:               'final',
 });
 
+// ─── GOAL COMPLETION ──────────────────────────────────────────────────────────
+//
+// Phase 23A — schema only. These describe the *observable outcome* of the user's
+// goal, checkable on the page that exists AFTER the terminal action. They are
+// introduced here as an additive data model and are NOT evaluated by any runtime
+// path yet (GoalVerifier / shadow mode arrive in later phases).
+
+/** @enum {string} Kinds of locally-checkable success signal. */
+export const SuccessSignalType = Object.freeze({
+  URL_MATCHES:     'url_matches',     // location matches urlPattern (post-action)
+  URL_LEAVES:      'url_leaves',      // location no longer matches urlPattern (left the form)
+  TEXT_PRESENT:    'text_present',    // visible page text contains `text` (e.g. "New key added")
+  ELEMENT_PRESENT: 'element_present', // a control/label with accessible `text` exists (e.g. key row)
+  ELEMENT_ABSENT:  'element_absent',  // element_disappears (e.g. creation form closed)
+});
+
+/** @enum {string} How the plan-level verifier decides the goal is done. */
+export const VerificationStrategy = Object.freeze({
+  LOCAL_SIGNALS: 'local_signals', // signals alone decide (navigation goals)
+  HYBRID:        'hybrid',        // local first; if ambiguous, one AI-confirm turn
+  AI_CONFIRM:    'ai_confirm',    // always confirm via a post-action planner turn
+});
+
 // ─── STEP STATUS ──────────────────────────────────────────────────────────────
 
 /** @enum {string} */
@@ -181,6 +204,36 @@ export const ElementResolutionThreshold = Object.freeze({
  * @property {number} createdAt - Unix timestamp (ms)
  * @property {string} [applicationId] - Detected application fingerprint
  * @property {Record<string, unknown>} [metadata] - Provider-specific metadata
+ * @property {GoalCompletionCriteria} [goalCompletionCriteria] - Phase 23A: optional,
+ *   plan-level completion contract. Additive; not evaluated by any runtime path yet.
+ */
+
+/**
+ * A single locally-checkable predicate about the post-action page.
+ * Phase 23A: data model only — not evaluated yet.
+ *
+ * @typedef {Object} SuccessSignal
+ * @property {SuccessSignalType[keyof SuccessSignalType]} type
+ * @property {string} [urlPattern] - for url_matches / url_leaves (substring or path glob)
+ * @property {string} [text] - for text_present / element_present / element_absent
+ * @property {string} [region] - optional region hint (reuses detectRegion vocabulary)
+ * @property {number} [weight] - 0..1; used only when match==='weighted' (default even split)
+ * @property {string} description - human-readable, for logs/telemetry
+ */
+
+/**
+ * Plan-level, goal-scoped completion contract. Describes the observable OUTCOME
+ * of the goal, meant to be checked AFTER the terminal action settles — never on
+ * the pre-action page. Phase 23A: threaded and stored, but not verified.
+ *
+ * @typedef {Object} GoalCompletionCriteria
+ * @property {GoalType[keyof GoalType]} goalType
+ * @property {'all'|'any'|'weighted'} match - how successSignals combine
+ * @property {SuccessSignal[]} successSignals - one or more signals
+ * @property {VerificationStrategy[keyof VerificationStrategy]} verificationStrategy
+ * @property {boolean} requiresEffect - true for create/add/change/send goals: a mutation
+ *   signal (text/element) is mandatory; a URL signal alone cannot complete the goal
+ * @property {number} [confidenceThreshold] - for match==='weighted' (default 0.6)
  */
 
 /**
@@ -347,6 +400,8 @@ export const ElementResolutionThreshold = Object.freeze({
  *   - ambiguous: Multiple valid execution paths exist; surface to the user.
  *
  * @property {ExecutionPlan} [plan]           - Present when state === "planned"
+ * @property {GoalCompletionCriteria} [goalCompletionCriteria] - Phase 23A: optional,
+ *   plan-level completion contract. Additive; not evaluated by any runtime path yet.
  *
  * @property {Object} [interpretation]        - Planner's world-model; useful for UI and A/B testing
  * @property {"navigation"|"action"|"mixed"} interpretation.goalType
@@ -440,6 +495,8 @@ export const ElementResolutionThreshold = Object.freeze({
  * @property {number}              lastProgressAt       - Unix ms of last confirmed step completion
  *
  * @property {PendingStepContext|null} pendingStep      - Context for the currently-highlighted step
+ * @property {GoalCompletionCriteria|null} [goalCompletionCriteria] - Phase 23A: persisted
+ *                                                         plan-level completion contract (or null)
  *
  * @property {SessionPhase}        phase                - Current lifecycle phase
  *

@@ -146,7 +146,7 @@
     if (!window.__SP_DEBUG__) return;
     try {
       window.dispatchEvent(new CustomEvent('sp-debug', { detail: { type, ...detail } }));
-    } catch (_) {}
+    } catch {}
   }
 
   // ─── HIGHLIGHTER ────────────────────────────────────────────────────────────
@@ -382,7 +382,7 @@
 
   // Lightweight semantic token search — splits the step description into tokens and looks
   // for a visible interactive element whose accessible text contains all significant tokens.
-  function findBySemanticSearch(description, elementType) {
+  function findBySemanticSearch(description) {
     if (!description) return null;
     const INTERACTIVE = 'button,a,input,select,textarea,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="option"]';
     const stopWords   = new Set(['the','a','an','to','in','on','at','of','and','or','for','with','click','press','open','select','choose','go']);
@@ -1088,7 +1088,7 @@
       if (!response) {
         // Collect enterprise context before every Gemini call (refresh on page changes)
         if (typeof EnterpriseContextService !== 'undefined') {
-          try { state.enterpriseContext = EnterpriseContextService.detect(); } catch (_) {}
+          try { state.enterpriseContext = EnterpriseContextService.detect(); } catch {}
         }
         if (state.enterpriseContext?.application) {
           _emitDebug('ENTERPRISE_CONTEXT', {
@@ -1752,7 +1752,7 @@
       }
 
       renderProgressPanel();
-    } catch (error) {
+    } catch {
       setStatus('ERROR', 'Could not restore the current task state.');
     }
   }
@@ -1788,7 +1788,8 @@
   function isScreenPilotNode(node) {
     const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     return Boolean(el?.closest?.(
-      '#screenpilot-widget, #screenpilot-highlight, #screenpilot-spotlight, #screenpilot-arrow, #screenpilot-bubble'
+      '#screenpilot-widget, #screenpilot-highlight, #screenpilot-spotlight, #screenpilot-arrow, #screenpilot-bubble,' +
+      '[id^="sp-"], [id^="screenpilot-"], [class*="sp-"], [data-screenpilot]'
     ));
   }
 

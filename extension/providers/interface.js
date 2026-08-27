@@ -40,7 +40,7 @@ export class BackendAdapter {
    * @param {import('../shared/types/index.js').PlanRequest} request
    * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
    */
-  async plan(request) {
+  async plan() {
     throw new Error(`${this.name} must implement plan(request)`);
   }
 
@@ -51,7 +51,7 @@ export class BackendAdapter {
    * @param {import('../shared/types/index.js').RecoverRequest} request
    * @returns {Promise<import('../shared/types/index.js').RecoverResponse>}
    */
-  async recover(request) {
+  async recover() {
     throw new Error(`${this.name} must implement recover(request)`);
   }
 
@@ -62,7 +62,7 @@ export class BackendAdapter {
    * @param {{ screenshot: { image: string, mimeType: string }, pageContext: object }} request
    * @returns {Promise<{ success: boolean, screenContext?: object, error?: string }>}
    */
-  async explain(request) {
+  async explain() {
     throw new Error(`${this.name} must implement explain(request)`);
   }
 
@@ -73,7 +73,7 @@ export class BackendAdapter {
    * @param {{ screenshot: { image: string, mimeType: string }, question: string, pageContext: object }} request
    * @returns {Promise<{ success: boolean, answer?: string, confidence?: number, elementHint?: string, error?: string }>}
    */
-  async ask(request) {
+  async ask() {
     throw new Error(`${this.name} must implement ask(request)`);
   }
 
@@ -86,7 +86,7 @@ export class BackendAdapter {
    * @param {object} request
    * @returns {{ inputTokens: number, outputTokens: number, estimatedUSD: number }}
    */
-  estimateCost(operation, request) {
+  estimateCost() {
     throw new Error(`${this.name} must implement estimateCost(operation, request)`);
   }
 

@@ -6,6 +6,7 @@
   --bg: #ffffff;
   --surface: #F8FAFC;
   --card: #ffffff;
+  --font-sans: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --blue: #2563EB;
   --blue-dark: #1D4ED8;
   --emerald: #10B981;
@@ -25,7 +26,7 @@ html {
 }
 
 body {
-  font-family: var(--font-inter), system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;

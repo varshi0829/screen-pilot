@@ -323,30 +323,47 @@ export class ExecutorEngine {
   _resolveElement(step) {
     if (!step.targetElement) return null;
 
+    console.log('[SP:Target]', {
+      text: step.targetElement?.text,
+      type: step.targetElement?.type,
+      region: step.targetElement?.region,
+      alternatives: step.targetElement?.alternatives
+    });
+
     const primary = this._domMatcher.matchElement(step.targetElement);
 
     if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
       this._logCandidates(step.targetElement.text, primary.candidates);
 
-      // Confidence is normalised score / divisor — not an independent signal.
-      // CONFIDENCE=0.40 is equivalent to PRIMARY=60 at divisor=150. Raise only with data.
-      // ?? 1: missing confidence field (test mocks, old matchElement builds) → always passes.
-      const conf = primary.confidence ?? 1;
-      if (conf >= ElementResolutionThreshold.CONFIDENCE) return primary;
-
-      console.warn(
-        `[ExecutorEngine] Low-confidence primary match (${conf.toFixed(2)}) for ` +
-        `"${step.targetElement.text}" — score ${primary.score}, reason: ${primary.reason} — trying alternatives`
-      );
+      // Confidence is a normalised view of score (score / CONFIDENCE_DIVISOR) — it is
+      // NOT an independent signal.  CONFIDENCE=0.40 is equivalent to PRIMARY=60 at the
+      // divisor of 150 used in dom-matcher.js.  When score >= PRIMARY (≥60) the confidence
+      // threshold is therefore always satisfied by definition — they test the same thing
+      // from different angles.  Dropping the primary here and falling to the alternatives
+      // loop with a *lower* threshold (RECOVERY=50) was actively counterproductive: it
+      // could select a 52-scoring unrelated element over a 60-scoring correct one.
+      //
+      // Always return the primary when score >= PRIMARY.  The confidence field is kept for
+      // observability and future telemetry-driven tuning only.
+      return primary;
     }
 
+    // Evaluate ALL alternatives and keep the highest-scoring match above RECOVERY.
+    // First-past-the-post here was a real ranking bug: the loop used to return the
+    // first alternative to clear the (lower) RECOVERY bar, so an early weak-but-valid
+    // alternative could win over a later alternative that resolves the intended
+    // element far more strongly. Scoring every alternative and returning the best
+    // removes that ordering dependency.
+    let best = null;
     for (const altText of (step.targetElement.alternatives ?? [])) {
       if (!altText?.trim()) continue;
       const alt = this._domMatcher.matchElement({ ...step.targetElement, text: altText });
-      if (alt?.score >= ElementResolutionThreshold.RECOVERY) return alt;
+      if (alt?.score >= ElementResolutionThreshold.RECOVERY && (!best || alt.score > best.score)) {
+        best = alt;
+      }
     }
 
-    return null;
+    return best;
   }
 
   /**
@@ -412,9 +429,17 @@ export class ExecutorEngine {
       this._emit('user:acted', { step, trigger, timestamp: Date.now() });
     };
 
+    // A "fill" step is completed by typing, not by a click. Detect it from either
+    // the planner phase or the completion condition.
+    const isFillStep = step.phase === 'fill_form' || step.completionCondition === 'input_filled';
+
     // Document-level click in capture phase: fires before the element's own handlers,
     // so we detect the action even if the element stops propagation or navigates away.
+    // For fill steps we IGNORE clicks — clicking into the field just focuses it, and
+    // advancing there would skip the step before the user has typed anything. Fill
+    // steps advance only on meaningful input/change (below).
     const clickHandler = (e) => {
+      if (isFillStep) return;
       if (e.target?.closest?.('#screenpilot-widget')) return; // ignore our own UI
       if (!this._activeElement || !this._activeElement.contains(e.target)) return;
       onUserAction('click');
@@ -424,19 +449,105 @@ export class ExecutorEngine {
       document.removeEventListener('click', clickHandler, { capture: true })
     );
 
-    // URL-change events cover SPA pushState and hash navigation.
-    // For v3 steps that declare expectedOutcome, only fire when the URL moved
-    // toward the expected destination. This prevents browser Back (popstate)
-    // from being treated as a successful step completion, which would silently
-    // corrupt session history.
-    // v1 steps without expectedOutcome skip the guard and behave as before.
-    const urlChangeHandler = () => {
+    // ── fill_form auto-advance ───────────────────────────────────────────
+    // Advance the moment a text-like field within the target receives non-empty
+    // input — no blur, no Enter, no navigation required. Safety: only text entry
+    // (input[type=text|search|email|url|tel|password|number], textarea, or
+    // contenteditable) triggers this. Checkboxes, radios, switches/toggles and
+    // <select> dropdowns are explicitly excluded so they never auto-complete.
+    if (isFillStep) {
+      const TEXT_INPUT_TYPES = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number', '']);
+      const isTextLikeField = (el) => {
+        if (!el || typeof el.tagName !== 'string') return false;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'textarea') return true;
+        if (el.isContentEditable === true) return true;
+        if (tag === 'input') {
+          const type = (el.getAttribute?.('type') ?? 'text').toLowerCase();
+          return TEXT_INPUT_TYPES.has(type);
+        }
+        return false;
+      };
+      const fieldValue = (el) => (el.isContentEditable === true ? (el.textContent ?? '') : (el.value ?? ''));
+
+      const inputHandler = (e) => {
+        // [SP:FILL] diagnostic instrumentation — debug-only, no logic change.
+        // Logged unconditionally, before any guard below, so every guard's inputs
+        // are visible on every input/change dispatch regardless of which guard
+        // (if any) rejects the event.
+        console.log("[SP:FILL] activeElement", {
+          tag: this._activeElement?.tagName,
+          id: this._activeElement?.id,
+          className: this._activeElement?.className
+        });
+        console.log("[SP:FILL] target", {
+          tag: e.target?.tagName,
+          id: e.target?.id,
+          className: e.target?.className
+        });
+        console.log("[SP:FILL] contains", {
+          result: this._activeElement?.contains?.(e.target)
+        });
+        console.log("[SP:FILL] isTextLikeField", {
+          result: isTextLikeField(e.target)
+        });
+        console.log("[SP:FILL] value", {
+          value: fieldValue(e.target)
+        });
+
+        if (!this._activeElement) return;
+        const field = e.target;
+        // The event must originate at (or inside) the highlighted target, and land
+        // on a text-like field with meaningful content.
+        if (!this._activeElement.contains(field)) return;
+        if (!isTextLikeField(field)) return;
+        if (fieldValue(field).trim().length === 0) return;
+        console.log("[SP:FILL] USER_ACTION_EMITTED");
+        onUserAction('input');
+      };
+      document.addEventListener('input',  inputHandler, { capture: true });
+      document.addEventListener('change', inputHandler, { capture: true });
+      this._cleanups.push(() => {
+        document.removeEventListener('input',  inputHandler, { capture: true });
+        document.removeEventListener('change', inputHandler, { capture: true });
+      });
+    }
+
+    // ── SPA navigation detection ─────────────────────────────────────────
+    // Modern SPAs (React Router, Vue Router, Next.js, etc.) navigate via
+    // history.pushState / history.replaceState.  Neither fires 'popstate'.
+    // We patch both methods for the lifetime of this watcher and restore them
+    // on teardown.  The patch is scoped to the watcher — not a permanent global
+    // override — so concurrent ScreenPilot instances (rare but possible during
+    // testing) don't stack patches on each other.
+
+    // Safe accessor: window.location is undefined in Node.js test environments.
+    const getHref = () => {
+      try { return window.location?.href ?? ''; } catch { return ''; }
+    };
+
+    const urlBeforeAction = getHref();
+
+    const urlChangeHandler = (newUrl) => {
+      // Apply the same guard as the legacy popstate/hashchange path.
       if (step.expectedOutcome !== undefined) {
         if (!step.expectedOutcome.urlChanges) return;
         const pattern = step.expectedOutcome.urlPattern;
         if (pattern) {
           try {
-            const { pathname, hash } = new URL(window.location.href);
+            const { pathname, hash } = new URL(newUrl);
+            if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
+          } catch {
+            return;
+          }
+        }
+      } else if (step.expectedPageState !== undefined) {
+        // v2 steps use expectedPageState instead of expectedOutcome
+        if (!step.expectedPageState.urlChanges) return;
+        const pattern = step.expectedPageState.urlPattern;
+        if (pattern) {
+          try {
+            const { pathname, hash } = new URL(newUrl);
             if (!pathname.includes(pattern) && !hash.includes(pattern)) return;
           } catch {
             return;
@@ -445,11 +556,74 @@ export class ExecutorEngine {
       }
       onUserAction('url_change');
     };
-    window.addEventListener('popstate',   urlChangeHandler);
-    window.addEventListener('hashchange', urlChangeHandler);
+
+    // Wrap pushState / replaceState only when the browser history API is available.
+    // In Node.js test environments, 'history' is not defined — guard it so tests
+    // don't crash.  The actual watcher still works in browsers.
+    let originalPushState    = null;
+    let originalReplaceState = null;
+
+    if (typeof history !== 'undefined' && history?.pushState) {
+      originalPushState    = history.pushState.bind(history);
+      originalReplaceState = history.replaceState.bind(history);
+
+      history.pushState = function (...args) {
+        originalPushState(...args);
+        // args[2] is the new URL; fall back to current href if absent/null
+        const nextUrl = args[2] ? String(args[2]) : getHref();
+        urlChangeHandler(nextUrl);
+      };
+      history.replaceState = function (...args) {
+        originalReplaceState(...args);
+        const nextUrl = args[2] ? String(args[2]) : getHref();
+        urlChangeHandler(nextUrl);
+      };
+    }
+
     this._cleanups.push(() => {
-      window.removeEventListener('popstate',   urlChangeHandler);
-      window.removeEventListener('hashchange', urlChangeHandler);
+      if (originalPushState)    history.pushState    = originalPushState;
+      if (originalReplaceState) history.replaceState = originalReplaceState;
+    });
+
+    // Legacy hash / popstate listeners — still needed for sites that use them
+    const legacyUrlChangeHandler = () => urlChangeHandler(getHref());
+    window.addEventListener('popstate',   legacyUrlChangeHandler);
+    window.addEventListener('hashchange', legacyUrlChangeHandler);
+    this._cleanups.push(() => {
+      window.removeEventListener('popstate',   legacyUrlChangeHandler);
+      window.removeEventListener('hashchange', legacyUrlChangeHandler);
+    });
+
+    // Post-click URL poll — safety net for SPAs that defer navigation via
+    // setTimeout / microtask after the click handler returns (e.g. form submit
+    // handlers that call router.push inside a Promise chain).  Only runs after
+    // a click on the target element has been detected, polls for up to 2 s.
+    let pollInterval = null;
+    const startUrlPoll = () => {
+      if (pollInterval) return; // already polling
+      let elapsed = 0;
+      pollInterval = setInterval(() => {
+        elapsed += 100;
+        const currentHref = getHref();
+        if (currentHref && currentHref !== urlBeforeAction) {
+          urlChangeHandler(currentHref);
+        }
+        if (fired || elapsed >= 2000) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
+      }, 100);
+    };
+
+    const clickForPollHandler = (e) => {
+      if (e.target?.closest?.('#screenpilot-widget')) return;
+      if (!this._activeElement || !this._activeElement.contains(e.target)) return;
+      startUrlPoll();
+    };
+    document.addEventListener('click', clickForPollHandler, { capture: true });
+    this._cleanups.push(() => {
+      document.removeEventListener('click', clickForPollHandler, { capture: true });
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
     });
   }
 
