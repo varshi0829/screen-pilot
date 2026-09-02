@@ -42,13 +42,23 @@ export class ExecutorEngine {
    * @param {{ show(element: Element, text: string): Promise<boolean>, clear(): void }} deps.highlighter
    * @param {() => object} [deps.captureSnapshot]
    */
-  constructor({ domMatcher, highlighter, captureSnapshot = capturePageSnapshot } = {}) {
+  constructor({
+    domMatcher, highlighter, captureSnapshot = capturePageSnapshot,
+    // Bounded wait-and-retry budget for _resolveElementWithWait (see its own
+    // doc comment) — configurable so tests can use a short budget instead of
+    // the real 2s one. Defaults mirror the existing post-click URL-poll
+    // precedent elsewhere in this file (100ms interval, 2s budget).
+    elementResolvePollIntervalMs = 100,
+    elementResolveMaxWaitMs      = 2000,
+  } = {}) {
     if (!domMatcher)  throw new TypeError('ExecutorEngine: domMatcher is required');
     if (!highlighter) throw new TypeError('ExecutorEngine: highlighter is required');
 
     this._domMatcher      = domMatcher;
     this._highlighter     = highlighter;
     this._captureSnapshot = captureSnapshot;
+    this._elementResolvePollIntervalMs = elementResolvePollIntervalMs;
+    this._elementResolveMaxWaitMs      = elementResolveMaxWaitMs;
 
     this._plan              = null;
     this._stepIndex         = 0;
@@ -203,7 +213,14 @@ export class ExecutorEngine {
     this._preActionSnapshot = this._captureSnapshot('');
 
     // ── 2. Resolve target element ─────────────────────────────────────────
-    const resolved = this._resolveElement(step);
+    const resolved = await this._resolveElementWithWait(step);
+
+    // abort() may have run while the wait loop was polling — its own null
+    // return in that case must not be re-interpreted as a genuine
+    // element:not_found, which would overwrite the 'aborted' status/emit a
+    // stale event. Mirrors the identical guard already used below, after
+    // awaiting highlighter.show().
+    if (this._status === 'aborted') return;
 
     if (!resolved) {
       const reason = `No element matched "${step.targetElement?.text ?? '(no text)'}"`;
@@ -246,10 +263,13 @@ export class ExecutorEngine {
       // "Inbox" among several other sibling labels) and accept it just
       // because it was visible, while the real, correctly-labelled "Inbox"
       // button (score 112) simply hadn't finished rendering yet — a genuine
-      // render race. Skip candidates below RECOVERY the same as a self-check
-      // failure, so a page still finishing its render falls through to a
-      // genuine not_found (and the existing replan mechanism) instead of a
-      // low-confidence guess.
+      // render race that ElementResolutionThreshold.RECOVERY plus the
+      // existing _resolveElementWithWait retry exists to handle, but never
+      // got the chance to because a low-score-but-visible candidate absorbed
+      // the attempt first. Skip candidates below RECOVERY the same as a
+      // self-check failure, so a page still finishing its render falls
+      // through to a genuine not_found/retry instead of a low-confidence
+      // guess.
       if (_ci > 0 && score < ElementResolutionThreshold.RECOVERY) {
         lastFailureReason = `Candidate score ${score} below RECOVERY threshold — skipped as noise`;
         continue;
@@ -331,6 +351,48 @@ export class ExecutorEngine {
   }
 
   // ── Private — element resolution ──────────────────────────────────────────
+
+  /**
+   * Wraps _resolveElement() with a short, bounded wait-and-retry for the case
+   * where the target genuinely doesn't exist in the DOM YET — a rendering-
+   * timing race, not a matching/scoring problem. Real-Chrome finding
+   * (vscode.dev, goal "Get started"): the FIRST resolution attempt ran
+   * ~200ms into the task, while the page's own dynamic content (a heavy
+   * client-rendered SPA) didn't finish rendering the target until ~2.8s
+   * after navigation — a generic "we searched before the page caught up"
+   * race that any sufficiently slow-rendering dynamic page can hit, not
+   * something specific to vscode.dev's markup or DOMMatcher's scoring.
+   * Mirrors the existing post-click URL-poll precedent elsewhere in this
+   * file (100ms interval, 2s budget) for the same class of "give a real SPA
+   * a moment to catch up" problem, reusing its exact timing rather than
+   * inventing a new constant.
+   *
+   * Only retries when the FIRST attempt found literally nothing — an
+   * immediate successful resolution (the overwhelmingly common case) costs
+   * nothing extra. A step still unresolved after the full budget reports
+   * element:not_found exactly as before. This is one bounded wait inside a
+   * single _executeStep() call, not a retry loop across attempts/replans.
+   *
+   * @param {import('../shared/types/index.js').PlanStep} step
+   * @returns {Promise<{ element: Element, score: number, confidence?: number } | null>}
+   */
+  async _resolveElementWithWait(step) {
+    const resolved = this._resolveElement(step);
+    if (resolved) return resolved;
+
+    const pollIntervalMs = this._elementResolvePollIntervalMs;
+    const maxWaitMs      = this._elementResolveMaxWaitMs;
+    let elapsed = 0;
+    while (elapsed < maxWaitMs) {
+      if (this._status === 'aborted') return null;
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      elapsed += pollIntervalMs;
+      if (this._status === 'aborted') return null;
+      const retry = this._resolveElement(step);
+      if (retry) return retry;
+    }
+    return null;
+  }
 
   /**
    * Try the primary descriptor, then alternatives in order.

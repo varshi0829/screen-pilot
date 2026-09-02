@@ -61,6 +61,7 @@ function makeEl({
   dataTestid   = null,
   childImgAlt  = null,   // simulates <img alt="…"> inside the element
   isSpNode     = false,  // simulates element inside a ScreenPilot overlay (#sp-* or screenpilot-*)
+  nestedInteractiveCount = 0, // simulates N independently-interactive descendants (hasMultipleInteractiveDescendants)
 } = {}) {
   const parent = {
     tagName:       parentTag,
@@ -113,6 +114,11 @@ function makeEl({
       }
       return null;
     },
+    // Simulates hasMultipleInteractiveDescendants' element.querySelectorAll(...)
+    // call — a fake array of the requested length, regardless of the exact
+    // selector string (nothing else in dom-matcher.js calls querySelectorAll
+    // on an individual candidate element).
+    querySelectorAll: () => Array.from({ length: nestedInteractiveCount }),
   };
 }
 
@@ -762,15 +768,138 @@ await test('defense-in-depth: input outranks a same-text label even in a mixed c
   assert.equal(r.element, input, 'winner must be the input, outranking the label even when both are scored');
 });
 
-// ── Real-Chrome finding: giant container false-positive via "contains match" ──
+// ── scoreContainsMatch: structural container vs. single-element regressions ───
 //
-// Regression for github.com/microsoft/vscode, goal "Open Pull requests": a
-// 7689-character <main id="js-repo-pjax-container"> (swept into the candidate
-// pool via the generic [id] selector) scored the same flat 70 "contains match"
-// as the real, correctly-labelled #pull-requests-tab link, purely because its
-// enormous dumped text happened to contain "pull requests" somewhere within it.
+// Real-Chrome findings on github.com/microsoft/vscode and vscode.dev drove
+// this whole distinction. Bug #1 ("Open Issues"): a <nav> aggregating five
+// tab labels ("Code Issues 5k+ Pull requests 2.5k Actions Project") tied the
+// real "Issues 5k+" tab link on a flat contains-match score and won via DOM
+// order. Bug #2 ("Open Pull requests"): an unrelated wiki link ("Submitting
+// pull requests") outscored the real tab via the semantic-container bonus.
+// Bug #3 (vscode.dev "Get started", found while fixing #1/#2): the first
+// specificity-based fix over-corrected — a real <button> whose own text
+// legitimately combines a title with a longer subtitle ("Get Started with VS
+// Code for the Web\nCustomize your editor, learn the basics, and start
+// coding") scored only 27, below the executor's PRIMARY (60) threshold, with
+// no nested interactive descendants to distinguish it from an aggregating
+// container. Each test below maps to one required case (A–F).
+
+await test('[A] single element: target leads, long subtitle follows — keeps strong score, not decayed', async () => {
+  const card = makeEl({
+    text: 'Get Started with the Editor\nCustomize your setup, learn the basics, and start working right away',
+    tag: 'BUTTON', parentTag: 'HEADER',
+  });
+  setElems(card);
+  const r = DM.matchElement({ text: 'Get Started with the Editor', type: 'button' });
+  assert.ok(r, 'should match');
+  assert.equal(r.element, card);
+  assert.ok(r.score >= 60, `title+subtitle element must clear PRIMARY (60), got ${r.score}`);
+  assert.ok(r.confidence >= 0.4, `should retain strong confidence, got ${r.confidence.toFixed(2)}`);
+
+  // And must win over a genuine aggregating container containing the same phrase.
+  const welcomePanel = makeEl({
+    text: 'Welcome\nEditor\nEditing evolved\nStart\nGet Started with the Editor\nOpen Folder\nClone Repository',
+    tag: 'DIV', id: 'welcome-panel', parentTag: 'MAIN',
+    nestedInteractiveCount: 3, // Start/Open Folder/Clone Repository are each their own real controls
+  });
+  setElems(welcomePanel, card);
+  const r2 = DM.matchElement({ text: 'Get Started with the Editor', type: 'button' });
+  assert.equal(r2.element, card,
+    `the single title+subtitle control must win over the surrounding welcome panel; got tag=${r2.element.tagName}`);
+});
+
+await test('[B] single element: target buried in unrelated prose — specificity-decayed', async () => {
+  // "Submitting pull requests" (github.com wiki link): target "pull
+  // requests" is not its lead ("Submitting" is) and it has zero nested
+  // interactive descendants — only the leading-match signal catches this.
+  const realTab = makeEl({ text: 'Pull requests 2.5k', tag: 'A', parentTag: 'NAV' });
+  const wikiLink = makeEl({ text: 'Submitting pull requests', tag: 'A', parentTag: 'NAV' });
+  setElems(realTab, wikiLink);
+
+  const r = DM.matchElement({ text: 'Pull requests', type: 'link' });
+  assert.ok(r, 'should match');
+  assert.equal(r.element, realTab,
+    `the real, tight tab link must win over a buried mention; got text="${r.element.innerText}"`);
+});
+
+await test('[C] structural container: multiple interactive descendants — specificity-decayed even if it happens to lead', async () => {
+  const navContainer = makeEl({
+    text: 'Code Issues 5k+ Pull requests 2.5k Actions Project',
+    tag: 'NAV', id: 'repo-nav', parentTag: 'HEADER',
+    nestedInteractiveCount: 5, // 5 real sibling <a> tab links, like github.com's actual repo nav
+  });
+  const issuesLink = makeEl({ text: 'Issues 5k+', tag: 'A', parentTag: 'HEADER' });
+  // Container necessarily precedes its own child in real DOM order.
+  setElems(navContainer, issuesLink);
+
+  const r = DM.matchElement({ text: 'Issues', type: 'button' });
+  assert.ok(r, 'should match');
+  assert.equal(r.element, issuesLink,
+    `the specific tab link must win, not the aggregating nav container; got tag=${r.element.tagName}`);
+
+  // Isolate the structural signal: a container whose text HAPPENS to lead
+  // with the target must still decay via nested descendants alone.
+  const leadingContainer = makeEl({
+    text: 'Issues Pull requests Actions Projects Wiki',
+    tag: 'NAV', parentTag: 'HEADER',
+    nestedInteractiveCount: 5,
+  });
+  setElems(leadingContainer, issuesLink);
+  const r2 = DM.matchElement({ text: 'Issues', type: 'button' });
+  assert.equal(r2.element, issuesLink,
+    `real link must win even though the container happens to lead with the target too; got tag=${r2.element.tagName}`);
+});
+
+await test('[D] short badge/count suffix — keeps full score within CONTAINS_GRACE_CHARS', async () => {
+  // GitHub's real Issues tab link: innerText "Issues\n5k+" normalizes to
+  // "issues 5k+" (10 chars vs. target "issues" 6 chars — 4 chars of excess,
+  // within the 8-char grace window).
+  setElems(makeEl({ text: 'Issues 5k+', tag: 'A' }));
+  const r = DM.matchElement({ text: 'Issues', type: 'button' });
+  assert.ok(r, 'should match');
+  assert.ok(r.reason.includes('contains match'), `expected a contains match, got reason "${r.reason}"`);
+  assert.ok(r.score >= 70, `"Issues 5k+" should retain the full contains score, got ${r.score}`);
+});
+
+await test('[E] title attribute: always specificity-scored, unrelated prose stays penalized', async () => {
+  // A GitHub commit-history link's title is its full commit message.
+  const commitNoise = makeEl({
+    text: '', title: 'fix(docs): correct grammar and typo issues in documentation',
+    tag: 'A', parentTag: 'MAIN',
+  });
+  const realTab = makeEl({ text: 'Issues 5k+', tag: 'A', parentTag: 'HEADER' });
+  setElems(commitNoise, realTab);
+
+  const r = DM.matchElement({ text: 'Issues', type: 'button' });
+  assert.ok(r, 'should match');
+  assert.equal(r.element, realTab,
+    `the real tab must win over unrelated title prose; got tag=${r.element.tagName} title="${r.element.getAttribute('title')}"`);
+  const noiseScore = r.candidates.find(c => c.element === commitNoise)?.score ?? 0;
+  assert.ok(noiseScore < 40, `unrelated 61-char commit-message title should be substantially penalized, got ${noiseScore}`);
+
+  // Grace-window boundary is unaffected (title="submit request", 14 chars,
+  // target "submit", 6 chars -> excess 8, exactly at the boundary).
+  setElems(makeEl({ text: '', title: 'submit request', tag: 'SPAN', parentTag: 'ASIDE' }));
+  const rBoundary = DM.matchElement({ text: 'submit' });
+  assert.equal(rBoundary.score, 63, `title contains-match at the grace boundary should still score 63 (70×0.9), got ${rBoundary.score}`);
+});
+
+await test('[F] candidate shorter than target: a clean leading/specific match is not penalized as buried', async () => {
+  // target "pull requests tab in the repository navigation" (verbose
+  // planner phrasing), candidate "pull requests" (a real, tight tab label)
+  // — the candidate is a clean PREFIX of the target, not a buried mention,
+  // even though it is the SHORTER of the two strings.
+  setElems(makeEl({ text: 'Pull requests', tag: 'A', parentTag: 'HEADER' }));
+  const r = DM.matchElement({ text: 'Pull requests tab in the repository navigation', type: 'link' });
+  assert.ok(r, 'should match');
+  assert.ok(r.reason.includes('contains match'), `expected a contains match, got reason "${r.reason}"`);
+  assert.ok(r.score >= 70, `a short, leading/specific candidate must not be penalized as buried, got ${r.score}`);
+});
 
 await test('giant container (>120 chars) with a buried substring match scores far below a real short label', async () => {
+  // Distinct from [C]: this container has no nested interactive descendants
+  // (swept in via the generic [id] selector, not a real nav) — caught by the
+  // length-cap path instead of the structural signal.
   const longText = 'Repository navigation. '.repeat(20) + 'View pull requests and more.'; // > 120 chars, contains "pull requests"
   const giantContainer = makeEl({ text: longText, tag: 'DIV', id: 'repo-container', parentTag: 'MAIN' });
   const realLabel       = makeEl({ text: 'Pull requests', tag: 'A', parentTag: 'NAV' });
@@ -787,111 +916,7 @@ await test('giant container (>120 chars) with a buried substring match scores fa
   assert.ok(containerScore < 40, `giant container score ${containerScore} should be pushed well down (< 40)`);
 });
 
-await test('short/medium badge-suffixed label keeps the full flat score (within the badge grace window)', async () => {
-  // Superseded by the github.com/microsoft/vscode "Open Issues"/"Open Pull
-  // requests" wrong-element-selection fix, refined a second time after the
-  // fix's first cut proved too aggressive: decaying ANY excess (even a
-  // realistic badge suffix, e.g. real GitHub's own "Issues\n5k+", 4 chars
-  // past the bare target) dropped a real, correct element's own score enough
-  // that an undecayed 'id' contains-match became its "best" attribute
-  // instead — and that alone was too weak to clear the executor's PRIMARY
-  // threshold, turning a wrong-element bug into a false-negative
-  // element_not_found on the very case the fix was meant to resolve.
-  // CONTAINS_GRACE_CHARS keeps a small excess (badge/count suffixes) at the
-  // full flat 70; only a LARGER excess (aggregating containers, unrelated
-  // prose) decays. "Pull requests 2.4k" has only 5 characters of excess past
-  // "Pull requests" (19 vs. 14 chars) — well within the 8-char grace window.
-  setElems(makeEl({ text: 'Pull requests 2.4k', tag: 'A' }));
-  const r = DM.matchElement({ text: 'Pull requests', type: 'link' });
-  assert.ok(r, 'should match');
-  assert.ok(r.reason.includes('contains match'), `expected a contains match, got reason "${r.reason}"`);
-  assert.ok(r.score >= 70,
-    `badge-suffixed label within the grace window should keep the full flat contains score, got ${r.score}`);
-});
-
-await test('"Issues" matching real GitHub badge text "Issues 5k+" retains the full contains score', async () => {
-  // The exact real-world case that motivated CONTAINS_GRACE_CHARS: GitHub's
-  // real Issues tab link (innerText "Issues\n5k+", normalizes to "issues
-  // 5k+", 10 chars vs. target "issues" 6 chars — 4 chars of excess, within
-  // the 8-char grace window).
-  setElems(makeEl({ text: 'Issues 5k+', tag: 'A' }));
-  const r = DM.matchElement({ text: 'Issues', type: 'button' });
-  assert.ok(r, 'should match');
-  assert.ok(r.reason.includes('contains match'), `expected a contains match, got reason "${r.reason}"`);
-  assert.ok(r.score >= 70, `"Issues 5k+" should retain the full contains score, got ${r.score}`);
-});
-
-await test('"Issues" matching a long unrelated commit-message title is substantially penalized', async () => {
-  // The exact real-world case that motivated bringing 'title' under decay:
-  // a GitHub commit-history link's title is its full commit message.
-  const el = makeEl({ text: '', title: 'fix(docs): correct grammar and typo issues in documentation', tag: 'A' });
-  setElems(el);
-  const r = DM.matchElement({ text: 'Issues', type: 'button' });
-  assert.ok(r, 'should still match (it does contain the word)');
-  assert.ok(r.score < 40, `unrelated 61-char commit-message title should be substantially penalized, got ${r.score}`);
-});
-
-await test('excess beyond the grace window still decays (badge-suffix protection has a limit)', async () => {
-  // A longer aside beyond a small badge — not a container, but no longer a
-  // "target + count" shape either — should still be scaled down by
-  // specificity, confirming the grace window doesn't just disable decay
-  // entirely for the 'text'/'title' attributes.
-  const tight = makeEl({ text: 'Settings 3',                              tag: 'A', parentTag: 'HEADER' });
-  const loose = makeEl({ text: 'Settings and preferences for your account', tag: 'A', parentTag: 'HEADER' });
-  setElems(tight, loose);
-  const r = DM.matchElement({ text: 'Settings', type: 'link' });
-  assert.equal(r.element, tight, 'the tight, badge-suffixed match must still win over the much longer phrase');
-
-  setElems(loose);
-  const rLoose = DM.matchElement({ text: 'Settings', type: 'link' });
-  assert.ok(rLoose.score < 70, `excess well beyond the grace window must still decay below flat 70, got ${rLoose.score}`);
-});
-
-// ── Real-Chrome regression: GitHub "Open Issues" / "Open Pull requests" ───────
-//
-// Bug #1: a <nav> whose aggregate text concatenates several tab labels
-// ("Code Issues 5k+ Pull requests 2.5k Actions Project") tied the real,
-// specific "Issues 5k+" tab link on the old flat-70 contains-match, then won
-// the tie via DOM order (the container necessarily precedes its own child in
-// document order). Bug #2: a semantically-unrelated wiki link ("Submitting
-// pull requests") earned the container-context bonus (its own container is
-// narrowly about "pull requests") and outscored the real tab link, whose
-// container is the same multi-item nav strip diluted across unrelated tab
-// names and so never qualifies for that bonus.
-
-await test('specific child link beats its own parent navigation container', async () => {
-  const navContainer = makeEl({
-    text: 'Code Issues 5k+ Pull requests 2.5k Actions Project',
-    tag: 'NAV', id: 'repo-nav', parentTag: 'HEADER',
-  });
-  const issuesLink = makeEl({
-    text: 'Issues 5k+', tag: 'A', parentTag: 'HEADER',
-  });
-  // Container necessarily precedes its own child in real DOM order.
-  setElems(navContainer, issuesLink);
-
-  const r = DM.matchElement({ text: 'Issues', type: 'button' });
-  assert.ok(r, 'should match');
-  assert.equal(r.element, issuesLink,
-    `the specific tab link must win, not the aggregating nav container; got tag=${r.element.tagName}`);
-});
-
-await test('specific "Pull requests" link beats an unrelated link that merely contains the phrase', async () => {
-  const realTab = makeEl({
-    text: 'Pull requests 2.5k', tag: 'A', parentTag: 'NAV',
-  });
-  const wikiLink = makeEl({
-    text: 'Submitting pull requests', tag: 'A', parentTag: 'NAV',
-  });
-  setElems(realTab, wikiLink);
-
-  const r = DM.matchElement({ text: 'Pull requests', type: 'link' });
-  assert.ok(r, 'should match');
-  assert.equal(r.element, realTab,
-    `the real, tight tab link must win over a tangential mention; got text="${r.element.innerText}"`);
-});
-
-await test('duplicate labels: identical short candidates still resolve deterministically (no specificity tie-break needed)', async () => {
+await test('duplicate labels: identical short candidates still resolve deterministically', async () => {
   const first  = makeEl({ text: 'Profile', tag: 'BUTTON', parentTag: 'HEADER' });
   const second = makeEl({ text: 'Profile', tag: 'BUTTON', parentTag: 'HEADER' });
   setElems(first, second);
@@ -933,41 +958,8 @@ await test('short vs. long matching candidates: score increases monotonically wi
     'between two contains-matches, the tighter/shorter one must win, not merely the first in DOM order');
 });
 
-await test('unrelated title-attribute prose no longer outscores the real target (github.com commit-history finding)', async () => {
-  // Real-Chrome finding (github.com/microsoft/vscode, goal "Open Issues",
-  // discovered while verifying the container/wiki-link fix against the live
-  // page): a commit-history link's title is its full commit message —
-  // title="fix(docs): correct grammar and typo issues in documentation" —
-  // which contains "issues" once inside 61 characters of unrelated text, and
-  // (before 'title' was brought under the same excess-based decay as 'text')
-  // outscored the real Issues tab purely on that basis.
-  const commitNoise = makeEl({
-    text: '', title: 'fix(docs): correct grammar and typo issues in documentation',
-    tag: 'A', parentTag: 'MAIN',
-  });
-  const realTab = makeEl({ text: 'Issues 5k+', tag: 'A', parentTag: 'HEADER' });
-  setElems(commitNoise, realTab);
-
-  const r = DM.matchElement({ text: 'Issues', type: 'button' });
-  assert.ok(r, 'should match');
-  assert.equal(r.element, realTab,
-    `the real tab must win over unrelated title prose; got tag=${r.element.tagName} title="${r.element.getAttribute('title')}"`);
-});
-
-await test('short title attribute keeps the existing region-mismatch test numbers exactly (grace window covers it)', async () => {
-  // Direct regression check for the pre-existing "region mismatch: -8 penalty"
-  // test's hardcoded numbers (title="submit request", 14 chars, target
-  // "submit", 6 chars -> excess 8, exactly at the grace boundary) — confirms
-  // bringing 'title' under decay didn't silently change that test's inputs.
-  const el = makeEl({ text: '', title: 'submit request', tag: 'SPAN', parentTag: 'ASIDE' });
-  setElems(el);
-  const r = DM.matchElement({ text: 'submit' });
-  assert.equal(r.score, 63, `title contains-match at the grace boundary should still score 63 (70×0.9), got ${r.score}`);
-});
-
 await test('existing L2 case unaffected: icon-only aria-label button still beats a same-score sidebar link', async () => {
-  // Same scenario as the earlier "icon-only boost" regression test above —
-  // confirms this fix, scoped to the 'text'/'title' attributes, does not
+  // Confirms this fix, scoped to the 'text'/'title' attributes, does not
   // touch the aria-label path that scenario depends on.
   const sidebarLink = makeEl({ text: 'Profile', tag: 'A', parentTag: 'NAV', parentLeft: 0 });
   const avatarButton = makeEl({ text: '', ariaLabel: 'View profile and more', tag: 'BUTTON', parentTag: 'HEADER' });

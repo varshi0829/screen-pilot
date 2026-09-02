@@ -13,53 +13,26 @@ const DOMMatcher = (() => {
   // A single perfect exact-text match scores 110; dividing by 150 yields 0.73.
   const CONFIDENCE_DIVISOR = 150;
 
-  // "Contains match" candidate-text length cap for aria-label / placeholder /
-  // name / id / data-* / etc. — attributes that are always a single string
-  // authored for exactly one element as its accessible name/identifier, and
-  // so can legitimately be longer than the target without that meaning
-  // anything about specificity (aria-label="View profile and more" for
-  // target "profile"). Any realistic label/badge-suffixed name is well under
-  // this; only structural containers (a <main>/<div> wrapping large chunks of
-  // the page, swept in via the generic [id] selector) exceed it. Generous
-  // margin above real-world labels (existing candidates top out around
-  // 40 chars) and below the real-world false-positive containers this exists
-  // to stop (measured 151–7689 chars on github.com/microsoft/vscode).
+  // "Contains match" length cap: candidates at or under this length keep a
+  // flat score; longer ones decay proportionally (floor MIN_CONTAINS_SCORE).
+  // Applies unconditionally to aria-label/placeholder/name/id/data-* (always
+  // a single string authored for exactly one element's own identity, so
+  // length alone doesn't imply irrelevance), and to 'text' when
+  // scoreContainsMatch (below) decides it isn't an aggregating container or
+  // buried mention. Measured against real containers on
+  // github.com/microsoft/vscode (151–7689 chars) vs. real labels (top out
+  // around 40 chars).
   const CANDIDATE_CONTAINS_LENGTH_CAP = 120;
 
-  // Floor for any decayed "contains match" score (both the length-cap path
-  // above and the specificity path below) — a match is never scored at 0,
-  // just heavily deprioritised against a more specific candidate.
+  // Floor for any decayed "contains match" score — never 0, just heavily
+  // deprioritised against a more specific candidate.
   const MIN_CONTAINS_SCORE = 15;
 
-  // 'text' (innerText/textContent) and 'title' are NOT given the length-cap
-  // protection above: 'text' can aggregate several sibling controls' labels
-  // into one blob (a <nav> wrapping five tab links); 'title' is routinely
-  // attached to genuinely arbitrary, unrelated prose on real sites (a GitHub
-  // commit-history link's title is its full commit message). Real-Chrome
-  // finding (github.com/microsoft/vscode, goal "Open Issues"): a <nav>
-  // aggregating "Code Issues 5k+ Pull requests 2.5k Actions Project" (~55
-  // chars, under the 120-char cap) scored an identical flat 70 to the real
-  // "Issues 5k+" tab link and won a tie via DOM order; separately, a commit
-  // link's title="fix(docs): correct grammar and typo issues in
-  // documentation" (61 chars) outscored the real tab purely by containing
-  // "issues" once. Both attributes are instead scored continuously by
-  // specificity — how much of the longer string (target vs. candidate) is
-  // the matching part — below.
-  //
-  // Below this many EXTRA characters beyond the target, that specificity
-  // score is skipped entirely and the full flat 70 is kept — covers
-  // realistic badge/count suffixes ("Issues 5k+", "Notifications (3)",
-  // "Pull requests 2.5k") so a real, correct element isn't penalised for a
-  // normal UI decoration. Real-Chrome finding: decaying ANY excess (even a
-  // realistic badge suffix, e.g. real GitHub's own "Issues\n5k+", 4 chars
-  // past the bare target) dropped a real, correct element's own score enough
-  // that an undecayed 'id' contains-match became its "best" attribute
-  // instead — and that alone was too weak to clear the executor's PRIMARY
-  // acceptance threshold (60), turning a wrong-element bug into a
-  // false-negative element_not_found. Chosen to comfortably cover realistic
-  // badge/count suffixes (2-8 chars) while staying well under the excess
-  // seen from real aggregating containers or unrelated prose (40+ chars in
-  // every case measured on github.com/microsoft/vscode).
+  // Grace window (see scoreContainsMatch): a candidate/target excess of this
+  // many characters or fewer keeps the full flat score, regardless of decay
+  // strategy — covers realistic badge/count suffixes ("Issues 5k+",
+  // "Notifications (3)") so a real, correct element isn't penalised for a
+  // normal UI decoration.
   const CONTAINS_GRACE_CHARS = 8;
 
   // Generic UI synonyms — no application names, no site-specific phrases.
@@ -163,7 +136,7 @@ const DOMMatcher = (() => {
     let bestSpecificity   = 1;
 
     for (const attribute of attributes) {
-      const scored = scoreAttributeValue(attribute.value, attribute.label, target);
+      const scored = scoreAttributeValue(attribute.value, attribute.label, target, element);
       if (!scored) continue;
 
       const weighted = scored.score * attribute.weight;
@@ -332,7 +305,102 @@ const DOMMatcher = (() => {
     ];
   }
 
-  function scoreAttributeValue(value, label, target) {
+  // Genuinely interactive elements only — deliberately narrower than the
+  // attribute-based sweep in getCandidateSelectors' `common` list (which
+  // includes [id]/[aria-label]/[title]/etc. to catch icon-only controls as
+  // top-level CANDIDATES, but would make almost any element with a labelled
+  // child look like it "aggregates controls"). Used only to answer one
+  // question: does this element's own text come from concatenating several
+  // SEPARATELY-clickable descendants, or is it one control's own content?
+  const INTERACTIVE_DESCENDANT_SELECTOR =
+    'a,button,input,textarea,select,[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="textbox"],[aria-haspopup]';
+
+  // True when `element` wraps two or more independently-interactive
+  // descendants (e.g. a <nav> containing several separate <a> tab links) —
+  // the structural signature of a container whose own text is an
+  // AGGREGATION of sibling controls' labels, not one control's own content.
+  // Threshold of 2 (not 1) requires genuinely multiple sibling controls, not
+  // one incidental nested control inside an otherwise single-purpose
+  // wrapper. Used by scoreContainsMatch below.
+  function hasMultipleInteractiveDescendants(element) {
+    if (!element || typeof element.querySelectorAll !== 'function') return false;
+    try {
+      return element.querySelectorAll(INTERACTIVE_DESCENDANT_SELECTOR).length >= 2;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Scores a "contains" match — the target and an attribute's normalized
+   * value overlap as a substring in either direction — for one attribute.
+   *
+   * Two decay strategies, chosen per attribute + structural evidence:
+   *
+   * SPECIFICITY decay (score scales with how much of the longer string is
+   * "extra" beyond the match; a grace window of CONTAINS_GRACE_CHARS keeps
+   * short excess at the full flat score) applies when:
+   *   - label is 'title' — always. A title attribute is a single string
+   *     that real sites routinely fill with arbitrary prose (a GitHub
+   *     commit-history link's title is its full commit message); there is
+   *     no DOM structure to lean on for a plain attribute string.
+   *   - label is 'text' AND the candidate is a structural container
+   *     aggregating multiple independently-interactive descendants
+   *     (hasMultipleInteractiveDescendants) — e.g. a <nav> wrapping five
+   *     separate <a> tab links, whose own text is several SIBLING controls'
+   *     labels concatenated, not one control's own content.
+   *   - label is 'text' AND the target is not a LEADING match against the
+   *     candidate's text (neither is a prefix of the other) — real UI
+   *     labels conventionally put the primary identifier first, with any
+   *     badge/count/description appended after it ("Issues 5k+"); a target
+   *     that instead shows up mid-string or as a grammatically subordinate
+   *     mention (a GitHub wiki link's own text, "Submitting pull requests"
+   *     — target "pull requests" is not its lead) is the same "incidental
+   *     mention" shape as an aggregating container, just without literal
+   *     nested interactive elements to catch it structurally.
+   *
+   * LENGTH-CAP decay (flat score up to CANDIDATE_CONTAINS_LENGTH_CAP,
+   * decayed only past it) applies to everything else: aria-label,
+   * placeholder, name, id, data-*, and 'text' that is both non-aggregating
+   * AND a leading match — the "title, then a longer descriptive subtitle, in
+   * ONE control" shape (real-Chrome finding, vscode.dev "Get started": a
+   * <button> with no nested interactive children, innerText "Get Started
+   * with VS Code for the Web\nCustomize your editor, learn the basics, and
+   * start coding" — must keep a strong score, not be treated as an
+   * aggregating container just because it's long).
+   */
+  function scoreContainsMatch(label, normalizedValue, target, element) {
+    // Symmetric: covers both "candidate's text leads with the target" (the
+    // common case — a badge/subtitle follows) and "the target leads with
+    // the candidate" (candidate shorter — a clean, specific label matching
+    // the front of a more verbose target phrase, e.g. target "click the
+    // pull requests tab", candidate "pull requests" — a MORE specific
+    // match, not a buried mention).
+    const isLeadingMatch = normalizedValue.startsWith(target.normalized) || target.normalized.startsWith(normalizedValue);
+    const isAggregatingContainer = label === 'text' && hasMultipleInteractiveDescendants(element);
+    const isBuriedMention        = label === 'text' && !isLeadingMatch;
+    const useSpecificityDecay    = label === 'title' || isAggregatingContainer || isBuriedMention;
+
+    if (!useSpecificityDecay) {
+      if (normalizedValue.length <= CANDIDATE_CONTAINS_LENGTH_CAP) {
+        return buildScore(70, `${label} contains match`, 'fuzzy');
+      }
+      const decayed = Math.round(70 * (CANDIDATE_CONTAINS_LENGTH_CAP / normalizedValue.length));
+      return buildScore(Math.max(MIN_CONTAINS_SCORE, decayed), `${label} contains match`, 'fuzzy');
+    }
+
+    const shorter = Math.min(target.normalized.length, normalizedValue.length);
+    const longer  = Math.max(target.normalized.length, normalizedValue.length);
+    const excess  = longer - shorter;
+    if (excess <= CONTAINS_GRACE_CHARS) {
+      return buildScore(70, `${label} contains match`, 'fuzzy', 1);
+    }
+    const specificity = longer === 0 ? 1 : shorter / longer;
+    const score = Math.max(MIN_CONTAINS_SCORE, Math.round(70 * specificity));
+    return buildScore(score, `${label} contains match`, 'fuzzy', specificity);
+  }
+
+  function scoreAttributeValue(value, label, target, element) {
     const normalizedValue = normalizeText(value);
     if (!normalizedValue) {
       return null;
@@ -366,27 +434,7 @@ const DOMMatcher = (() => {
     }
 
     if (targetHasAlnum && (normalizedValue.includes(target.normalized) || target.normalized.includes(normalizedValue))) {
-      // aria-label/placeholder/name/id/data-* etc.: length-cap-only decay.
-      // See CANDIDATE_CONTAINS_LENGTH_CAP above for why these are protected.
-      if (label !== 'text' && label !== 'title') {
-        if (normalizedValue.length <= CANDIDATE_CONTAINS_LENGTH_CAP) {
-          return buildScore(70, `${label} contains match`, 'fuzzy');
-        }
-        const decayed = Math.round(70 * (CANDIDATE_CONTAINS_LENGTH_CAP / normalizedValue.length));
-        return buildScore(Math.max(MIN_CONTAINS_SCORE, decayed), `${label} contains match`, 'fuzzy');
-      }
-
-      // 'text'/'title': specificity-scaled, with a grace window for short
-      // suffixes. See CONTAINS_GRACE_CHARS above for the full rationale.
-      const shorter = Math.min(target.normalized.length, normalizedValue.length);
-      const longer  = Math.max(target.normalized.length, normalizedValue.length);
-      const excess  = longer - shorter;
-      if (excess <= CONTAINS_GRACE_CHARS) {
-        return buildScore(70, `${label} contains match`, 'fuzzy', 1);
-      }
-      const specificity = longer === 0 ? 1 : shorter / longer;
-      const score = Math.max(MIN_CONTAINS_SCORE, Math.round(70 * specificity));
-      return buildScore(score, `${label} contains match`, 'fuzzy', specificity);
+      return scoreContainsMatch(label, normalizedValue, target, element);
     }
 
     const synonymSimilarity = calculateTokenSimilarity(target.expandedTokens, expandTokens(valueTokens));
@@ -405,8 +453,7 @@ const DOMMatcher = (() => {
   }
 
   // directSpecificity (0–1, default 1) is the winning attribute's own match
-  // ratio — see the 'text'/'title' specificity scoring in scoreAttributeValue
-  // above (CONTAINS_GRACE_CHARS comment). Real-Chrome finding
+  // ratio — see scoreContainsMatch above. Real-Chrome finding
   // (github.com/microsoft/vscode, goal "Open Pull requests"):
   // this bonus is meant to help a WEAK/generic direct match ("Submit" among
   // several forms) using surrounding context — but a topically-narrow,
@@ -558,8 +605,8 @@ const DOMMatcher = (() => {
     return rank[incoming] > rank[current] ? incoming : current;
   }
 
-  // specificity defaults to 1 (no reduction) for every match type except the
-  // 'text'/'title' contains-match branch above, which passes its own
+  // specificity defaults to 1 (no reduction) for every match type except
+  // scoreContainsMatch's specificity-decay path, which passes its own
   // computed ratio — see scoreSemanticContainer's use of it.
   function buildScore(score, reason, matchType, specificity = 1) {
     return { score, reason, matchType, specificity };

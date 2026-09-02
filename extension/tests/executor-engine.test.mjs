@@ -108,6 +108,18 @@ function makeExecutor(matcherOpts, highlighterOpts) {
     domMatcher:      makeMatcher(matcherOpts),
     highlighter:     makeHighlighter(highlighterOpts),
     captureSnapshot: (text = '') => ({ ...MOCK_SNAPSHOT, highlightedElementText: text }),
+    // Production default is a real 100ms/2000ms bounded wait-and-retry for a
+    // not-yet-rendered element (see _resolveElementWithWait) — disabled
+    // (maxWait=0, so the retry loop's `elapsed < maxWaitMs` is false
+    // immediately) for every OTHER test in this file, preserving their exact
+    // pre-existing single-shot-resolution semantics unchanged. Several mocks
+    // here use a call counter to distinguish "this step's resolution" from
+    // "the next step's resolution" — any retry would call matchElement an
+    // extra time and could accidentally resolve the wrong thing. The retry
+    // behavior itself gets its own dedicated test with a real non-zero
+    // budget, isolated from these.
+    elementResolvePollIntervalMs: 1,
+    elementResolveMaxWaitMs:      0,
   });
 }
 
@@ -261,6 +273,102 @@ await test('start() emits element:not_found when highlighter.show() returns fals
   assert.equal(ex.getStatus(), 'idle');
 });
 
+// ── 3b. Element resolution wait/retry (SPA render race) ──────────────────────
+//
+// _resolveElementWithWait: real-Chrome finding (vscode.dev, goal "Get
+// started") — the target didn't exist in the DOM yet on the first
+// resolution attempt (a heavy client-rendered SPA still finishing its
+// initial render), so the executor now retries within a short, bounded
+// budget instead of declaring element:not_found on a single miss. These
+// tests use their own short elementResolvePollIntervalMs/elementResolveMaxWaitMs
+// (not makeExecutor()'s disabled default) to exercise the wait loop directly,
+// isolated from every other test's exact-single-call semantics.
+
+await test('resolves on a later attempt when the target appears mid-wait (SPA render race)', async () => {
+  let callCount = 0;
+  const domMatcher = {
+    matchElement: () => {
+      callCount++;
+      // Simulates a target that doesn't exist yet on the first couple of
+      // lookups (still rendering), then appears.
+      return callCount < 3 ? null : { element: MOCK_ELEMENT, score: 85 };
+    },
+  };
+  const ex = new ExecutorEngine({
+    domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+    elementResolvePollIntervalMs: 5, elementResolveMaxWaitMs: 100,
+  });
+
+  const payload = await new Promise((resolve, reject) => {
+    ex.on('element:ready', resolve);
+    ex.on('element:not_found', () => reject(new Error('should not report not_found — target appears within the wait budget')));
+    ex.start(makePlan([makeStep()]));
+  });
+
+  assert.ok(callCount >= 3, `expected at least 3 resolution attempts, got ${callCount}`);
+  assert.equal(payload.element, MOCK_ELEMENT);
+});
+
+await test('gives up and reports element:not_found only after the full wait budget elapses', async () => {
+  const domMatcher = { matchElement: () => null }; // never resolves
+  const ex = new ExecutorEngine({
+    domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+    elementResolvePollIntervalMs: 5, elementResolveMaxWaitMs: 30,
+  });
+
+  const t0 = Date.now();
+  const payload = await new Promise((resolve, reject) => {
+    ex.on('element:not_found', resolve);
+    ex.on('element:ready', () => reject(new Error('should not resolve — matcher never finds anything')));
+    ex.start(makePlan([makeStep()]));
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed >= 30, `should wait out the full budget (~30ms) before giving up, took ${elapsed}ms`);
+  assert.ok(payload.reason.includes('Submit'));
+});
+
+await test('wait loop stops promptly when abort() is called mid-wait (no continued polling)', async () => {
+  let callCount = 0;
+  const domMatcher = { matchElement: () => { callCount++; return null; } }; // never resolves
+  const ex = new ExecutorEngine({
+    domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+    elementResolvePollIntervalMs: 20, elementResolveMaxWaitMs: 2000,
+  });
+
+  ex.start(makePlan([makeStep()]));
+  await new Promise((r) => setTimeout(r, 10));
+  ex.abort();
+  const countAtAbort = callCount;
+  assert.equal(ex.getStatus(), 'aborted');
+
+  // Give the in-flight poll iteration a moment to notice the abort and stop —
+  // if the loop kept running for the full 2000ms budget, callCount would keep
+  // climbing well past this short window instead of settling immediately.
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(
+    callCount <= countAtAbort + 1,
+    `wait loop must stop shortly after abort, not keep polling for the full budget (callCount ${countAtAbort} -> ${callCount})`
+  );
+  assert.equal(ex.getStatus(), 'aborted');
+});
+
+await test('an immediate successful resolution is unaffected by the wait/retry budget (no added delay)', async () => {
+  let callCount = 0;
+  const domMatcher = { matchElement: () => { callCount++; return { element: MOCK_ELEMENT, score: 85 }; } };
+  const ex = new ExecutorEngine({
+    domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+    elementResolvePollIntervalMs: 100, elementResolveMaxWaitMs: 2000,
+  });
+
+  const t0 = Date.now();
+  await new Promise((resolve) => { ex.on('element:ready', resolve); ex.start(makePlan([makeStep()])); });
+  const elapsed = Date.now() - t0;
+
+  assert.equal(callCount, 1, 'a successful first attempt must not retry');
+  assert.ok(elapsed < 50, `an immediate match must resolve fast, took ${elapsed}ms`);
+});
+
 // ── 4. Optional steps ─────────────────────────────────────────────────────────
 
 await test('optional step with no match emits step:skipped and auto-advances', async () => {
@@ -274,7 +382,7 @@ await test('optional step with no match emits step:skipped and auto-advances', a
       return callCount === 1 ? null : { element: MOCK_ELEMENT, score: 85 };
     },
   };
-  const ex = new ExecutorEngine({ domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT });
+  const ex = new ExecutorEngine({ domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT, elementResolveMaxWaitMs: 0 });
 
   // Both events are emitted before the test can await them individually:
   // step:skipped fires synchronously, and element:ready fires in the microtask
@@ -654,6 +762,13 @@ await test('abort() during async highlight gap is handled gracefully', async () 
   const ex = new ExecutorEngine({ domMatcher: makeMatcher(), highlighter: hl, captureSnapshot: () => MOCK_SNAPSHOT });
 
   ex.start(makePlan([makeStep()]));
+  // _resolveElementWithWait (see executor-engine.js) adds one microtask tick
+  // before _executeStep's continuation reaches highlighter.show() (which
+  // assigns resolveShow). Let that tick flush so show() is genuinely
+  // in-flight — this test's actual intent — before aborting; _executeStep
+  // now also bails out immediately (by design) if abort() lands before that
+  // point is ever reached, which would make resolveShow never get assigned.
+  await new Promise((r) => setTimeout(r, 0));
   ex.abort();
   assert.equal(ex.getStatus(), 'aborted');
 
@@ -738,7 +853,7 @@ await test('evaluates ALL alternatives and keeps the highest-scoring match', asy
 
 await test('emits element:not_found when all alternatives also fail', async () => {
   const domMatcher = { matchElement: () => ({ element: MOCK_ELEMENT, score: 10 }) }; // always too low
-  const ex   = new ExecutorEngine({ domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT });
+  const ex   = new ExecutorEngine({ domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT, elementResolveMaxWaitMs: 0 });
   const step = makeStep({ targetElement: { text: 'Submit', type: 'button', intent: 'submit', alternatives: ['Send', 'Go'] } });
 
   const promise = nextEvent(ex, 'element:not_found'); // synchronous — register before start
