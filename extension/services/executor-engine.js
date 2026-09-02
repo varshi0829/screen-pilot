@@ -235,6 +235,26 @@ export class ExecutorEngine {
       const candidate = allCandidates[_ci];
       const { element, score } = candidate;
 
+      // Real-Chrome finding (linear.app, goal "Open Inbox"): `resolved` (the
+      // primary) can clear PRIMARY via a candidate that then fails self-check
+      // — e.g. an SVG icon-sprite <symbol id="Inbox"> swept in by the generic
+      // [id] selector, an exact id match, but zero-size and never rendered.
+      // `resolved.alternatives` is DOMMatcher's own ranked list for the SAME
+      // target, with no score floor applied here — so the fallback loop could
+      // previously walk all the way down to a near-noise score (7, a giant
+      // wrapper div whose specificity-decayed text happened to contain
+      // "Inbox" among several other sibling labels) and accept it just
+      // because it was visible, while the real, correctly-labelled "Inbox"
+      // button (score 112) simply hadn't finished rendering yet — a genuine
+      // render race. Skip candidates below RECOVERY the same as a self-check
+      // failure, so a page still finishing its render falls through to a
+      // genuine not_found (and the existing replan mechanism) instead of a
+      // low-confidence guess.
+      if (_ci > 0 && score < ElementResolutionThreshold.RECOVERY) {
+        lastFailureReason = `Candidate score ${score} below RECOVERY threshold — skipped as noise`;
+        continue;
+      }
+
       // ── [DIAG] Candidate identity ──────────────────────────────────────
       {
         const tag       = element.tagName?.toLowerCase() ?? '?';

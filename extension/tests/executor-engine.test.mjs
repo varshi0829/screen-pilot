@@ -6,6 +6,7 @@
 
 import assert from 'assert/strict';
 import { ExecutorEngine } from '../services/executor-engine.js';
+import { ElementResolutionThreshold } from '../shared/types/index.js';
 
 // ── Browser API shims ─────────────────────────────────────────────────────────
 
@@ -1035,6 +1036,84 @@ await test('BUG-003: all candidates fail highlight → element:not_found', async
     payload.reason.toLowerCase().includes('highlight'),
     `reason should reference highlight failure, got: "${payload.reason}"`,
   );
+});
+
+// ── 14. Low-score alternative rejected in the self-check fallback loop ────────
+//
+// Real-Chrome finding (linear.app, goal "Open Inbox"): an SVG icon-sprite
+// <symbol id="Inbox"> won primary via an exact id match, correctly failed
+// self-check (zero-size, never rendered — a <symbol> is a template, not a
+// visible node), and the fallback loop then walked to DOMMatcher's own next-
+// ranked alternative — a giant wrapper div scoring 7 (a near-noise score,
+// well below RECOVERY=50) whose specificity-decayed text happened to still
+// contain "Inbox" among several sibling labels. That div passed self-check
+// (it genuinely was visible) and was accepted as the resolved target, even
+// though the REAL "Inbox" button (score 112) simply hadn't finished
+// rendering yet on this render-race-prone page. A candidate below RECOVERY
+// must now be skipped the same as a self-check failure.
+
+function makeMatcherWithScoredAlternatives(primary, primaryScore, alts) {
+  return {
+    matchElement: () => ({
+      element:      primary,
+      score:        primaryScore,
+      confidence:   primaryScore / 150,
+      reason:       'text contains match',
+      matchType:    'fuzzy',
+      alternatives: alts.map(({ element, score }) => ({ element, score, reason: 'text contains match', matchType: 'fuzzy' })),
+    }),
+  };
+}
+
+await test('low-score alternative (below RECOVERY) is skipped, not accepted as a false match', async () => {
+  const primaryFailsSelfCheck = { ...MOCK_ELEMENT, disabled: true }; // fails self-check, like the SVG symbol
+  const noiseAlt = { ...MOCK_ELEMENT, _id: 'noise' };                // would pass self-check/highlight if reached
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return true; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher: makeMatcherWithScoredAlternatives(
+      primaryFailsSelfCheck, 80, // clears PRIMARY on its own, like the id-exact-match symbol
+      [{ element: noiseAlt, score: 7 }], // well below RECOVERY=50
+    ),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  const promise = nextEvent(ex, 'element:not_found');
+  ex.start(makePlan([makeStep()]));
+  const payload = await promise;
+
+  assert.equal(hlCalls.length, 0, 'the low-score noise candidate must never reach the highlighter');
+  assert.ok(payload.reason.toLowerCase().includes('recovery') || payload.reason.toLowerCase().includes('noise') || payload.reason.toLowerCase().includes('below'),
+    `reason should reference the score floor, got: "${payload.reason}"`);
+  assert.equal(ex.getStatus(), 'idle');
+});
+
+await test('alternative at/above RECOVERY is still used normally (score floor is not overly strict)', async () => {
+  const primaryFailsSelfCheck = { ...MOCK_ELEMENT, disabled: true };
+  const decentAlt = { ...MOCK_ELEMENT, _id: 'decent' };
+  const hlCalls = [];
+  const hl = {
+    show:  async (el) => { hlCalls.push(el); return el === decentAlt; },
+    clear: () => {},
+  };
+  const ex = new ExecutorEngine({
+    domMatcher: makeMatcherWithScoredAlternatives(
+      primaryFailsSelfCheck, 80,
+      [{ element: decentAlt, score: ElementResolutionThreshold.RECOVERY }], // exactly at the floor
+    ),
+    highlighter:     hl,
+    captureSnapshot: () => MOCK_SNAPSHOT,
+  });
+
+  ex.start(makePlan([makeStep()]));
+  const payload = await nextEvent(ex, 'element:ready');
+
+  assert.equal(payload.element, decentAlt, 'a candidate exactly at RECOVERY must still be used');
+  assert.equal(ex.getStatus(), 'awaiting');
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────
