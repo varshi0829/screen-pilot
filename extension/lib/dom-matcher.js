@@ -13,6 +13,55 @@ const DOMMatcher = (() => {
   // A single perfect exact-text match scores 110; dividing by 150 yields 0.73.
   const CONFIDENCE_DIVISOR = 150;
 
+  // "Contains match" candidate-text length cap for aria-label / placeholder /
+  // name / id / data-* / etc. — attributes that are always a single string
+  // authored for exactly one element as its accessible name/identifier, and
+  // so can legitimately be longer than the target without that meaning
+  // anything about specificity (aria-label="View profile and more" for
+  // target "profile"). Any realistic label/badge-suffixed name is well under
+  // this; only structural containers (a <main>/<div> wrapping large chunks of
+  // the page, swept in via the generic [id] selector) exceed it. Generous
+  // margin above real-world labels (existing candidates top out around
+  // 40 chars) and below the real-world false-positive containers this exists
+  // to stop (measured 151–7689 chars on github.com/microsoft/vscode).
+  const CANDIDATE_CONTAINS_LENGTH_CAP = 120;
+
+  // Floor for any decayed "contains match" score (both the length-cap path
+  // above and the specificity path below) — a match is never scored at 0,
+  // just heavily deprioritised against a more specific candidate.
+  const MIN_CONTAINS_SCORE = 15;
+
+  // 'text' (innerText/textContent) and 'title' are NOT given the length-cap
+  // protection above: 'text' can aggregate several sibling controls' labels
+  // into one blob (a <nav> wrapping five tab links); 'title' is routinely
+  // attached to genuinely arbitrary, unrelated prose on real sites (a GitHub
+  // commit-history link's title is its full commit message). Real-Chrome
+  // finding (github.com/microsoft/vscode, goal "Open Issues"): a <nav>
+  // aggregating "Code Issues 5k+ Pull requests 2.5k Actions Project" (~55
+  // chars, under the 120-char cap) scored an identical flat 70 to the real
+  // "Issues 5k+" tab link and won a tie via DOM order; separately, a commit
+  // link's title="fix(docs): correct grammar and typo issues in
+  // documentation" (61 chars) outscored the real tab purely by containing
+  // "issues" once. Both attributes are instead scored continuously by
+  // specificity — how much of the longer string (target vs. candidate) is
+  // the matching part — below.
+  //
+  // Below this many EXTRA characters beyond the target, that specificity
+  // score is skipped entirely and the full flat 70 is kept — covers
+  // realistic badge/count suffixes ("Issues 5k+", "Notifications (3)",
+  // "Pull requests 2.5k") so a real, correct element isn't penalised for a
+  // normal UI decoration. Real-Chrome finding: decaying ANY excess (even a
+  // realistic badge suffix, e.g. real GitHub's own "Issues\n5k+", 4 chars
+  // past the bare target) dropped a real, correct element's own score enough
+  // that an undecayed 'id' contains-match became its "best" attribute
+  // instead — and that alone was too weak to clear the executor's PRIMARY
+  // acceptance threshold (60), turning a wrong-element bug into a
+  // false-negative element_not_found. Chosen to comfortably cover realistic
+  // badge/count suffixes (2-8 chars) while staying well under the excess
+  // seen from real aggregating containers or unrelated prose (40+ chars in
+  // every case measured on github.com/microsoft/vscode).
+  const CONTAINS_GRACE_CHARS = 8;
+
   // Generic UI synonyms — no application names, no site-specific phrases.
   // Covers common action labels that mean the same thing across different UIs.
   const SYNONYM_GROUPS = [
@@ -111,6 +160,7 @@ const DOMMatcher = (() => {
     let bestWeightedScore = 0;
     let bestReason        = '';
     let bestMatchType     = '';
+    let bestSpecificity   = 1;
 
     for (const attribute of attributes) {
       const scored = scoreAttributeValue(attribute.value, attribute.label, target);
@@ -121,6 +171,7 @@ const DOMMatcher = (() => {
         bestWeightedScore = weighted;
         bestReason        = scored.reason;
         bestMatchType     = scored.matchType;
+        bestSpecificity   = scored.specificity;
       } else {
         // Keep track of the best match type even from lower-weight attributes
         bestMatchType = chooseMatchType(bestMatchType, scored.matchType);
@@ -134,7 +185,7 @@ const DOMMatcher = (() => {
     // Secondary signals are additive bonuses, each capped so they cannot individually
     // swing the winner.  The cap prevents a strong semantic container from overriding
     // a much better attribute match on a different element.
-    const semantic  = scoreSemanticContainer(element, target, targetType);
+    const semantic  = scoreSemanticContainer(element, target, targetType, bestSpecificity);
     const typeBonus = scoreTypeAffinity(element, targetType);
     const region    = scoreRegion(element, targetRegion);
 
@@ -315,7 +366,27 @@ const DOMMatcher = (() => {
     }
 
     if (targetHasAlnum && (normalizedValue.includes(target.normalized) || target.normalized.includes(normalizedValue))) {
-      return buildScore(70, `${label} contains match`, 'fuzzy');
+      // aria-label/placeholder/name/id/data-* etc.: length-cap-only decay.
+      // See CANDIDATE_CONTAINS_LENGTH_CAP above for why these are protected.
+      if (label !== 'text' && label !== 'title') {
+        if (normalizedValue.length <= CANDIDATE_CONTAINS_LENGTH_CAP) {
+          return buildScore(70, `${label} contains match`, 'fuzzy');
+        }
+        const decayed = Math.round(70 * (CANDIDATE_CONTAINS_LENGTH_CAP / normalizedValue.length));
+        return buildScore(Math.max(MIN_CONTAINS_SCORE, decayed), `${label} contains match`, 'fuzzy');
+      }
+
+      // 'text'/'title': specificity-scaled, with a grace window for short
+      // suffixes. See CONTAINS_GRACE_CHARS above for the full rationale.
+      const shorter = Math.min(target.normalized.length, normalizedValue.length);
+      const longer  = Math.max(target.normalized.length, normalizedValue.length);
+      const excess  = longer - shorter;
+      if (excess <= CONTAINS_GRACE_CHARS) {
+        return buildScore(70, `${label} contains match`, 'fuzzy', 1);
+      }
+      const specificity = longer === 0 ? 1 : shorter / longer;
+      const score = Math.max(MIN_CONTAINS_SCORE, Math.round(70 * specificity));
+      return buildScore(score, `${label} contains match`, 'fuzzy', specificity);
     }
 
     const synonymSimilarity = calculateTokenSimilarity(target.expandedTokens, expandTokens(valueTokens));
@@ -333,7 +404,20 @@ const DOMMatcher = (() => {
     return null;
   }
 
-  function scoreSemanticContainer(element, target) {
+  // directSpecificity (0–1, default 1) is the winning attribute's own match
+  // ratio — see the 'text'/'title' specificity scoring in scoreAttributeValue
+  // above (CONTAINS_GRACE_CHARS comment). Real-Chrome finding
+  // (github.com/microsoft/vscode, goal "Open Pull requests"):
+  // this bonus is meant to help a WEAK/generic direct match ("Submit" among
+  // several forms) using surrounding context — but a topically-narrow,
+  // UNRELATED container (a wiki doc link sitting in a "Contributing" section)
+  // could earn the full bonus and outscore the real, correctly-labelled repo
+  // tab, whose own container is a shared nav strip diluted across several
+  // OTHER unrelated tab names and so never qualifies for the bonus at all.
+  // Scaling the bonus down as the direct match's own specificity rises means
+  // context can still rescue a genuinely weak match, but can't stack an
+  // additional swing on top of a match that already stands on its own.
+  function scoreSemanticContainer(element, target, targetType, directSpecificity = 1) {
     const container = element.closest('form, nav, header, main, section, article, li, td, tr, label, [role="dialog"], [role="menu"], [role="navigation"], [aria-label]');
     if (!container || container === element) {
       return { score: 0, reason: '' };
@@ -346,8 +430,11 @@ const DOMMatcher = (() => {
 
     const similarity = calculateTokenSimilarity(target.expandedTokens, containerTokens);
     if (similarity >= 0.6) {
+      const base = 10 + Math.round(similarity * 8);
+      const scaled = Math.round(base * (1 - directSpecificity));
+      if (scaled <= 0) return { score: 0, reason: '' };
       return {
-        score: 10 + Math.round(similarity * 8),
+        score: scaled,
         reason: 'semantic container context'
       };
     }
@@ -471,8 +558,11 @@ const DOMMatcher = (() => {
     return rank[incoming] > rank[current] ? incoming : current;
   }
 
-  function buildScore(score, reason, matchType) {
-    return { score, reason, matchType };
+  // specificity defaults to 1 (no reduction) for every match type except the
+  // 'text'/'title' contains-match branch above, which passes its own
+  // computed ratio — see scoreSemanticContainer's use of it.
+  function buildScore(score, reason, matchType, specificity = 1) {
+    return { score, reason, matchType, specificity };
   }
 
   function targetTokenKey(tokens) {
