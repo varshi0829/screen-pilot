@@ -6,6 +6,7 @@ import { MemoryService }       from './services/memory-service.js';
 import { RateLimiterService }  from './services/rate-limiter-service.js';
 import { ValidationService }   from './services/validation-service.js';
 import { NavigationPlanner }  from './services/navigation-planner.js';
+import { sendWithRetry } from './services/message-retry.js';
 
 const DEBUG = false;
 
@@ -593,7 +594,10 @@ async function startV2Task(message, sender) {
   const tabId = message.tabId || sender.tab?.id;
   if (!tabId) return { success: false, error: 'No target tab specified.' };
   try {
-    await chrome.tabs.sendMessage(tabId, { type: 'START_V2_TASK' });
+    // Bounded retry covers the document_idle content-script bootstrap race on
+    // heavy/slow-loading pages, where the tab's URL can commit well before the
+    // content script has registered its message listener. See message-retry.js.
+    await sendWithRetry(() => chrome.tabs.sendMessage(tabId, { type: 'START_V2_TASK' }));
     return { success: true };
   } catch {
     return { success: false, error: 'Content script not reachable. Please reload the page.' };
