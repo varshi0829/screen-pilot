@@ -504,6 +504,48 @@ function enrichStepFromPageState(plannerStep, pageState) {
     plannerStep.targetElement.region = resolvedEl.region;
   }
 }
+// Shared by the STALE_PLAN discard check and the deduplication guard below:
+// does `proposedStep` match one of the most recently completed steps, and
+// does `currentSnap` correspond to that step's own post-completion state?
+// Returns null when there's no matching completed step at all (nothing for
+// either caller to act on); otherwise { matchingCompleted, urlSame, domHashSame }
+// — callers decide what "urlSame && domHashSame" means for their own purpose.
+// See the dedup guard's own comment for why domHashAfter (not domHashBefore)
+// is the correct baseline for a STICKY same-page effect.
+function matchesCompletedStep(completedSteps, pendingStep, proposedStep, currentSnap) {
+  if (!proposedStep) return null;
+  const recentCompleted = (completedSteps || []).slice(-3);
+  const targetText      = (proposedStep.targetElement?.text || '').trim().toLowerCase();
+  const planIntent      = (proposedStep.intent || '').trim().toLowerCase();
+
+  const matchingCompleted = recentCompleted.slice().reverse().find(step => {
+    const stepIntent  = (step.intent || '').trim().toLowerCase();
+    const stepDesc    = (step.description || '').trim().toLowerCase();
+    const intentMatch = stepIntent && (stepIntent === planIntent || stepDesc.includes(planIntent) || planIntent.includes(stepIntent));
+    const textMatch   = targetText && stepDesc.toLowerCase().includes(targetText);
+    return intentMatch || textMatch;
+  });
+  if (!matchingCompleted) return null;
+
+  // A completed step's own destination is urlAfter (where it left the page),
+  // not urlBefore (where it started) — for a navigation-causing step these
+  // differ, and comparing against urlBefore would wrongly treat "we're still
+  // sitting on the page that step navigated TO" as "the URL changed". Falls
+  // back to urlBefore for older records that predate urlAfter being stored.
+  const urlBaseline = matchingCompleted.urlAfter ?? matchingCompleted.urlBefore;
+  const urlSame = currentSnap.url === urlBaseline;
+  let domHashSame;
+  if (matchingCompleted.domHashAfter != null) {
+    domHashSame = currentSnap.domHash === matchingCompleted.domHashAfter;
+  } else if (matchingCompleted.domHashBefore != null) {
+    domHashSame = currentSnap.domHash === matchingCompleted.domHashBefore;
+  } else if (pendingStep?.domHashBefore != null) {
+    domHashSame = currentSnap.domHash === pendingStep.domHashBefore;
+  } else {
+    domHashSame = false;
+  }
+  return { matchingCompleted, urlSame, domHashSame };
+}
 function makeSingleStepPlan(step, goal) {
   return {
     planId: crypto.randomUUID(),
@@ -756,9 +798,26 @@ async function _runPlanLoopInternal(tabId, myGen) {
     const urlChanged = preSnap.url !== postSnap.url;
     const domChanged = preSnap.domHash !== postSnap.domHash;
     if (urlChanged || domChanged) {
-      console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_snapshot_change`);
-      console.log(`[SP:V2] STALE_PLAN discarded urlChanged=${urlChanged} domChanged=${domChanged} preUrl=${preSnap.url} postUrl=${postSnap.url} preDomHash=${preSnap.domHash} postDomHash=${postSnap.domHash} reqMs=${reqMs}ms`);
-      continue;
+      // Before discarding outright: if the proposed step matches a step we've
+      // already completed, AND the current page corresponds to that step's own
+      // post-completion state, the snapshot drift isn't a fresh navigation/
+      // action invalidating this plan — it's the SAME already-handled repeat
+      // the dedup guard below exists to catch. Let it fall through instead of
+      // silently discarding it here, so the guard's fast, cheap step-attempt
+      // limit gets a chance to fire instead of burning through the whole
+      // (larger, more expensive) planner-call budget on a repeat that was
+      // never going to be acted on anyway — the STALE_PLAN check runs before
+      // the dedup guard and previously had no way to tell the two apart.
+      const dedupPreview = matchesCompletedStep(
+        freshSession.completedSteps, freshSession.pendingStep, planResp.plan?.steps?.[0], postSnap
+      );
+      const isRepeatOfCompletedStep = !!dedupPreview && dedupPreview.urlSame && dedupPreview.domHashSame;
+      if (!isRepeatOfCompletedStep) {
+        console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_snapshot_change`);
+        console.log(`[SP:V2] STALE_PLAN discarded urlChanged=${urlChanged} domChanged=${domChanged} preUrl=${preSnap.url} postUrl=${postSnap.url} preDomHash=${preSnap.domHash} postDomHash=${postSnap.domHash} reqMs=${reqMs}ms`);
+        continue;
+      }
+      console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=stale_snapshot_matches_completed_step_deferred_to_dedup_guard`);
     }
 
     const cycleMs = Date.now() - tCycleStart;
@@ -912,31 +971,12 @@ async function _runPlanLoopInternal(tabId, myGen) {
     // changed is correctly let through. domHashBefore (and pendingStep.domHashBefore)
     // remain as fallbacks only for older session records that predate domHashAfter.
     {
-      const recentCompleted = freshSession.completedSteps.slice(-3);
-      const currentSnap     = capturePageSnapshot('');
-      const targetText      = (plannerStep.targetElement?.text || '').trim().toLowerCase();
-      const planIntent      = (plannerStep.intent || '').trim().toLowerCase();
+      const currentSnap = capturePageSnapshot('');
+      const targetText  = (plannerStep.targetElement?.text || '').trim().toLowerCase();
+      const dedup = matchesCompletedStep(freshSession.completedSteps, freshSession.pendingStep, plannerStep, currentSnap);
 
-      const matchingCompleted = recentCompleted.slice().reverse().find(step => {
-        const stepIntent  = (step.intent || '').trim().toLowerCase();
-        const stepDesc    = (step.description || '').trim().toLowerCase();
-        const intentMatch = stepIntent && (stepIntent === planIntent || stepDesc.includes(planIntent) || planIntent.includes(stepIntent));
-        const textMatch   = targetText && stepDesc.toLowerCase().includes(targetText);
-        return intentMatch || textMatch;
-      });
-
-      if (matchingCompleted) {
-        const urlSame = currentSnap.url === matchingCompleted.urlBefore;
-        let domHashSame;
-        if (matchingCompleted.domHashAfter != null) {
-          domHashSame = currentSnap.domHash === matchingCompleted.domHashAfter;
-        } else if (matchingCompleted.domHashBefore != null) {
-          domHashSame = currentSnap.domHash === matchingCompleted.domHashBefore;
-        } else if (freshSession.pendingStep?.domHashBefore != null) {
-          domHashSame = currentSnap.domHash === freshSession.pendingStep.domHashBefore;
-        } else {
-          domHashSame = false;
-        }
+      if (dedup) {
+        const { matchingCompleted, urlSame, domHashSame } = dedup;
 
         console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" target="${targetText}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${matchingCompleted.domHashAfter ?? matchingCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
 

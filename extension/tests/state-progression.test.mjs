@@ -1145,7 +1145,354 @@ test('Dedup guard (domHashAfter): genuinely new change Y→Z after completion �
   }
 });
 
-// ── 23. MULTI-STEP CONTINUATION — the full production bug, end to end ─────────
+// ── 23. STALE_PLAN / dedup interaction — confirmed root cause of the
+// "stuck on Planning..." symptom that survived the domHashAfter fix (9f306a7) ─
+//
+// Confirmed via a controlled, instrumented reproduction before this fix: when
+// the page looks different between preSnap (captured right before a planner
+// round trip) and postSnap (captured right after) — not because a genuinely
+// new action happened, but because the page was transiently unsettled and has
+// landed back on EXACTLY the completed step's own post-completion state
+// (domHashAfter) by the time postSnap is captured — STALE_PLAN discarded the
+// response outright, every single cycle, and the dedup guard never got a
+// turn. The loop instead burned through the much larger, more expensive
+// plannerAttemptCount budget (10 + 2×completedSteps — 12 here) instead of the
+// fast, cheap 3-attempt stepAttemptCount cap: 11 wasted planner round trips
+// before failing with "Global planner call limit reached (12/12)", confirmed
+// empirically, vs. 3 with this fix.
+//
+// These tests mock DecisionRouter.route() to simulate exactly that shape of
+// transient settling churn; everything else (session storage, the plan loop,
+// the dedup guard, the STALE_PLAN check) runs as it does in production.
+
+function mockSettlingRoute(intent, description, targetText, settledTexts) {
+  // Deliberately synchronous and free of any setTimeout/scheduled callback —
+  // an earlier version scheduled a delayed re-unsettle here, which could
+  // still be pending (and fire) after this test's own await chain finished,
+  // corrupting shared module-level DOM-hash state for a LATER test. The test
+  // body seeds the page as "unsettled" once, before the first call; settling
+  // it here (synchronously, every call) reproduces the real shape of the bug
+  // for at least the first cycle (preSnap, captured before this call, still
+  // saw the unsettled seed) without ever leaving anything scheduled behind.
+  return async function () {
+    setDomHash(settledTexts);
+    return {
+      layer: 'deterministic', layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK', state: 'planned', confidence: 0.9,
+        plan: { goalType: 'action', confidence: 0.9, steps: [{
+          id: 1, description, intent, completionCondition: 'dom_change',
+          targetElement: { text: targetText, type: 'button' },
+          expectedPageState: { urlChanges: false },
+        }] },
+      },
+    };
+  };
+}
+
+test('A: settling DOM churn during round trip reaches the dedup guard instead of exhausting the planner-call budget', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  const settledTexts = ['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist'];
+  setDomHash(['Explore', 'Marketplace', 'Pricing']);
+  const domHashBefore = currentDomHash();
+  setDomHash(settledTexts);
+  const domHashAfter = currentDomHash();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = mockSettlingRoute(
+    'open_create_menu', 'Click the + button in the top navigation', '+', settledTexts
+  );
+
+  const stepAttemptResults    = [];
+  const origIncStep = SessionStore.incrementStepAttempt.bind(SessionStore);
+  SessionStore.incrementStepAttempt = async (tabId) => {
+    const r = await origIncStep(tabId);
+    stepAttemptResults.push(r);
+    return r;
+  };
+  const plannerAttemptResults = [];
+  const origIncPlannerOnly = SessionStore.incrementPlannerAttemptOnly.bind(SessionStore);
+  SessionStore.incrementPlannerAttemptOnly = async (tabId) => {
+    const r = await origIncPlannerOnly(tabId);
+    plannerAttemptResults.push(r);
+    return r;
+  };
+  const staleDiscardLines = [];
+  const dedupFiredLines   = [];
+  const origLog  = console.log;
+  const origWarn = console.warn;
+  console.log = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('STALE_PLAN discarded')) staleDiscardLines.push(s);
+    origLog(...args);
+  };
+  console.warn = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('Dedup guard FIRED')) dedupFiredLines.push(s);
+    origWarn(...args);
+  };
+
+  try {
+    await SessionStore.create(TAB, 'how to create a new repo');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click the + button in the top navigation',
+      intent:                'open_create_menu',
+      completionCondition:  'dom_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com',
+      domHashAfter,
+      completedAt:           Date.now() - 500,
+    });
+    setDomHash([...settledTexts, 'transient-blip']); // unsettled — what the first preSnap sees
+
+    const restore = stubLoad(6);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(dedupFiredLines.length > 0,
+      'REGRESSION: the dedup guard must get a turn instead of STALE_PLAN silently discarding every repeat');
+
+    const stepLimitHit    = stepAttemptResults.some((r) => r.isStuck);
+    const plannerLimitHit = plannerAttemptResults.some((r) => r.isStuck);
+    assert.ok(stepLimitHit,
+      'the fast 3-attempt step-attempt limit must be what catches this, not the planner-call budget');
+    assert.ok(!plannerLimitHit,
+      `must NOT exhaust the much larger planner-call budget — plannerAttemptResults: ${JSON.stringify(plannerAttemptResults)}`);
+    assert.ok(plannerAttemptResults.length <= 4,
+      `only a few planner round trips should occur before the fast step limit fires — got ${plannerAttemptResults.length}`);
+  } finally {
+    DecisionRouter.prototype.route            = origRoute;
+    SessionStore.incrementStepAttempt         = origIncStep;
+    SessionStore.incrementPlannerAttemptOnly  = origIncPlannerOnly;
+    console.log  = origLog;
+    console.warn = origWarn;
+  }
+});
+
+test('B: a genuine new state (Y→Z) after completion is NOT incorrectly deferred to the dedup guard', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  const settledY = ['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist'];
+  const genuineZ = ['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist', 'New organization', 'Import repository'];
+
+  setDomHash(['Explore', 'Marketplace', 'Pricing']);
+  const domHashBefore = currentDomHash();
+  setDomHash(settledY);
+  const domHashAfter = currentDomHash(); // Y — the completed step's own post-completion state
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = async () => {
+    // Round trip resolves with the page in a GENUINELY different state (Z),
+    // not the completed step's own Y — this must NOT be mistaken for the
+    // "settled back to Y" case.
+    setDomHash(genuineZ);
+    return {
+      layer: 'deterministic', layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK', state: 'planned', confidence: 0.9,
+        plan: { goalType: 'action', confidence: 0.9, steps: [{
+          id: 1, description: 'Click the + button in the top navigation',
+          intent: 'open_create_menu', completionCondition: 'dom_change',
+          targetElement: { text: '+', type: 'button' },
+          expectedPageState: { urlChanges: false },
+        }] },
+      },
+    };
+  };
+
+  const staleDiscardLines = [];
+  const deferredLines     = [];
+  const origLog = console.log;
+  console.log = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('STALE_PLAN discarded')) staleDiscardLines.push(s);
+    if (s.includes('deferred_to_dedup_guard')) deferredLines.push(s);
+    origLog(...args);
+  };
+
+  try {
+    await SessionStore.create(TAB, 'how to create a new repo');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click the + button in the top navigation',
+      intent:                'open_create_menu',
+      completionCondition:  'dom_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com',
+      domHashAfter,
+      completedAt:           Date.now() - 500,
+    });
+    setDomHash(settledY); // preSnap sees Y, the round trip lands on genuinely new Z
+
+    const restore = stubLoad(2);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(staleDiscardLines.length > 0,
+      'a genuinely different post-round-trip state must still be discarded as stale');
+    assert.equal(deferredLines.length, 0,
+      'must NOT be deferred to the dedup guard — it does not match the completed step\'s own post-completion state');
+  } finally {
+    DecisionRouter.prototype.route = origRoute;
+    console.log = origLog;
+  }
+});
+
+test('C: STALE_PLAN for a response unrelated to any completed step is discarded exactly as before', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  setDomHash(['Explore', 'Marketplace', 'Pricing']);
+  const domHashBefore = currentDomHash();
+  setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']);
+  const domHashAfter = currentDomHash();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = async () => {
+    // A genuine navigation happened mid-flight — url changes and the proposed
+    // step is unrelated to anything already completed.
+    setUrl('https://example.com/settings');
+    return {
+      layer: 'deterministic', layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK', state: 'planned', confidence: 0.9,
+        plan: { goalType: 'action', confidence: 0.9, steps: [{
+          id: 1, description: 'Click Save preferences',
+          intent: 'save_preferences', completionCondition: 'dom_change',
+          targetElement: { text: 'Save', type: 'button' },
+          expectedPageState: { urlChanges: false },
+        }] },
+      },
+    };
+  };
+
+  const staleDiscardLines = [];
+  const deferredLines     = [];
+  const origLog = console.log;
+  console.log = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('STALE_PLAN discarded')) staleDiscardLines.push(s);
+    if (s.includes('deferred_to_dedup_guard')) deferredLines.push(s);
+    origLog(...args);
+  };
+
+  try {
+    await SessionStore.create(TAB, 'how to create a new repo');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click the + button in the top navigation',
+      intent:                'open_create_menu',
+      completionCondition:  'dom_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com',
+      domHashAfter,
+      completedAt:           Date.now() - 500,
+    });
+
+    const restore = stubLoad(2);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(staleDiscardLines.length > 0, 'an unrelated navigation mid-flight must still be discarded as stale');
+    assert.equal(deferredLines.length, 0, 'must not be deferred — it does not match any completed step at all');
+  } finally {
+    DecisionRouter.prototype.route = origRoute;
+    console.log = origLog;
+  }
+});
+
+// ── D: matchesCompletedStep must compare against the completed step's own
+// destination (urlAfter), not its starting point (urlBefore) ─────────────────
+//
+// For a navigation-causing completed step, urlBefore and urlAfter genuinely
+// differ (the step navigated FROM one page TO another). The current page,
+// after that step completed, correctly sits at urlAfter — comparing against
+// urlBefore instead would wrongly conclude the URL "changed" (relative to a
+// baseline the page was never expected to still be on), causing a repeat of
+// that same step to be misclassified as genuinely stale/new instead of being
+// recognized and handled by the dedup guard.
+
+test('D: urlAfter (not urlBefore) is the correct baseline for a navigation-causing completed step', async () => {
+  clearStore();
+  __resetState();
+
+  const settledTexts = ['Repository name', 'Description', 'Create repository'];
+  setDomHash(['Explore', 'Marketplace', 'Pricing']);
+  const domHashBefore = currentDomHash();
+  setDomHash(settledTexts);
+  const domHashAfter = currentDomHash();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = mockSettlingRoute(
+    'navigate_to_new_repo_form', 'Click New repository', 'New repository', settledTexts
+  );
+
+  const stepAttemptResults = [];
+  const origIncStep = SessionStore.incrementStepAttempt.bind(SessionStore);
+  SessionStore.incrementStepAttempt = async (tabId) => {
+    const r = await origIncStep(tabId);
+    stepAttemptResults.push(r);
+    return r;
+  };
+  const dedupFiredLines   = [];
+  const staleDiscardLines = [];
+  const origWarn = console.warn;
+  const origLog  = console.log;
+  console.warn = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('Dedup guard FIRED')) dedupFiredLines.push(s);
+    origWarn(...args);
+  };
+  console.log = (...args) => {
+    const s = args.join(' ');
+    if (s.includes('STALE_PLAN discarded')) staleDiscardLines.push(s);
+    origLog(...args);
+  };
+
+  try {
+    // The completed step navigated FROM example.com TO the new-repo form —
+    // urlBefore and urlAfter genuinely differ. The page is currently sitting
+    // at urlAfter, exactly where that step left it.
+    setUrl('https://example.com/new');
+    await SessionStore.create(TAB, 'how to create a new repo');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click New repository',
+      intent:                'navigate_to_new_repo_form',
+      completionCondition:  'url_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com/new',
+      domHashAfter,
+      completedAt:           Date.now() - 500,
+    });
+    setDomHash([...settledTexts, 'transient-blip']); // unsettled — what the first preSnap sees
+
+    const restore = stubLoad(6);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(dedupFiredLines.length > 0,
+      'REGRESSION: the repeated proposal must reach and be blocked by the dedup guard');
+    assert.equal(staleDiscardLines.length, 0,
+      'must NOT be treated as stale merely because the current URL differs from urlBefore — it correctly matches urlAfter');
+    assert.ok(stepAttemptResults.some((r) => r.isStuck),
+      'the fast step-attempt limit must be what catches this');
+  } finally {
+    DecisionRouter.prototype.route    = origRoute;
+    SessionStore.incrementStepAttempt = origIncStep;
+    console.warn = origWarn;
+    console.log  = origLog;
+  }
+});
+
+// ── 24. MULTI-STEP CONTINUATION — the full production bug, end to end ─────────
 //
 // Reproduces the reported production issue and its fix, end to end, through the
 // real orchestrator code (_bootstrapSession → classifyNavigation →
