@@ -780,7 +780,14 @@ test('GitHub + menu scenario: REFRESH+DOM-changed completes step and advances to
 //   - URL unchanged
 //   - BUT domHash DID change (menu opened)
 
-test('Dedup guard: same intent + URL unchanged + DOM changed → guard does NOT fire', async () => {
+// NOTE: this test intentionally stores ONLY domHashBefore on the completed-step
+// record (no domHashAfter) — it now exercises the LEGACY FALLBACK path the dedup
+// guard falls back to for a completed-step record that predates the domHashAfter
+// fix below (see the "sticky same-page effect" tests further down for the
+// primary, now-fixed behavior). For an old-schema record, comparing against
+// domHashBefore is still exactly what happens, and this is a real (if narrow)
+// trade-off: an old-schema record genuinely cannot benefit from the fix.
+test('Dedup guard (legacy domHashBefore-only fallback): same intent + URL unchanged + DOM changed since BEFORE the click → guard does NOT fire', async () => {
   clearStore();
   setUrl('https://github.com');
   __resetState();
@@ -795,21 +802,23 @@ test('Dedup guard: same intent + URL unchanged + DOM changed → guard does NOT 
 
   assert.notEqual(domHashBefore, domHashAfter, 'pre-condition: DOM hashes must differ');
 
-  // Session with "+" step already completed, domHashBefore stored
+  // Session with "+" step already completed, domHashBefore stored, domHashAfter
+  // absent (old-schema record).
   await SessionStore.create(TAB, 'how to create a new repo');
   await SessionStore.completeStep(TAB, {
     description:    'Click the + button in the top navigation',
     intent:         'open_create_menu',
     completionCondition: 'dom_change',
     urlBefore:      'https://github.com',
-    domHashBefore,   // ← the key fix: domHashBefore stored on completed step record
+    domHashBefore,   // ← domHashAfter intentionally omitted (old-schema record)
     urlAfter:       'https://github.com',
     completedAt:    Date.now() - 1000,
   });
   // pendingStep is null (cleared by completeStep)
 
   // The dedup guard compares currentDomHash (menu open = domHashAfter)
-  // against latestCompleted.domHashBefore (pre-click = domHashBefore).
+  // against latestCompleted.domHashBefore (pre-click = domHashBefore), since
+  // domHashAfter is absent on this record.
   // They differ → domHashSame = false → guard must NOT fire.
   // Verify by checking that stepAttemptCount stays at 0 after the guard evaluates.
 
@@ -842,9 +851,11 @@ test('Dedup guard: same intent + URL unchanged + DOM changed → guard does NOT 
 // ── 18. Dedup guard: same intent + URL unchanged + DOM unchanged → fires ───────
 //
 // Opposite case: planner returned same step and the page state genuinely didn't
-// change (e.g. click had no effect). The guard SHOULD fire here.
+// change (e.g. click had no effect). The guard SHOULD fire here. Also doubles as
+// a backward-compatibility check: this record has no domHashAfter either, so it
+// exercises the same legacy domHashBefore fallback as the test above.
 
-test('Dedup guard: same intent + URL unchanged + DOM unchanged → guard fires', async () => {
+test('Dedup guard (legacy domHashBefore-only fallback): same intent + URL unchanged + DOM unchanged → guard fires', async () => {
   clearStore();
   setUrl('https://github.com');
 
@@ -985,7 +996,156 @@ test('computeExpectedNavigationFromElement: javascript: href → urlChanges:fals
   assert.deepEqual(nav, { urlChanges: false });
 });
 
-// ── 22. MULTI-STEP CONTINUATION — the full production bug, end to end ─────────
+// ── 22. Dedup guard (domHashAfter) — sticky same-page effect / stale-step loop ──
+//
+// Reproduces the reported production bug: after a "+"-style step succeeds and
+// opens a menu (a STICKY effect — the menu stays open across cycles), the
+// planner keeps proposing the exact same step again. Before the fix, the dedup
+// guard compared the current DOM hash against domHashBefore (the pre-click
+// baseline), which is permanently different from the post-click "menu open"
+// state, so the guard always waved the repeat through. With domHashAfter now
+// recorded at completion time, a cycle where nothing has changed since the
+// step's own completion is correctly recognized as a no-op repeat and blocked
+// — while a cycle where something genuinely new happened is still allowed.
+//
+// Driven through the real orchestrator (_bootstrapSession → _runPlanLoop →
+// DecisionRouter.route → the dedup guard) with only DecisionRouter.route
+// mocked (planning is unrelated to this fix); window.DOMMatcher is left null
+// so an ALLOWED step fails fast at "element_not_found" rather than needing a
+// full ExecutorEngine simulation — irrelevant to what's under test here, which
+// is whether the guard lets _runPlanLoopInternal reach SessionStore.setPhase
+// (tabId, "EXECUTING") for the repeated step at all.
+
+function mockRepeatedStepRoute(intent, description, targetText) {
+  return async function () {
+    return {
+      layer: 'deterministic',
+      layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK', state: 'planned', confidence: 0.9,
+        plan: {
+          goalType: 'action', confidence: 0.9,
+          steps: [{
+            id: 1, description, intent,
+            completionCondition: 'dom_change',
+            targetElement: { text: targetText, type: 'button' },
+            expectedPageState: { urlChanges: false },
+          }],
+        },
+      },
+    };
+  };
+}
+
+test('Dedup guard (domHashAfter): sticky same-page effect X→Y, DOM still Y → repeated proposal is BLOCKED', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = mockRepeatedStepRoute(
+    'open_create_menu', 'Click the + button in the top navigation', '+'
+  );
+
+  const setPhaseCalls = [];
+  const origSetPhase = SessionStore.setPhase.bind(SessionStore);
+  SessionStore.setPhase = async (tabId, phase) => {
+    setPhaseCalls.push(phase);
+    return origSetPhase(tabId, phase);
+  };
+
+  const incrementCalls = { step: 0 };
+  const origIncrementStepAttempt = SessionStore.incrementStepAttempt.bind(SessionStore);
+  SessionStore.incrementStepAttempt = async (tabId) => {
+    incrementCalls.step++;
+    return origIncrementStepAttempt(tabId);
+  };
+
+  try {
+    setDomHash(['Explore', 'Marketplace', 'Pricing']);           // X — before the click
+    const domHashBefore = currentDomHash();
+    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']); // Y — menu opened
+    const domHashAfter = currentDomHash();
+
+    await SessionStore.create(TAB, 'open the create menu');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click the + button in the top navigation',
+      intent:                'open_create_menu',
+      completionCondition:  'dom_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com',
+      domHashAfter,          // the fix: post-completion state recorded
+      completedAt:           Date.now() - 500,
+    });
+    // DOM stays exactly at Y — the menu is still open, nothing further happened
+    // (setDomHash was left at the "menu opened" list above).
+
+    const restore = stubLoad(3);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(!setPhaseCalls.includes('EXECUTING'),
+      `REGRESSION: dedup guard failed to block a repeat of an already-completed sticky step — setPhase calls: ${setPhaseCalls.join(', ')}`);
+    assert.ok(incrementCalls.step > 0, 'the dedup guard\'s own retry path must have run');
+  } finally {
+    DecisionRouter.prototype.route      = origRoute;
+    SessionStore.setPhase               = origSetPhase;
+    SessionStore.incrementStepAttempt   = origIncrementStepAttempt;
+  }
+});
+
+test('Dedup guard (domHashAfter): genuinely new change Y→Z after completion → repeated-looking proposal is ALLOWED', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = mockRepeatedStepRoute(
+    'open_create_menu', 'Click the + button in the top navigation', '+'
+  );
+
+  const setPhaseCalls = [];
+  const origSetPhase = SessionStore.setPhase.bind(SessionStore);
+  SessionStore.setPhase = async (tabId, phase) => {
+    setPhaseCalls.push(phase);
+    return origSetPhase(tabId, phase);
+  };
+
+  try {
+    setDomHash(['Explore', 'Marketplace', 'Pricing']);
+    const domHashBefore = currentDomHash();
+    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']);
+    const domHashAfter = currentDomHash();
+
+    await SessionStore.create(TAB, 'open the create menu');
+    await SessionStore.completeStep(TAB, {
+      description:          'Click the + button in the top navigation',
+      intent:                'open_create_menu',
+      completionCondition:  'dom_change',
+      urlBefore:             'https://example.com',
+      domHashBefore,
+      urlAfter:              'https://example.com',
+      domHashAfter,
+      completedAt:           Date.now() - 500,
+    });
+    // Something further changed since completion (e.g. a sub-menu expanded) —
+    // current DOM (Z) no longer matches domHashAfter (Y).
+    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist', 'New organization', 'Import repository']);
+
+    const restore = stubLoad(2);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.ok(setPhaseCalls.includes('EXECUTING'),
+      `the guard must allow the step through when the DOM has genuinely changed since completion — setPhase calls: ${setPhaseCalls.join(', ')}`);
+  } finally {
+    DecisionRouter.prototype.route = origRoute;
+    SessionStore.setPhase          = origSetPhase;
+  }
+});
+
+// ── 23. MULTI-STEP CONTINUATION — the full production bug, end to end ─────────
 //
 // Reproduces the reported production issue and its fix, end to end, through the
 // real orchestrator code (_bootstrapSession → classifyNavigation →

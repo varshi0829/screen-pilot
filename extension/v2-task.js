@@ -422,6 +422,13 @@ function buildPendingStepContext(step) {
   };
 }
 function buildStepRecord(pendingStep) {
+  // Captured now (the step is already confirmed complete on this code path) so the
+  // dedup guard below can tell "still sitting in this step's own post-completion
+  // state" apart from "something genuinely new happened since" — see its comment.
+  // Degrade-safe: matches the existing capturePageSnapshot() try/catch convention
+  // elsewhere in this file (mock/headless environments without a live DOM).
+  let domHashAfter = null;
+  try { domHashAfter = capturePageSnapshot('').domHash ?? null; } catch { /* mock/headless fallback */ }
   return {
     description: pendingStep.description,
     intent: pendingStep.intent,
@@ -429,6 +436,7 @@ function buildStepRecord(pendingStep) {
     urlBefore: pendingStep.urlBefore,
     domHashBefore: pendingStep.domHashBefore ?? null,  // carry through for dedup guard
     urlAfter: window.location.href,
+    domHashAfter,
     completedAt: Date.now()
   };
 }
@@ -879,8 +887,8 @@ async function _runPlanLoopInternal(tabId, myGen) {
 
     // ── Deduplication guard ───────────────────────────────────────────────────
     // If the planner returned the same intent as the most recently completed step,
-    // AND the current page state is identical to the pre-action baseline of that step,
-    // the action did not advance the workflow — do NOT re-execute it.
+    // AND the current page state is identical to that step's OWN post-completion
+    // state, the action did not advance the workflow any further — do NOT re-execute it.
     //
     // This catches the case where the planner ignores completedSteps and returns
     // the same step again (e.g. "open_create_menu" after the menu already opened).
@@ -888,13 +896,21 @@ async function _runPlanLoopInternal(tabId, myGen) {
     // A re-execution IS allowed when:
     //   (a) the intent differs from the last completed step, OR
     //   (b) the URL has changed since that step ran, OR
-    //   (c) the domHash has changed since that step ran (menu opened, modal appeared, etc.)
+    //   (c) the domHash has changed since that step FINISHED (something new happened)
     //
     // Critical: the fallback for domHash comparison must NOT be urlSame. GitHub's "+"
     // menu opens without a URL change, so urlSame=true even when the state DID change.
-    // We use latestCompleted.domHashBefore (stored when the step completed) to compare
-    // against the current domHash. If the DOM changed, the step genuinely advanced state
-    // and the planner should return a different next step — let it through.
+    //
+    // Compare against domHashAfter (captured once the step was confirmed complete),
+    // NOT domHashBefore (the pre-click baseline) — a STICKY effect like an opened menu
+    // makes "current domHash != domHashBefore" true forever once the very first click
+    // succeeds, which used to make this guard permanently think every later cycle was
+    // "new" and wave through an endless re-click of the same already-open menu. Once
+    // the step's own post-completion state (domHashAfter) is what we're comparing
+    // against, a later cycle that's still sitting in that same state is correctly
+    // recognized as a no-op repeat, while a cycle where something genuinely further
+    // changed is correctly let through. domHashBefore (and pendingStep.domHashBefore)
+    // remain as fallbacks only for older session records that predate domHashAfter.
     {
       const recentCompleted = freshSession.completedSteps.slice(-3);
       const currentSnap     = capturePageSnapshot('');
@@ -912,7 +928,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
       if (matchingCompleted) {
         const urlSame = currentSnap.url === matchingCompleted.urlBefore;
         let domHashSame;
-        if (matchingCompleted.domHashBefore != null) {
+        if (matchingCompleted.domHashAfter != null) {
+          domHashSame = currentSnap.domHash === matchingCompleted.domHashAfter;
+        } else if (matchingCompleted.domHashBefore != null) {
           domHashSame = currentSnap.domHash === matchingCompleted.domHashBefore;
         } else if (freshSession.pendingStep?.domHashBefore != null) {
           domHashSame = currentSnap.domHash === freshSession.pendingStep.domHashBefore;
@@ -920,7 +938,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
           domHashSame = false;
         }
 
-        console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" target="${targetText}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${matchingCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
+        console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" target="${targetText}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${matchingCompleted.domHashAfter ?? matchingCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
 
         if (urlSame && domHashSame) {
           console.warn(
@@ -1115,6 +1133,11 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
         urlBefore: pre?.url ?? window.location.href,
         domHashBefore: pre?.domHash ?? null,   // stored so dedup guard works post-completion
         urlAfter: post.url,
+        // Captured post-action, before this step is (correctly) recorded complete — lets
+        // the dedup guard tell "still in this step's own post-completion state" apart
+        // from "something new happened since" (see the guard's comment for why this
+        // matters for a STICKY effect like a menu that stays open across cycles).
+        domHashAfter: post.domHash ?? null,
         completedAt: Date.now()
       });
       // Phase 23C shadow trigger: STEP_COMPLETED. legacyComplete reflects whether the
