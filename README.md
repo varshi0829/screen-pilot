@@ -1,201 +1,114 @@
-# ScreenPilot
+# ScreenPilot V2 — Local-First Hierarchical Browser Agent
 
-A Chrome extension that guides users through any web software step by step. Click the icon on any tab, type what you want to do, and ScreenPilot captures the page, sends it to Gemini 2.5 Flash, and puts a pulsing highlight on exactly what to click next.
+ScreenPilot is a Chrome extension that guides a user through any web app step by step — it observes the live page, decides the next single action toward a stated goal, and highlights exactly what to click. No chat interface, no per-site configuration, no hardcoded workflows.
 
-Requires a Gemini API key for backend requests. No per-site configuration. No hardcoded workflows.
+V2 evolves the project into a **local-first, hierarchical browser agent**: instead of sending every webpage and interaction to cloud LLM providers, it routes each decision through a 3-tier local cascade — deterministic matching, then a small local ranking model, then a locally-hosted LLM — for zero API cost, instant response times, full privacy, and offline operation, only escalating to cloud when local resolution isn't available.
+
+**→ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical breakdown** (decision cascade, core components, and the specific failure modes each safeguard exists to prevent).
 
 ---
 
-## How it works
+## 🚀 How V2 Local Hierarchy Works
 
 ```
-User types goal
-      ↓
-Content script captures visible tab (captureVisibleTab)
-      ↓
-Background worker sends screenshot + URL + goal to backend
-      ↓
-Backend (Next.js API route on Vercel) calls Gemini 2.5 Flash
-      ↓
-Gemini returns: candidates[], targetElement, instruction, confidence
-      ↓
-UniversalPlanner ranks candidates by 8 generic DOM signals
-      ↓
-DOMMatcher resolves best candidate against live DOM
-      ↓
-Highlight ring + arrow + instruction bubble appear over the element
-      ↓
-MutationObserver watches for DOM changes → re-plans automatically
+                         USER GOAL
+                             ↓
+              PAGE STATE EXTRACTION (Generic Normalized JSON)
+                             ↓
+               ┌───────────────────────────┐
+               │ 1. FAST LOCAL PATH        │
+               │ Deterministic DOMMatcher  │ (<5ms)
+               └─────────────┬─────────────┘
+                             ↓
+                      Confidence High? (>= 0.85)
+                        /         \
+                      YES           NO
+                       ↓             ↓
+                   [EXECUTE]   ┌───────────────────────────┐
+                               │ 2. SMALL UI GROUNDING MODEL│
+                               │ Feature/Relevance Scorer  │ (<15ms)
+                               └─────────────┬─────────────┘
+                                             ↓
+                                      Confidence High? (>= 0.70)
+                                        /         \
+                                      YES           NO
+                                       ↓             ↓
+                                   [EXECUTE]   ┌───────────────────────────┐
+                                               │ 3. LOCAL QWEN PLANNER     │
+                                               │ Ollama qwen2.5-coder:7b   │ (~1.5s–2.5s)
+                                               └─────────────┬─────────────┘
+                                                             ↓
+                                                       1-Action JSON
+                                                             ↓
+                                                    [EXECUTOR ENGINE]
+                                                             ↓
+                                                    [LIVE BROWSER DOM]
+                                                             ↓
+                                                    [GOAL VERIFIER]
+                                                             ↓
+                                                      Goal Complete?
+                                                        /         \
+                                                      YES           NO
+                                                       ↓             ↓
+                                                    [DONE]      [REPLAN 1-ACTION]
 ```
 
 ---
 
-## Install the extension (for users)
+## 🎯 Core Features of ScreenPilot V2
 
-1. Download `screenpilot-extension.zip` from the landing page
-2. Go to `chrome://extensions/`
-3. Enable **Developer mode** (top right)
-4. Click **Load unpacked**
-5. Select the extracted `extension/` folder — the one containing `manifest.json`
-6. Open any webpage, click the ScreenPilot icon, type your goal
+- **Local-First & Offline Capable**: Runs locally using Ollama (`qwen2.5-coder:7b`) with zero cloud dependencies when `PLANNER_MODE = 'local'`.
+- **Website-Agnostic**: Operates dynamically on arbitrary, unseen websites without hardcoded selectors, URLs, or domain rules.
+- **1-Action Iterative Planning**: Evaluates 1 action per iteration to prevent stale multi-step plan execution.
+- **Stale Plan Protection**: Pre/post DOM snapshot comparison (`preSnap` vs `postSnap`) automatically aborts stale in-flight requests.
+- **Condition-Based Verification**: Post-action state verification uses 150ms condition-based polling instead of fixed sleeps.
 
 ---
 
-## Run locally (for developers)
+## 🛠 Local Setup & Running
 
-### Backend
+### 1. Prerequisites
+- **Node.js**: v18+ (tested on v22.18.0)
+- **Local LLM Runtime**: [Ollama](https://ollama.com/) running at `http://127.0.0.1:11434`
+- **Downloaded Model**: `ollama pull qwen2.5-coder:7b`
 
+### 2. Build Extension Bundles & Run Tests
 ```bash
-# Clone the repo
-git clone https://github.com/varshi0829/screen-pilot.git
-cd screen-pilot
-
 # Install dependencies
 npm install
 
-# Create .env.local with your Gemini key
-# Get a free key at: https://aistudio.google.com/apikey
-echo "GEMINI_API_KEY=your_key_here" > .env.local
+# Run unit test suite (252 tests passing)
+node --test extension/tests/*.test.mjs
 
-# Start dev server
-npm run dev
-# Landing page: http://localhost:3000
-# API endpoint: http://localhost:3000/api/analyze
+# Build Chrome Extension bundles
+npm run build:ext
+
+# Next.js app build
+npm run build
 ```
 
-### Extension
-
-Point the extension at your local backend while developing:
-
-In `extension/services/vision-service.js`, change:
-```js
-const BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
-// → 
-const BACKEND_URL = 'http://localhost:3000/api/analyze';
-```
-
-Then load the `extension/` folder via `chrome://extensions/ → Load unpacked`.
-
-You can also change the backend URL from the extension popup:
-
-1. Open ScreenPilot
-2. Go to `Settings`
-3. Set `Backend URL` to your local or deployed endpoint
+### 3. Load the Extension in Chrome
+1. Open `chrome://extensions`, enable **Developer mode**.
+2. Click **Load unpacked** and select the `extension/` directory.
+3. Click the ScreenPilot icon on any tab, type a goal (e.g. "search for wireless headphones"), and it highlights the next action.
 
 ---
 
-## Deploy to Vercel
+## 📚 Documentation Index (`docs/`)
 
-1. Push to GitHub
-2. Import the repo in Vercel (no Root Directory setting needed — Next.js is at the repo root)
-3. Add environment variable: `GEMINI_API_KEY = your_key`
-4. Deploy
-
----
-
-## Architecture
-
-### Application-agnostic design
-
-ScreenPilot has no built-in knowledge of any website or application. Every decision is derived from:
-
-- The current screenshot (what Gemini sees)
-- The DOM state (what elements are actually present)
-- The user's goal (plain English)
-- The history of completed steps
-
-There are no `if (url.includes('gmail'))` branches. No per-site element selectors. No hardcoded step sequences.
-
-### Backend (`src/app/api/analyze/route.ts`)
-
-- Receives `{ screenshot, goal, pageContext, taskState }` from the extension
-- Builds the Gemini prompt server-side (never exposes the API key)
-- Rate-limits requests per session UUID; the analyzer route currently uses a higher dev limit than the public launch target
-- Returns Gemini's raw response; parsing stays in the extension
-
-### Content script (`extension/content.js`)
-
-- **Widget**: Floating UI injected into the active tab
-- **PerfTracer**: Measures each phase of a cycle (cache hit / Gemini round-trip / DOM match / highlight) and prints a structured table in DevTools
-- **PageStateCache**: Caches the last Gemini response keyed by `URL + goal + DOM fingerprint`. Invalidated when the DOM changes or after 25 seconds. Prevents redundant API calls on repeated `Go` with identical page state.
-- **UniversalPlanner**: Ranks Gemini's `candidates[]` using 8 generic signals: Gemini confidence, DOM match score, clickability, semantic similarity, visibility, action type weight, region weight, visual prominence
-- **PageObserver**: `MutationObserver` + popstate/hashchange — triggers re-analysis on DOM changes, automatically invalidating the cache
-
-### DOM Matcher (`extension/lib/dom-matcher.js`)
-
-Resolves an element description to a live DOM node using:
-
-- Exact text match (score 110)
-- Synonym match via generic synonym table (score 102)
-- Token similarity / reordering (score 72–98)
-- Substring containment (score 70)
-- Levenshtein distance ≤ 2 (score 48–64)
-- Semantic container context bonus (+10–18)
-- Element type affinity bonus (+10)
-
-Synonym table contains only generic UI verbs (`upload/attach`, `submit/send/confirm`, `cancel/dismiss`, etc.) — no application names.
-
-### Performance profile
-
-Open Chrome DevTools → Console on any page where ScreenPilot runs and look for:
-
-```
-[ScreenPilot Perf] 3842ms — "schedule an email for tomorrow"
-┌─────────────────────┬──────────────────┬──────────────────┐
-│ phase               │ ms (cumulative)  │ ms (this phase)  │
-├─────────────────────┼──────────────────┼──────────────────┤
-│ gemini_roundtrip    │ 3761             │ 3761             │
-│ dom_match           │ 3798             │ 37               │
-│ highlight           │ 3842             │ 44               │
-└─────────────────────┴──────────────────┴──────────────────┘
-```
-
-Typical breakdown: Gemini latency is ~95% of total time. Screenshot capture and compression are ~100–200ms (inside the Gemini phase). DOM matching and highlighting are negligible.
-
-The `cache_hit` phase appears instead of `gemini_roundtrip` when the page state hasn't changed:
-```
-[Cache] HIT — returning cached analysis (same URL + goal + DOM)
-[ScreenPilot Perf] 41ms — "schedule an email for tomorrow"
-```
-
----
-
-## Project structure
-
-```
-screen-pilot/
-├── extension/                  ← Chrome extension (load this folder in Chrome)
-│   ├── manifest.json           ← MV3
-│   ├── background.js           ← Service worker: orchestration
-│   ├── content.js              ← Widget, UniversalPlanner, PageStateCache, PerfTracer
-│   ├── lib/
-│   │   └── dom-matcher.js      ← DOM element resolution
-│   ├── services/
-│   │   ├── vision-service.js   ← Backend API caller
-│   │   ├── screenshot-service.js
-│   │   └── state-manager.js
-│   ├── popup/
-│   │   ├── popup.html
-│   │   └── popup.js
-│   ├── styles/widget.css
-│   └── icons/
-├── src/                        ← Next.js landing page
-│   ├── app/
-│   │   ├── api/analyze/
-│   │   │   └── route.ts        ← Gemini proxy endpoint
-│   │   ├── layout.tsx
-│   │   └── page.tsx
-│   └── components/
-├── public/
-│   ├── demo.mp4
-│   └── screenpilot-extension.zip
-├── next.config.ts
-├── package.json
-└── .env.example                ← Copy to .env.local, add GEMINI_API_KEY
-```
-
----
-
-## License
-
-MIT
+- [Architecture Overview](ARCHITECTURE.md) — start here
+- [V2 Architecture Specification](docs/V2_ARCHITECTURE.md)
+- [V2 Implementation Plan & Audit Report](docs/V2_IMPLEMENTATION_PLAN.md)
+- [V2 Functional Requirements](docs/V2_REQUIREMENTS.md)
+- [Local Qwen Integration Guide](docs/V2_LOCAL_QWEN.md)
+- [Page State Representation Schema](docs/PAGE_STATE.md)
+- [UI Grounding & Ranking Model Specification](docs/UI_GROUNDING_MODEL.md)
+- [Decision Router Specification](docs/DECISION_ROUTER.md)
+- [Qwen 1-Action Planner Specification](docs/QWEN_PLANNER.md)
+- [Execution & Verification Engine Specification](docs/EXECUTION_AND_VERIFICATION.md)
+- [Goal Verification & Contract Gate Specification](docs/GOAL_VERIFICATION.md)
+- [Performance & Benchmarking Methodology](docs/V2_PERFORMANCE.md)
+- [Testing & Quality Assurance Guide](docs/V2_TESTING.md)
+- [V1 to V2 Migration Guide](docs/V2_MIGRATION.md)
+- [V2 Changelog](docs/V2_CHANGELOG.md)
+- [Historical / superseded docs](docs/archive/)
