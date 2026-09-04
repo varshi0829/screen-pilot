@@ -7,3 +7,10 @@ out/
 .env.*.local
 .DS_Store
 tsconfig.tsbuildinfo
+.e2e-scratch/
+
+# Tool-internal logs — never repo content
+.blackbox/tmp/
+
+# Packaged/zipped extension builds — build from source via `npm run build:ext`
+*.zip
