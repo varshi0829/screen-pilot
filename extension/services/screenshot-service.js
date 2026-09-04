@@ -5,8 +5,8 @@ export const ScreenshotService = (() => {
 
   const CAPTURE_TIMEOUT_MS    = 8000;
   const MAX_CAPTURE_ATTEMPTS  = 2;
-  const MAX_WIDTH             = 1280;   // resize larger screens down
-  const JPEG_QUALITY          = 0.82;   // good fidelity, ~3-4× smaller than PNG
+  const MAX_WIDTH             = 1024;   // resize larger screens down (1024px)
+  const JPEG_QUALITY          = 0.70;   // good fidelity, optimized payload size
 
   async function captureVisibleTab(windowId) {
     let lastError = null;

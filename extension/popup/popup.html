@@ -195,6 +195,38 @@
     .sp-key-status { font-size: 11px; color: #444; }
     .sp-key-status.saved { color: #22c55e; }
     .sp-key-status.error { color: #fca5a5; }
+
+    /* ── Advanced settings (collapsed) ── */
+    .sp-advanced-toggle {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: none;
+      border: none;
+      border-top: 1px solid rgba(255,255,255,0.07);
+      padding: 12px 0 0;
+      margin-top: 4px;
+      color: #555;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+    }
+    .sp-advanced-toggle:hover { color: #999; }
+    .sp-advanced-toggle .chev { transition: transform 0.15s; }
+    .sp-advanced-toggle.open .chev { transform: rotate(90deg); }
+    .sp-advanced-body { display: none; margin-top: 12px; }
+    .sp-advanced-body.open { display: block; }
+    .sp-checkbox-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      cursor: pointer;
+    }
+    .sp-checkbox-row input { margin-top: 2px; accent-color: #cc2222; }
+    .sp-checkbox-row .sp-setting-label { margin-bottom: 2px; }
   </style>
 </head>
 <body>
@@ -285,6 +317,25 @@
         <button class="sp-btn-small outline" id="clear-backend-btn">Clear</button>
       </div>
       <div id="backend-status" class="sp-key-status"></div>
+    </div>
+
+    <button class="sp-advanced-toggle" id="advanced-toggle">
+      <span>Advanced</span>
+      <span class="chev">&rsaquo;</span>
+    </button>
+    <div class="sp-advanced-body" id="advanced-body">
+      <div class="sp-setting-group">
+        <label class="sp-checkbox-row">
+          <input type="checkbox" id="local-ai-checkbox" />
+          <span>
+            <span class="sp-setting-label" style="margin-bottom:2px;">AI Processing — Use local AI when available</span>
+            <span class="sp-setting-hint" style="margin-bottom:0;">
+              Requires Ollama and a compatible model installed on this computer.
+              If local processing is unavailable, ScreenPilot may use cloud AI instead.
+            </span>
+          </span>
+        </label>
+      </div>
     </div>
   </div>
 

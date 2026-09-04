@@ -38,10 +38,12 @@ export class BackendAdapter {
    * conditional linear ExecutionPlan with all steps upfront.
    *
    * @param {import('../shared/types/index.js').PlanRequest} request
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal] - Optional signal to abort the request
    * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
    */
-  async plan() {
-    throw new Error(`${this.name} must implement plan(request)`);
+  async plan(request, options = {}) {
+    throw new Error(`${this.name} must implement plan(request, options)`);
   }
 
   /**

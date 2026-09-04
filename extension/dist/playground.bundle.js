@@ -20,7 +20,7 @@
       if (!_isVisible(el)) continue;
       const text = (el.getAttribute("aria-label") || el.innerText || el.getAttribute("placeholder") || "").trim().slice(0, 20);
       fingerprint += `${text}|`;
-      if (++count >= 60) break;
+      if (++count >= 200) break;
     }
     return _fnv32a(fingerprint);
   }
@@ -138,12 +138,24 @@
      * @param {{ show(element: Element, text: string): Promise<boolean>, clear(): void }} deps.highlighter
      * @param {() => object} [deps.captureSnapshot]
      */
-    constructor({ domMatcher, highlighter, captureSnapshot = capturePageSnapshot } = {}) {
+    constructor({
+      domMatcher,
+      highlighter,
+      captureSnapshot = capturePageSnapshot,
+      // Bounded wait-and-retry budget for _resolveElementWithWait (see its own
+      // doc comment) — configurable so tests can use a short budget instead of
+      // the real 2s one. Defaults mirror the existing post-click URL-poll
+      // precedent elsewhere in this file (100ms interval, 2s budget).
+      elementResolvePollIntervalMs = 100,
+      elementResolveMaxWaitMs = 2e3
+    } = {}) {
       if (!domMatcher) throw new TypeError("ExecutorEngine: domMatcher is required");
       if (!highlighter) throw new TypeError("ExecutorEngine: highlighter is required");
       this._domMatcher = domMatcher;
       this._highlighter = highlighter;
       this._captureSnapshot = captureSnapshot;
+      this._elementResolvePollIntervalMs = elementResolvePollIntervalMs;
+      this._elementResolveMaxWaitMs = elementResolveMaxWaitMs;
       this._plan = null;
       this._stepIndex = 0;
       this._status = "idle";
@@ -276,7 +288,8 @@
         return;
       }
       this._preActionSnapshot = this._captureSnapshot("");
-      const resolved = this._resolveElement(step);
+      const resolved = await this._resolveElementWithWait(step);
+      if (this._status === "aborted") return;
       if (!resolved) {
         const reason = `No element matched "${step.targetElement?.text ?? "(no text)"}"`;
         if (step.optional) {
@@ -299,6 +312,10 @@
       for (let _ci = 0; _ci < allCandidates.length; _ci++) {
         const candidate = allCandidates[_ci];
         const { element, score } = candidate;
+        if (_ci > 0 && score < ElementResolutionThreshold.RECOVERY) {
+          lastFailureReason = `Candidate score ${score} below RECOVERY threshold \u2014 skipped as noise`;
+          continue;
+        }
         {
           const tag = element.tagName?.toLowerCase() ?? "?";
           const text = (element.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 50);
@@ -349,6 +366,46 @@
       });
     }
     // ── Private — element resolution ──────────────────────────────────────────
+    /**
+     * Wraps _resolveElement() with a short, bounded wait-and-retry for the case
+     * where the target genuinely doesn't exist in the DOM YET — a rendering-
+     * timing race, not a matching/scoring problem. Real-Chrome finding
+     * (vscode.dev, goal "Get started"): the FIRST resolution attempt ran
+     * ~200ms into the task, while the page's own dynamic content (a heavy
+     * client-rendered SPA) didn't finish rendering the target until ~2.8s
+     * after navigation — a generic "we searched before the page caught up"
+     * race that any sufficiently slow-rendering dynamic page can hit, not
+     * something specific to vscode.dev's markup or DOMMatcher's scoring.
+     * Mirrors the existing post-click URL-poll precedent elsewhere in this
+     * file (100ms interval, 2s budget) for the same class of "give a real SPA
+     * a moment to catch up" problem, reusing its exact timing rather than
+     * inventing a new constant.
+     *
+     * Only retries when the FIRST attempt found literally nothing — an
+     * immediate successful resolution (the overwhelmingly common case) costs
+     * nothing extra. A step still unresolved after the full budget reports
+     * element:not_found exactly as before. This is one bounded wait inside a
+     * single _executeStep() call, not a retry loop across attempts/replans.
+     *
+     * @param {import('../shared/types/index.js').PlanStep} step
+     * @returns {Promise<{ element: Element, score: number, confidence?: number } | null>}
+     */
+    async _resolveElementWithWait(step) {
+      const resolved = this._resolveElement(step);
+      if (resolved) return resolved;
+      const pollIntervalMs = this._elementResolvePollIntervalMs;
+      const maxWaitMs = this._elementResolveMaxWaitMs;
+      let elapsed = 0;
+      while (elapsed < maxWaitMs) {
+        if (this._status === "aborted") return null;
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        elapsed += pollIntervalMs;
+        if (this._status === "aborted") return null;
+        const retry = this._resolveElement(step);
+        if (retry) return retry;
+      }
+      return null;
+    }
     /**
      * Try the primary descriptor, then alternatives in order.
      * Returns the first match that clears the score threshold AND the confidence threshold.
@@ -629,10 +686,12 @@ ${lines.join("\n")}`);
      * conditional linear ExecutionPlan with all steps upfront.
      *
      * @param {import('../shared/types/index.js').PlanRequest} request
+     * @param {object} [options]
+     * @param {AbortSignal} [options.signal] - Optional signal to abort the request
      * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
      */
-    async plan() {
-      throw new Error(`${this.name} must implement plan(request)`);
+    async plan(request, options = {}) {
+      throw new Error(`${this.name} must implement plan(request, options)`);
     }
     /**
      * Request a corrected step or full replan after execution diverged.
@@ -712,48 +771,53 @@ ${lines.join("\n")}`);
      * Calls POST /api/plan and returns a PlanResponse.
      *
      * @param {import('../shared/types/index.js').PlanRequest} request
+     * @param {object} [options]
+     * @param {AbortSignal} [options.signal]
      * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
      */
-    async plan(request) {
-      return this._post("/api/plan", request);
+    async plan(request, options = {}) {
+      return this._post("/api/plan", request, options);
     }
     /**
      * Request a corrected step or full replan after execution diverged.
      * Calls POST /api/recover and returns a RecoverResponse.
      *
      * @param {import('../shared/types/index.js').RecoverRequest} request
+     * @param {object} [options]
      * @returns {Promise<import('../shared/types/index.js').RecoverResponse>}
      */
-    async recover(request) {
-      return this._post("/api/recover", request);
+    async recover(request, options = {}) {
+      return this._post("/api/recover", request, options);
     }
     /**
      * Explain what is currently visible on screen.
      *
      * @param {{ screenshot: { image: string, mimeType: string }, pageContext: object }} request
+     * @param {object} [options]
      * @returns {Promise<{ success: boolean, screenContext?: object, error?: string }>}
      */
-    async explain({ screenshot, pageContext = {} }) {
+    async explain({ screenshot, pageContext = {} }, options = {}) {
       return this._post("/api/analyze", {
         screenshot,
         pageContext,
         goal: "Explain what is visible on this screen",
         mode: "explain"
-      });
+      }, options);
     }
     /**
      * Answer a question about the current screen.
      *
      * @param {{ screenshot: { image: string, mimeType: string }, question: string, pageContext: object }} request
+     * @param {object} [options]
      * @returns {Promise<{ success: boolean, answer?: string, confidence?: number, elementHint?: string, error?: string }>}
      */
-    async ask({ screenshot, question, pageContext = {} }) {
+    async ask({ screenshot, question, pageContext = {} }, options = {}) {
       return this._post("/api/analyze", {
         screenshot,
         goal: question,
         pageContext,
         mode: "ask"
-      });
+      }, options);
     }
     /**
      * Estimate the token cost of a request before sending it.
@@ -792,9 +856,11 @@ ${lines.join("\n")}`);
      *
      * @param {string} path
      * @param {object} body
+     * @param {object} [options]
+     * @param {AbortSignal} [options.signal]
      * @returns {Promise<object>}
      */
-    async _post(path, body) {
+    async _post(path, body, options = {}) {
       const headers = {
         "Content-Type": "application/json",
         "X-Session-ID": this._sessionId
@@ -802,6 +868,14 @@ ${lines.join("\n")}`);
       if (this._apiKey) headers["X-OpenRouter-Key"] = this._apiKey;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3e4);
+      const callerSignal = options?.signal;
+      if (callerSignal) {
+        if (callerSignal.aborted) {
+          controller.abort(callerSignal.reason);
+        } else {
+          callerSignal.addEventListener("abort", () => controller.abort(callerSignal.reason), { once: true });
+        }
+      }
       let response;
       try {
         response = await fetch(`${this._baseUrl}${path}`, {
@@ -813,10 +887,11 @@ ${lines.join("\n")}`);
         clearTimeout(timeoutId);
       } catch (err) {
         clearTimeout(timeoutId);
-        const isTimeout = err instanceof Error && err.name === "AbortError";
-        const message = isTimeout ? `Request to ${path} timed out after 30s` : err instanceof Error ? err.message : String(err);
-        const errorCode = isTimeout ? "REQUEST_TIMEOUT" : "NETWORK_ERROR";
-        console.error(`[VercelBackendAdapter] ${isTimeout ? "Timeout" : "Network error"} on ${path}:`, message);
+        const isCallerAborted = callerSignal?.aborted;
+        const isTimeout = err instanceof Error && err.name === "AbortError" && !isCallerAborted;
+        const message = isCallerAborted ? `Request to ${path} was aborted` : isTimeout ? `Request to ${path} timed out after 30s` : err instanceof Error ? err.message : String(err);
+        const errorCode = isCallerAborted ? "ABORTED" : isTimeout ? "REQUEST_TIMEOUT" : "NETWORK_ERROR";
+        console.error(`[VercelBackendAdapter] ${isCallerAborted ? "Aborted" : isTimeout ? "Timeout" : "Network error"} on ${path}:`, message);
         return this._networkFailure(message, errorCode);
       }
       let data;

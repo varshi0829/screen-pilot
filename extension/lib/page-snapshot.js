@@ -4,8 +4,8 @@
 // Used as the pre-action baseline that the Validator compares against
 // post-action state to determine whether a step succeeded.
 //
-// The domHash is an FNV-32a hash over the accessible text of the 60 most
-// prominent interactive elements visible in the viewport. It changes when
+// The domHash is an FNV-32a hash over the accessible text of the first 200
+// visible interactive elements in DOM order. It changes when
 // the page adds, removes, or relabels interactive elements — which is the
 // signal we care about, not attribute churn or animation updates.
 
@@ -45,7 +45,21 @@ function _computeDomHash() {
       ''
     ).trim().slice(0, 20);
     fingerprint += `${text}|`;
-    if (++count >= 60) break;
+    // Same DOM-order-first-N truncation pattern confirmed as a real bug in
+    // page-state-service.js's element cap (see its comment there) — here it
+    // means a DOM mutation past the first N interactive elements never changes
+    // the hash, so stale-plan discard and the dedup guard can silently miss
+    // it. Raised as a precautionary analog of that confirmed fix, not a fully
+    // reproduced-and-closed bug itself: on an artificial worst case (a button
+    // appended as literally the last of 423 interactive elements on
+    // github.com/microsoft/vscode) this cap still doesn't cover it — that
+    // remains a known residual limitation of any DOM-order-based cap, same as
+    // the page-state-service.js one. Purely local/never-network computation,
+    // so raising it costs nothing but a little iteration time — kept bounded
+    // (not removed outright) because capturePageSnapshot() runs on a tight
+    // budget: the executor's 150ms post-action verification polls it every
+    // ~25ms.
+    if (++count >= 200) break;
   }
   return _fnv32a(fingerprint);
 }

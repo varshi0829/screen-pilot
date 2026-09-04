@@ -6,6 +6,7 @@ import { MemoryService }       from './services/memory-service.js';
 import { RateLimiterService }  from './services/rate-limiter-service.js';
 import { ValidationService }   from './services/validation-service.js';
 import { NavigationPlanner }  from './services/navigation-planner.js';
+import { handleOllamaGenerate, handleOllamaCheck, handleOllamaCancel } from './services/ollama-proxy.js';
 import { sendWithRetry } from './services/message-retry.js';
 
 const DEBUG = false;
@@ -49,6 +50,9 @@ async function handleMessage(message, sender) {
     case 'RUN_BENCHMARK':            return runBenchmark(message, sender);
     case 'GET_TAB_ID':               return { success: true, tabId: sender.tab?.id ?? null };
     case 'START_V2_TASK':            return startV2Task(message, sender);
+    case 'OLLAMA_GENERATE':          return handleOllamaGenerate(message);
+    case 'OLLAMA_CHECK':             return handleOllamaCheck(message);
+    case 'OLLAMA_CANCEL':            return handleOllamaCancel(message);
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }
@@ -603,6 +607,11 @@ async function startV2Task(message, sender) {
     return { success: false, error: 'Content script not reachable. Please reload the page.' };
   }
 }
+
+// ─── OLLAMA BACKGROUND PROXY ──────────────────────────────────────────────────
+// Moved to ./services/ollama-proxy.js (see import above) — pure fetch/AbortController
+// logic with no chrome.* dependency, extracted for unit testability and to add the
+// previously-missing OLLAMA_CANCEL handler.
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 

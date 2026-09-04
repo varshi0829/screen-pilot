@@ -115,9 +115,21 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // ── Advanced settings (collapsed) ────────────────────────────────────────────
+  document.getElementById('advanced-toggle').addEventListener('click', () => {
+    document.getElementById('advanced-toggle').classList.toggle('open');
+    document.getElementById('advanced-body').classList.toggle('open');
+  });
+
+  const localAiCheckbox = document.getElementById('local-ai-checkbox');
+  localAiCheckbox.addEventListener('change', async () => {
+    await chrome.storage.local.set({ executionMode: localAiCheckbox.checked ? 'local-qwen' : 'cloud' });
+  });
+
   // ── Settings tab ──────────────────────────────────────────────────────────────
   async function loadSettings() {
-    const { openRouterApiKey, screenPilotBackendUrl } = await chrome.storage.local.get(['openRouterApiKey', 'screenPilotBackendUrl']);
+    const { openRouterApiKey, screenPilotBackendUrl, executionMode } = await chrome.storage.local.get(['openRouterApiKey', 'screenPilotBackendUrl', 'executionMode']);
+    localAiCheckbox.checked = executionMode === 'local-qwen';
     const statusEl = document.getElementById('key-status');
     const inputEl  = document.getElementById('openrouter-key-input');
     if (openRouterApiKey) {

@@ -37,10 +37,12 @@ export class VercelBackendAdapter extends BackendAdapter {
    * Calls POST /api/plan and returns a PlanResponse.
    *
    * @param {import('../shared/types/index.js').PlanRequest} request
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal]
    * @returns {Promise<import('../shared/types/index.js').PlanResponse>}
    */
-  async plan(request) {
-    return this._post('/api/plan', request);
+  async plan(request, options = {}) {
+    return this._post('/api/plan', request, options);
   }
 
   /**
@@ -48,40 +50,43 @@ export class VercelBackendAdapter extends BackendAdapter {
    * Calls POST /api/recover and returns a RecoverResponse.
    *
    * @param {import('../shared/types/index.js').RecoverRequest} request
+   * @param {object} [options]
    * @returns {Promise<import('../shared/types/index.js').RecoverResponse>}
    */
-  async recover(request) {
-    return this._post('/api/recover', request);
+  async recover(request, options = {}) {
+    return this._post('/api/recover', request, options);
   }
 
   /**
    * Explain what is currently visible on screen.
    *
    * @param {{ screenshot: { image: string, mimeType: string }, pageContext: object }} request
+   * @param {object} [options]
    * @returns {Promise<{ success: boolean, screenContext?: object, error?: string }>}
    */
-  async explain({ screenshot, pageContext = {} }) {
+  async explain({ screenshot, pageContext = {} }, options = {}) {
     return this._post('/api/analyze', {
       screenshot,
       pageContext,
       goal: 'Explain what is visible on this screen',
       mode: 'explain',
-    });
+    }, options);
   }
 
   /**
    * Answer a question about the current screen.
    *
    * @param {{ screenshot: { image: string, mimeType: string }, question: string, pageContext: object }} request
+   * @param {object} [options]
    * @returns {Promise<{ success: boolean, answer?: string, confidence?: number, elementHint?: string, error?: string }>}
    */
-  async ask({ screenshot, question, pageContext = {} }) {
+  async ask({ screenshot, question, pageContext = {} }, options = {}) {
     return this._post('/api/analyze', {
       screenshot,
       goal: question,
       pageContext,
       mode: 'ask',
-    });
+    }, options);
   }
 
   /**
@@ -129,9 +134,11 @@ export class VercelBackendAdapter extends BackendAdapter {
    *
    * @param {string} path
    * @param {object} body
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal]
    * @returns {Promise<object>}
    */
-  async _post(path, body) {
+  async _post(path, body, options = {}) {
     /** @type {Record<string, string>} */
     const headers = {
       'Content-Type': 'application/json',
@@ -144,6 +151,15 @@ export class VercelBackendAdapter extends BackendAdapter {
     const controller = new AbortController();
     const timeoutId  = setTimeout(() => controller.abort(), 30_000);
 
+    const callerSignal = options?.signal;
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        controller.abort(callerSignal.reason);
+      } else {
+        callerSignal.addEventListener('abort', () => controller.abort(callerSignal.reason), { once: true });
+      }
+    }
+
     let response;
     try {
       response = await fetch(`${this._baseUrl}${path}`, {
@@ -155,12 +171,15 @@ export class VercelBackendAdapter extends BackendAdapter {
       clearTimeout(timeoutId);
     } catch (err) {
       clearTimeout(timeoutId);
-      const isTimeout = err instanceof Error && err.name === 'AbortError';
-      const message   = isTimeout
-        ? `Request to ${path} timed out after 30s`
-        : (err instanceof Error ? err.message : String(err));
-      const errorCode = isTimeout ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR';
-      console.error(`[VercelBackendAdapter] ${isTimeout ? 'Timeout' : 'Network error'} on ${path}:`, message);
+      const isCallerAborted = callerSignal?.aborted;
+      const isTimeout       = err instanceof Error && err.name === 'AbortError' && !isCallerAborted;
+      const message         = isCallerAborted
+        ? `Request to ${path} was aborted`
+        : isTimeout
+          ? `Request to ${path} timed out after 30s`
+          : (err instanceof Error ? err.message : String(err));
+      const errorCode       = isCallerAborted ? 'ABORTED' : isTimeout ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR';
+      console.error(`[VercelBackendAdapter] ${isCallerAborted ? 'Aborted' : isTimeout ? 'Timeout' : 'Network error'} on ${path}:`, message);
       return this._networkFailure(message, errorCode);
     }
 

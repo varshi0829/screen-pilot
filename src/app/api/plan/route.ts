@@ -13,7 +13,7 @@ const MAX_SERVER_SIDE_CALLS = 12;
 
 // Phase 1: single model only. Phase 2: add "anthropic/claude-haiku-4-5-20251001".
 const VISION_MODELS: readonly string[] = [
-  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
 ];
 
 // 400/401/403 mean the request itself is broken — retrying a different model won't help.
@@ -234,7 +234,7 @@ async function callOpenRouter(
       ],
     }],
     temperature: 0.1,
-    max_tokens:  1200,
+    max_tokens:  768,
   };
 
   let upstream: Response;
@@ -612,6 +612,7 @@ function buildPlannerPrompt(req: {
   if (req.executionHistory?.completedSteps.length) {
     lines.push(`Completed: ${req.executionHistory.completedSteps.map(s => s.description).join(" → ")}`);
     lines.push(`Plan version: ${req.executionHistory.planVersion} | Recovery attempts: ${req.executionHistory.attemptCount}`);
+    lines.push(`Replan notice: ${req.executionHistory.completedSteps.length} step(s) already completed. Emit ONLY remaining required steps from current screen state. Keep plannerSummary to 1 short sentence.`);
   }
 
   if (req.workflowMemory?.extractedData && Object.keys(req.workflowMemory.extractedData).length) {
