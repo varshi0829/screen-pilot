@@ -92,6 +92,8 @@ global.document = {
   createElement:  ()   => makeElStub(),
   body:  { appendChild: () => {} },
   title: 'Test page',
+  addEventListener:    () => {},
+  removeEventListener: () => {},
 };
 
 global.window = {
@@ -190,10 +192,12 @@ const {
   __getState,
   __resetState,
   __setTabId,
+  __computeExpectedNavigationFromElement,
 } = await import('../v2-task.js');
 
 const { SessionStore }    = await import('../services/session-store.js');
 const { TaskState }       = await import('../shared/state-machine/transitions.js');
+const { DecisionRouter }  = await import('../services/decision-router.js');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -927,4 +931,219 @@ test('Dedup guard: domHashBefore absent on completed step → default to allowin
 
   assert.equal(domHashSame, false,
     'When domHashBefore is absent, default is false — guard does not fire, step allowed through');
+});
+
+// ── 21. computeExpectedNavigationFromElement — anchor regression + wrapper coverage ──
+//
+// Part 1 of the multi-step navigation-continuation fix: ground-truths
+// expectedPageState from the ACTUAL resolved DOM element about to be clicked,
+// not just a plain <a href> element echoed back via pageState.elements (the
+// pre-existing computeExpectedNavigation, unchanged, still covers that path).
+// Scenario B ("anchor regression") from the fix's test requirements: an <a
+// href> target must still ground-truth correctly; a non-anchor wrapper around
+// a real anchor must now ALSO ground-truth correctly; no anchor anywhere must
+// leave the existing signal untouched (returns null).
+
+test('computeExpectedNavigationFromElement: element itself is <a href> → ground-truthed (anchor regression)', () => {
+  setUrl('https://github.com/torvalds/linux');
+  const anchor = {
+    tagName: 'A',
+    getAttribute: (k) => (k === 'href' ? '/torvalds/linux/pulls' : null),
+    closest: () => null,
+  };
+  const nav = __computeExpectedNavigationFromElement(anchor);
+  assert.deepEqual(nav, { urlChanges: true, urlPattern: '/torvalds/linux/pulls' });
+});
+
+test('computeExpectedNavigationFromElement: div wrapper around a real anchor → ground-truthed from the anchor', () => {
+  setUrl('https://www.bbc.com/');
+  const anchor = {
+    tagName: 'A',
+    getAttribute: (k) => (k === 'href' ? '/technology' : null),
+  };
+  const div = {
+    tagName: 'DIV',
+    getAttribute: () => null,
+    closest: (sel) => (sel === 'a[href]' ? anchor : null),
+  };
+  const nav = __computeExpectedNavigationFromElement(div);
+  assert.deepEqual(nav, { urlChanges: true, urlPattern: '/technology' });
+});
+
+test('computeExpectedNavigationFromElement: no anchor anywhere → returns null (leaves existing signal untouched)', () => {
+  const div = { tagName: 'DIV', getAttribute: () => null, closest: () => null };
+  assert.equal(__computeExpectedNavigationFromElement(div), null);
+});
+
+test('computeExpectedNavigationFromElement: javascript: href → urlChanges:false, no pattern invented', () => {
+  const anchor = {
+    tagName: 'A',
+    getAttribute: (k) => (k === 'href' ? 'javascript:void(0)' : null),
+    closest: () => null,
+  };
+  const nav = __computeExpectedNavigationFromElement(anchor);
+  assert.deepEqual(nav, { urlChanges: false });
+});
+
+// ── 22. MULTI-STEP CONTINUATION — the full production bug, end to end ─────────
+//
+// Reproduces the reported production issue and its fix, end to end, through the
+// real orchestrator code (_bootstrapSession → classifyNavigation →
+// SessionStore.completeStep → _runPlanLoop → DecisionRouter.route →
+// _executeStep → ExecutorEngine) with no shortcuts around the classification
+// or session-progression logic under test:
+//
+//   step 1 (a non-anchor "click Technology" control, no ground-truth pattern
+//   available) → real navigation → content-script rebootstrap → classified as
+//   WORKFLOW_NAVIGATION (Case 4, not UNKNOWN) → step 1 completed → replanned →
+//   step 2 resolved and highlighted by a real ExecutorEngine → step 2 is
+//   itself ALSO a non-anchor navigating control → a second navigation +
+//   rebootstrap → classified as WORKFLOW_NAVIGATION again → step 2 completed
+//   (terminal) → goal complete.
+//
+// Only DecisionRouter.route() and window.DOMMatcher are mocked (planning and
+// element-scoring are unrelated to this fix and already covered elsewhere);
+// everything else — session storage, classification, the plan loop, and a
+// real ExecutorEngine instance — runs as it does in production.
+//
+// A real hard navigation tears down the executing script mid-flight, so
+// _executeStep's promise for step 2 is intentionally never resolved here
+// (nothing ever fires user:acted) — exactly like production, where the
+// document (and its in-flight promises) is discarded by the navigation. The
+// orphaned first bootstrap call is therefore deliberately NOT awaited; this
+// is the last test in the file so no later test can be affected by it.
+
+test('Multi-step continuation: two non-anchor navigating steps complete the goal with no PAUSED in between', async () => {
+  clearStore();
+  setUrl('https://www.bbc.com/');
+  __resetState();
+  setDomHash(['Home', 'Technology', 'Sport']);
+
+  function makeClickableElement(text) {
+    return {
+      tagName: 'BUTTON',
+      id: '', className: '',
+      textContent: text, innerText: text,
+      isConnected: true, disabled: false,
+      style: {},
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 40, right: 100, width: 90, height: 30 }),
+      scrollIntoView: () => {},
+      // No real anchor anywhere — a pure JS-routed control, the harder case
+      // computeExpectedNavigationFromElement cannot ground-truth (Part 1);
+      // continuation here depends entirely on the classifier fallback (Part 2).
+      closest: () => null,
+      querySelector: () => null,
+    };
+  }
+  window.DOMMatcher = {
+    isVisible:    () => true,
+    detectRegion: () => 'main_content',
+    matchElement: (descriptor) => ({
+      element:    makeClickableElement(descriptor?.text || 'target'),
+      score:      100,
+      candidates: [{ score: 100, reason: 'test match', matchType: 'exact' }],
+    }),
+  };
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = async function () {
+    return {
+      layer: 'deterministic',
+      layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK',
+        state:  'planned',
+        confidence: 0.9,
+        plannerSummary: '[test] click Sport',
+        plan: {
+          goalType: 'action',
+          confidence: 0.9,
+          steps: [{
+            id: 1,
+            description: 'Click the Sport section link',
+            intent: 'click_sport_section',
+            completionCondition: 'final',
+            targetElement: { text: 'Sport', type: 'link' },
+            // Deliberately unreliable, mirroring L1's hardcoded false — no
+            // ground truth is available for this non-anchor control either.
+            expectedPageState: { urlChanges: false },
+          }],
+        },
+      },
+    };
+  };
+
+  const completeStepCalls = [];
+  const origCompleteStep = SessionStore.completeStep.bind(SessionStore);
+  SessionStore.completeStep = async (tabId, record) => {
+    completeStepCalls.push(record);
+    return origCompleteStep(tabId, record);
+  };
+
+  const setPhaseCalls = [];
+  const origSetPhase = SessionStore.setPhase.bind(SessionStore);
+  SessionStore.setPhase = async (tabId, phase) => {
+    setPhaseCalls.push(phase);
+    return origSetPhase(tabId, phase);
+  };
+
+  let resolveStep2Pending;
+  const step2PendingPromise = new Promise((resolve) => { resolveStep2Pending = resolve; });
+  const origMarkPendingStep = SessionStore.markPendingStep.bind(SessionStore);
+  SessionStore.markPendingStep = async (tabId, pendingStep) => {
+    const result = await origMarkPendingStep(tabId, pendingStep);
+    if (pendingStep.intent === 'click_sport_section') resolveStep2Pending();
+    return result;
+  };
+
+  try {
+    await SessionStore.create(TAB, 'go to the sport detail page');
+    // Step 1 already executed: a non-anchor "Technology" control with no
+    // ground-truth pattern (mirrors L1's hardcoded urlChanges:false), and its
+    // click already caused a real navigation.
+    await SessionStore.markPendingStep(TAB, {
+      description:         'Click Technology',
+      intent:              'click_technology',
+      completionCondition: 'url_change',
+      expectedUrlPattern:  null,
+      expectedUrlChanges:  false,
+      urlBefore:           'https://www.bbc.com/',
+      domHashBefore:       currentDomHash(),
+      stepStartedAt:       Date.now(),
+    });
+    setUrl('https://www.bbc.com/technology');
+
+    // Fire-and-forget: this call's promise chain hangs inside _executeStep for
+    // step 2 (nothing ever fires user:acted, exactly like a real page teardown
+    // mid-navigation) and is never awaited, matching production.
+    _bootstrapSession(TAB);
+
+    // Wait only for the observable side effect that matters: step 2 was
+    // resolved by a real ExecutorEngine and its pendingStep was recorded.
+    await step2PendingPromise;
+
+    // Step 2's own click also caused a real navigation (same origin).
+    setUrl('https://www.bbc.com/technology/sport-detail');
+    await _bootstrapSession(TAB);
+
+    assert.equal(completeStepCalls.length, 2, 'both steps must be completed');
+    assert.equal(completeStepCalls[0].intent, 'click_technology', 'step 1 completed first');
+    assert.equal(completeStepCalls[1].intent, 'click_sport_section', 'step 2 completed second');
+    assert.ok(!setPhaseCalls.includes('PAUSED'),
+      `REGRESSION: task must not pause between steps — setPhase calls were: ${setPhaseCalls.join(', ')}`);
+
+    const loaded = await SessionStore.load(TAB);
+    // showCompletionCard() throws in this Node environment (no <canvas>), a
+    // pre-existing, already-documented harness limitation (see the terminal-
+    // step REFRESH test above) — SessionStore.clear() is never reached, so the
+    // session is still loadable here with both steps recorded.
+    assert.equal(loaded?.completedSteps.length, 2, 'both completed steps persisted — goal-complete path was reached');
+  } finally {
+    DecisionRouter.prototype.route = origRoute;
+    SessionStore.completeStep      = origCompleteStep;
+    SessionStore.setPhase          = origSetPhase;
+    SessionStore.markPendingStep   = origMarkPendingStep;
+    window.DOMMatcher = null;
+  }
 });

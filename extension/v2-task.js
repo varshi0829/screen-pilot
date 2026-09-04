@@ -5,6 +5,9 @@
 
 import { ExecutorEngine }                         from './services/executor-engine.js';
 import { VercelBackendAdapter }                   from './providers/vercel-backend-adapter.js';
+import { PageStateService }                       from './services/page-state-service.js';
+import { DecisionRouter }                          from './services/decision-router.js';
+import { LocalQwenAdapter }                        from './providers/local-qwen-adapter.js';
 import { capturePageSnapshot }                    from './lib/page-snapshot.js';
 import { TaskState, TaskEvent, transition }       from './shared/state-machine/transitions.js';
 import { SessionStore }                           from './services/session-store.js';
@@ -432,6 +435,67 @@ function buildStepRecord(pendingStep) {
 function toExecutorStep(plannerStep) {
   return { ...plannerStep, expectedOutcome: plannerStep.expectedPageState };
 }
+// Single source of truth for whether a resolved step actually navigates. All three
+// decision-router/local-qwen-adapter tiers set expectedPageState.urlChanges from
+// unreliable signals (a hardcoded false, or Qwen's own action verb) — this derives
+// it from the resolved DOM element's real tag/href instead, since that's ground
+// truth and already sitting unused in PageStateService's element list. Only <a href>
+// is handled: JS-driven navigation and hash-only/query-only links can't be inferred
+// generically without site-specific guessing, so those cases fall through unchanged.
+function computeExpectedNavigationFromHref(href) {
+  const trimmed = (href || '').trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith('javascript:') || lower === '#' || lower.startsWith('mailto:') || lower.startsWith('tel:')) {
+    return { urlChanges: false };
+  }
+  let target;
+  try { target = new URL(trimmed, window.location.href); } catch { return null; }
+  if (target.origin === window.location.origin && target.pathname === window.location.pathname) {
+    return null; // same-path (hash-only/query-only) — ambiguous, leave existing signal
+  }
+  return { urlChanges: true, urlPattern: target.pathname };
+}
+function computeExpectedNavigation(el) {
+  if (!el || el.tag !== 'a') return null;
+  return computeExpectedNavigationFromHref(el.href);
+}
+// Same ground truth as computeExpectedNavigation above, but resolved from the
+// ACTUAL LIVE DOM element the executor is about to click (available at
+// element:ready, before the user acts) rather than the pageState.elements
+// descriptor snapshot enrichStepFromPageState reads. Covers a clickable wrapper
+// (a <button>, a <div>, a <span role="button">) built around a real anchor,
+// which the descriptor-based check above cannot see — that descriptor only
+// records the PLANNER's own chosen element's own tag/href, never its ancestry.
+// Real-Chrome finding (bbc.com, goal "Go to the Technology section"): the
+// executor's resolved click target was a <div>, not an <a>, so the tag==='a'
+// check never applied and expectedPageState was left at whatever L1/L2/L3
+// guessed (here: urlChanges: false) even though the div very plausibly sits
+// inside — or wraps — a real navigable <a href="/technology">.
+function computeExpectedNavigationFromElement(element) {
+  if (!element) return null;
+  const tag = element.tagName?.toLowerCase?.();
+  const anchor = tag === 'a' ? element
+    : (typeof element.closest === 'function' ? element.closest('a[href]') : null);
+  if (!anchor) return null;
+  return computeExpectedNavigationFromHref(anchor.getAttribute?.('href') || anchor.href || '');
+}
+// Enrich a freshly-selected planner step with ground-truth navigation/region info
+// looked up from the same PageStateService element list the tier resolved it
+// against (all three tiers echo the element's `id` back as targetElement.elementId).
+function enrichStepFromPageState(plannerStep, pageState) {
+  const elementId = plannerStep?.targetElement?.elementId;
+  if (!pageState?.elements || !elementId) return;
+  const resolvedEl = pageState.elements.find((e) => e.id === elementId);
+  if (!resolvedEl) return;
+  const nav = computeExpectedNavigation(resolvedEl);
+  if (nav) {
+    plannerStep.expectedPageState = { ...plannerStep.expectedPageState, ...nav };
+  }
+  if (plannerStep.targetElement.region == null && resolvedEl.region) {
+    plannerStep.targetElement.region = resolvedEl.region;
+  }
+}
 function makeSingleStepPlan(step, goal) {
   return {
     planId: crypto.randomUUID(),
@@ -469,12 +533,46 @@ async function _showGoalCompleteCard(tabId, goal) {
   });
   await SessionStore.clear(tabId);
 }
+let _activePlanPromise = null;
+
 async function _runPlanLoop(tabId, myGen) {
+  if (_activePlanPromise) {
+    console.log("[SP:V2:TRACE] _runPlanLoop call queued — awaiting active planning promise");
+    try {
+      await _activePlanPromise;
+    } catch { /* ignore */ }
+    const session = await SessionStore.load(tabId);
+    if (session?.phase === 'PLANNING' && _generation === myGen) {
+      console.log("[SP:V2:TRACE] Session still in PLANNING phase after active plan completed — re-executing plan loop");
+      return _runPlanLoop(tabId, myGen);
+    }
+    return;
+  }
+
+  _activePlanPromise = _runPlanLoopInternal(tabId, myGen);
+  try {
+    await _activePlanPromise;
+  } catch (err) {
+    console.error("[SP:V2:TRACE] Unhandled plan loop error:", err);
+    showStatus(`ScreenPilot: Planning error — ${err?.message || "Internal error"}`, "error");
+    await SessionStore.clear(tabId);
+  } finally {
+    _activePlanPromise = null;
+  }
+}
+
+async function _runPlanLoopInternal(tabId, myGen) {
   const storage = getStorageArea();
-  const { openRouterApiKey } = storage ? await storage.get('openRouterApiKey') : { openRouterApiKey: undefined };
-  const adapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? undefined });
+  const { executionMode = 'cloud', openRouterApiKey } = storage
+    ? await storage.get(['executionMode', 'openRouterApiKey'])
+    : { executionMode: 'cloud', openRouterApiKey: undefined };
+  const cloudAdapter   = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? undefined });
+  const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter: new LocalQwenAdapter(), cloudAdapter });
   // B5: consecutive retryable-failure counter, reset on every successful planner response.
   let planRetryCount = 0;
+  // Set inside the local-mode branch each iteration; used after the try/catch below
+  // to enrich the chosen step with ground-truth nav/region info (see Bug A fix).
+  let localPageState = null;
   while (true) {
     if (_generation !== myGen) {
       console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} — exiting`);
@@ -487,6 +585,8 @@ async function _runPlanLoop(tabId, myGen) {
       return;
     }
     if (_generation !== myGen) return;
+    console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${session.goal}"`);
+
     // Diagnostic: log full session state at each plan loop entry
     try {
       const lastStep = session.completedSteps[session.completedSteps.length - 1];
@@ -498,21 +598,23 @@ async function _runPlanLoop(tabId, myGen) {
         currentDomHash:    currentSnap.domHash,
       });
     } catch { /* non-browser environment — skip diagnostic snapshot */ }
-    // Phase 26 — verifier-driven completion. If the goal's persisted completion
-    // contract is already satisfied on the current page (requiresEffect goals only,
-    // gated by GoalVerifier.shouldComplete), finish NOW — no planner round-trip.
-    // This is the "I already finished the task, why is ScreenPilot still running?"
-    // fix: after the terminal action navigates, the next plan-loop entry sees the
-    // post-effect page and completes immediately. Legacy planner completion
-    // (state="complete") below remains the fallback for everything else.
+    
+    // Verifier-driven early completion check (requiresEffect OR generic goal satisfaction)
     {
-      const gate = GoalVerifier.shouldComplete(session.goalCompletionCriteria);
+      console.log("[SP:V2:TRACE] verify START");
+      const tGoalStart = Date.now();
+      const pageState  = PageStateService.extractPageState();
+      const gate       = GoalVerifier.shouldComplete(session.goalCompletionCriteria, {}, session.goal, pageState);
+      const goalVerifyMs = Date.now() - tGoalStart;
+      console.log(`[SP:V2:TRACE] verify END complete=${gate.complete} reason=${gate.reason}`);
+
       if (gate.complete) {
         console.log("[SP:GoalCompletion]", {
           source: "verifier",
           satisfied: true,
-          signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+          reason: gate.reason
         });
+        console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_already_satisfied`);
         applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
         await _showGoalCompleteCard(tabId, session.goal);
         return;
@@ -525,19 +627,10 @@ async function _runPlanLoop(tabId, myGen) {
       await SessionStore.clear(tabId);
       return;
     }
+    const tCycleStart = Date.now();
     showStatus("ScreenPilot · Planning…", "planning");
-    let screenshot;
-    try {
-      screenshot = await captureScreenshot();
-    } catch (err) {
-      console.error("[SP:V2] Screenshot failed:", err);
-      applyEvent(TaskEvent.PLAN_FAILED, { reason: "screenshot_failed" });
-      showStatus(`ScreenPilot: Screenshot error — ${err.message}`, "error");
-      await SessionStore.clear(tabId);
-      return;
-    }
-    if (_generation !== myGen) return;
-    const freshSession = await SessionStore.load(tabId);
+
+    const freshSession = session;
     if (!freshSession) {
       hideStatus();
       return;
@@ -545,18 +638,60 @@ async function _runPlanLoop(tabId, myGen) {
     if (_generation !== myGen) return;
     const nClarifications = freshSession.clarifications?.length ?? 0;
     const pageControls    = collectPageControls();
-    console.log(`[SP:V2] [${ts()}] /api/plan  step=${freshSession.completedSteps.length + 1}  url=${window.location.href}  clarifications=${nClarifications}  pageControls=${pageControls.length}`);
+    const reqId           = `req_v2_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const planController  = new AbortController();
+
+    console.log(`[SP:V2:TRACE] plan START reqId=${reqId}`);
+    console.log(`[SP:V2:DEBUG] controller_created reqId=${reqId} signalAborted=${planController.signal.aborted}`);
+    console.log(`[SP:V2:DEBUG] controller_id reqId=${reqId}`);
+    console.log(`[SP:V2:DEBUG] signal_before_request reqId=${reqId} aborted=${planController.signal.aborted}`);
+
+    let preSnap = { url: window.location.href, domHash: '' };
+    try {
+      preSnap = capturePageSnapshot("");
+    } catch { /* mock/headless fallback */ }
+
+    // Dynamic stale-plan protection listener: abort controller if user navigates or page changes
+    const onNavCheck = () => {
+      if (window.location.href !== preSnap.url && !planController.signal.aborted) {
+        console.log(`[SP:V2:DEBUG] abort_reason reqId=${reqId} reason=page_url_changed_during_planning`);
+        planController.abort('page_url_changed_during_planning');
+      }
+    };
+    window.addEventListener('popstate', onNavCheck, { once: true });
+
+    const tReqStart = Date.now();
+    console.log(`[SP:V2] [${ts()}] executionMode=${executionMode} step=${freshSession.completedSteps.length + 1} url=${window.location.href} clarifications=${nClarifications} pageControls=${pageControls.length} reqId=${reqId}`);
+    let screenshotMs = 0;
+
     let planResp;
     try {
-      planResp = await adapter.plan({
-        schemaVersion: "1",
-        requestId: crypto.randomUUID(),
-        goal: freshSession.goal,
-        page: {
-          url: window.location.href,
-          title: document.title,
-          screenshot: { image: screenshot.image, mimeType: screenshot.mimeType }
-        },
+      const tDomStart = Date.now();
+      const pageState = PageStateService.extractPageState();
+      localPageState  = pageState;
+      const domMs     = Date.now() - tDomStart;
+
+      // Pre-L3 goal satisfaction check — applies regardless of executionMode,
+      // so cloud users also skip a paid LLM call when the goal is already met.
+      const preL3Check = GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
+      if (preL3Check.satisfied) {
+        window.removeEventListener('popstate', onNavCheck);
+        console.log(`[SP:V2:TRACE] plan END reqId=${reqId} outcome=goal_already_satisfied`);
+        console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=0 layer2Ms=0 qwenMs=0 cloudMs=0 postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${Date.now() - tReqStart} l3=SKIPPED reason=goal_already_satisfied`);
+        applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
+        await _showGoalCompleteCard(tabId, freshSession.goal);
+        return;
+      }
+
+      const getScreenshot = async () => {
+        const tSnap = Date.now();
+        const shot = await captureScreenshot();
+        screenshotMs = Date.now() - tSnap;
+        return shot;
+      };
+      const cloudContext = {
+        requestId: reqId,
+        getScreenshot,
         ...freshSession.completedSteps.length && {
           executionHistory: {
             completedSteps: freshSession.completedSteps.map((s) => ({
@@ -568,19 +703,61 @@ async function _runPlanLoop(tabId, myGen) {
             attemptCount: freshSession.plannerAttemptCount
           }
         },
-        ...nClarifications && {
-          clarifications: freshSession.clarifications.map((c) => c.text)
-        },
+        ...nClarifications && { clarifications: freshSession.clarifications.map((c) => c.text) },
         ...pageControls.length && { pageControls }
-      });
+      };
+
+      const routed = await decisionRouter.route(freshSession.goal, pageState, { signal: planController.signal, cloudContext });
+
+      planResp     = routed.planResponse;
+      const layer1Ms    = routed.layer1Ms ?? 0;
+      const layer2Ms    = routed.layer2Ms ?? 0;
+      const qwenMs      = routed.qwenMs ?? 0;
+      const cloudMs     = routed.cloudMs ?? 0;
+      const totalPlanningMs = Date.now() - tReqStart;
+
+      console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? 'n/a'}`);
+      console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
     } catch (err) {
-      console.error("[SP:V2] /api/plan failed:", err);
+      window.removeEventListener('popstate', onNavCheck);
+      console.log(`[SP:V2:TRACE] plan ERROR reqId=${reqId} name=${err?.name} message=${err?.message}`);
+      console.log(`[SP:V2:DEBUG] signal_end reqId=${reqId} aborted=${planController.signal.aborted} reason=${planController.signal.reason}`);
+      if (planController.signal.aborted || err?.name === 'AbortError') {
+        console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_aborted_exception`);
+        console.log("[SP:V2] Request aborted — replanning");
+        continue;
+      }
+      console.error("[SP:V2] Planning failed:", err);
       applyEvent(TaskEvent.PLAN_FAILED, { reason: "network_error" });
-      showStatus(`ScreenPilot: Network error — ${err.message}`, "error");
+      showStatus(`ScreenPilot: Planning error — ${err.message}`, "error");
       await SessionStore.clear(tabId);
       return;
     }
+    console.log(`[SP:V2:TRACE] plan END reqId=${reqId}`);
+    window.removeEventListener('popstate', onNavCheck);
+    const reqMs = Date.now() - tReqStart;
     if (_generation !== myGen) return;
+
+    if (planResp?.errorCode === 'ABORTED') {
+      console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_discard`);
+      console.log("[SP:V2] Request aborted — replanning");
+      continue;
+    }
+
+    const postSnap = capturePageSnapshot("");
+    const urlChanged = preSnap.url !== postSnap.url;
+    const domChanged = preSnap.domHash !== postSnap.domHash;
+    if (urlChanged || domChanged) {
+      console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_snapshot_change`);
+      console.log(`[SP:V2] STALE_PLAN discarded urlChanged=${urlChanged} domChanged=${domChanged} preUrl=${preSnap.url} postUrl=${postSnap.url} preDomHash=${preSnap.domHash} postDomHash=${postSnap.domHash} reqMs=${reqMs}ms`);
+      continue;
+    }
+
+    const cycleMs = Date.now() - tCycleStart;
+    const modelUsed = planResp.providerMetadata?.model ?? "unknown";
+    const inTokens  = planResp.providerMetadata?.inputTokens ?? "?";
+    const outTokens = planResp.providerMetadata?.outputTokens ?? "?";
+    console.log(`[SP:V2:PERF] cycleMs=${cycleMs}ms screenshotMs=${screenshotMs}ms reqMs=${reqMs}ms model=${modelUsed} inTokens=${inTokens} outTokens=${outTokens}`);
     console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${planResp.plannerSummary ?? ""}"`);
     // Diagnostic: log full planner response step details
     if (planResp.plan?.steps?.length) {
@@ -693,6 +870,11 @@ async function _runPlanLoop(tabId, myGen) {
       console.warn("[SP:V2] state=planned but steps is empty — treating as ambiguous");
       continue;
     }
+    // Correct expectedPageState.urlChanges/region from ground truth before anything
+    // downstream (buildPendingStepContext, toExecutorStep, expectsNavigation) reads
+    // it — see Bug A/D fix. No-op when localPageState is unset (cloud mode) or the
+    // resolved element isn't a plain <a href>.
+    enrichStepFromPageState(plannerStep, localPageState);
     applyEvent(TaskEvent.PLAN_RECEIVED, { intent: plannerStep.intent });
 
     // ── Deduplication guard ───────────────────────────────────────────────────
@@ -714,35 +896,37 @@ async function _runPlanLoop(tabId, myGen) {
     // against the current domHash. If the DOM changed, the step genuinely advanced state
     // and the planner should return a different next step — let it through.
     {
-      const latestCompleted = freshSession.completedSteps[freshSession.completedSteps.length - 1];
-      if (latestCompleted && latestCompleted.intent === plannerStep.intent) {
-        const currentSnap = capturePageSnapshot('');
-        const urlSame     = currentSnap.url === latestCompleted.urlBefore;
+      const recentCompleted = freshSession.completedSteps.slice(-3);
+      const currentSnap     = capturePageSnapshot('');
+      const targetText      = (plannerStep.targetElement?.text || '').trim().toLowerCase();
+      const planIntent      = (plannerStep.intent || '').trim().toLowerCase();
 
-        // Use domHashBefore from the completed step record (stored by user:acted handler
-        // and buildStepRecord). If absent (old session format), compare against the
-        // pendingStep's domHashBefore if still available, else treat as "changed" (safe
-        // default: don't block a step whose pre-action baseline we cannot verify).
+      const matchingCompleted = recentCompleted.slice().reverse().find(step => {
+        const stepIntent  = (step.intent || '').trim().toLowerCase();
+        const stepDesc    = (step.description || '').trim().toLowerCase();
+        const intentMatch = stepIntent && (stepIntent === planIntent || stepDesc.includes(planIntent) || planIntent.includes(stepIntent));
+        const textMatch   = targetText && stepDesc.toLowerCase().includes(targetText);
+        return intentMatch || textMatch;
+      });
+
+      if (matchingCompleted) {
+        const urlSame = currentSnap.url === matchingCompleted.urlBefore;
         let domHashSame;
-        if (latestCompleted.domHashBefore != null) {
-          domHashSame = currentSnap.domHash === latestCompleted.domHashBefore;
+        if (matchingCompleted.domHashBefore != null) {
+          domHashSame = currentSnap.domHash === matchingCompleted.domHashBefore;
         } else if (freshSession.pendingStep?.domHashBefore != null) {
           domHashSame = currentSnap.domHash === freshSession.pendingStep.domHashBefore;
         } else {
-          // No baseline available — cannot confirm state is unchanged.
-          // Default to allowing the step through (don't block on insufficient data).
           domHashSame = false;
         }
 
-        console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${latestCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
+        console.log(`[SP:V2] Dedup check: intent="${plannerStep.intent}" target="${targetText}" urlSame=${urlSame} domHashSame=${domHashSame} currentDomHash=${currentSnap.domHash} baselineDomHash=${matchingCompleted.domHashBefore ?? freshSession.pendingStep?.domHashBefore ?? 'none'}`);
 
         if (urlSame && domHashSame) {
           console.warn(
-            `[SP:V2] Dedup guard FIRED: planner returned same intent="${plannerStep.intent}" as last completed step` +
+            `[SP:V2] Dedup guard FIRED: planner returned step matching recent action ("${plannerStep.intent}" / "${targetText}")` +
             ` with identical page state — page did not change after that action`
           );
-          // Bump the step attempt counter so the stuck-workflow detector can still
-          // fire if this dedup cycle repeats MAX_STEP_ATTEMPTS times.
           const { isStuck, reason } = await SessionStore.incrementStepAttempt(tabId);
           if (isStuck) {
             applyEvent(TaskEvent.PLAN_FAILED, { reason });
@@ -750,10 +934,10 @@ async function _runPlanLoop(tabId, myGen) {
             await SessionStore.clear(tabId);
             return;
           }
-          await new Promise((r) => setTimeout(r, 500));
+          await new Promise((r) => setTimeout(r, 200));
           continue;
         } else {
-          console.log(`[SP:V2] Dedup check PASSED: same intent but page state changed (urlSame=${urlSame} domHashSame=${domHashSame}) — allowing re-execution`);
+          console.log(`[SP:V2] Dedup check PASSED: page state changed (urlSame=${urlSame} domHashSame=${domHashSame}) — allowing execution`);
         }
       }
     }
@@ -792,7 +976,7 @@ async function _runPlanLoop(tabId, myGen) {
         // unload this timer dies with the document and never fires, so hard-reload
         // behavior is unchanged. Generation safety is _bootstrapSession's own:
         // it increments _generation and self-guards, same as its init invocation.
-        setTimeout(() => { _bootstrapSession(tabId); }, 800);
+        setTimeout(() => { _bootstrapSession(tabId); }, 200);
       }
       return;
     }
@@ -863,7 +1047,9 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
     });
     if (_executor) _executor.abort();
     _executor = executor;
-    const expectsNavigation = plannerStep.expectedPageState?.urlChanges === true;
+    // Mutable — element:ready below may correct this once the real resolved
+    // element is known (see computeExpectedNavigationFromElement).
+    let expectsNavigation = plannerStep.expectedPageState?.urlChanges === true;
     let resolved = false;
     function done(result) {
       if (resolved) return;
@@ -871,8 +1057,18 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       if (_executor === executor) _executor = null;
       resolve(result);
     }
-    executor.on("element:ready", async ({ step }) => {
+    executor.on("element:ready", async ({ step, element }) => {
       applyEvent(TaskEvent.ELEMENT_READY, { intent: plannerStep.intent });
+      // Ground-truth correction from the ACTUAL resolved DOM element — see
+      // computeExpectedNavigationFromElement. Runs here because the live node
+      // is only known once the executor has resolved a candidate; only
+      // overrides expectedPageState when a real anchor was actually found, so
+      // a tier's correct guess is never clobbered by a null result.
+      const elementNav = computeExpectedNavigationFromElement(element);
+      if (elementNav) {
+        step.expectedPageState = { ...step.expectedPageState, ...elementNav };
+        expectsNavigation = step.expectedPageState.urlChanges === true;
+      }
       if (_taskContext) {
         _taskContext.currentStep = step.description;
         showTaskPanel(_taskContext);
@@ -894,13 +1090,22 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
         return;
       }
       showStatus("Verifying…", "validating");
-      await new Promise((r) => setTimeout(r, 600));
+      const pre = executor.getPreActionSnapshot();
+      let post = capturePageSnapshot("");
+      const tVerifyStart = Date.now();
+      while (Date.now() - tVerifyStart < 150 && pre?.domHash === post.domHash && pre?.url === post.url) {
+        await new Promise((r) => setTimeout(r, 25));
+        post = capturePageSnapshot("");
+      }
+      if (Date.now() - tVerifyStart < 150) {
+        const rem = 150 - (Date.now() - tVerifyStart);
+        if (rem > 0) await new Promise((r) => setTimeout(r, rem));
+      }
       if (_generation !== myGen) {
         done("aborted");
         return;
       }
-      const pre = executor.getPreActionSnapshot();
-      const post = capturePageSnapshot("");
+      post = capturePageSnapshot("");
       const verdict = validateStep(pre, post);
       console.log(`[SP:V2] user:acted verdict=${verdict} domHashBefore=${pre?.domHash} domHashAfter=${post.domHash} urlBefore=${pre?.url} urlAfter=${post.url}`);
       await SessionStore.completeStep(tabId, {
@@ -1246,6 +1451,7 @@ export function __resetState() {
 export function __setTabId(id) {
   _tabId = id;
 }
+export { computeExpectedNavigationFromElement as __computeExpectedNavigationFromElement };
 export {
   _handleClarification as __handleClarification,
   _handleResume as __handleResume,

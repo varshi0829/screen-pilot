@@ -44,6 +44,25 @@ function matchesUrlPattern(url, pattern) {
   }
 }
 
+/** True when both URLs share the same origin (protocol + host + port). A
+ *  navigation to a different site is far more likely to be the user browsing
+ *  away than evidence of this workflow's own action — used to bound the
+ *  conservative fallback below. */
+function sameOrigin(urlA, urlB) {
+  try {
+    return new URL(urlA).origin === new URL(urlB).origin;
+  } catch {
+    return false;
+  }
+}
+
+// Bounded window within which a URL change is still plausibly the direct result
+// of the workflow's own just-executed action, rather than an unrelated
+// navigation the user made much later after resuming a stale session. Generous
+// enough to cover a slow page load or a short redirect chain; short enough to
+// exclude anything else.
+const WORKFLOW_NAVIGATION_WINDOW_MS = 20000;
+
 /**
  * Classify the current URL relative to the active session.
  *
@@ -82,6 +101,43 @@ export function classifyNavigation(session, currentUrl) {
     }
   }
 
-  // Case 4: unknown — manual navigation, auth redirect, or unrecognized destination
+  // Case 4: conservative fallback — a workflow step was pending, a real
+  // navigation to a DIFFERENT same-origin URL occurred shortly after it
+  // started, and we have no specific prediction it contradicts. Covers a
+  // resolved click target that wasn't a plain <a href> (a button, a div, a
+  // JS-routed control) whose real destination the planning tiers could not
+  // ground-truth in advance. Real-Chrome finding (bbc.com, goal "Go to the
+  // Technology section"): the resolved click target was a <div>,
+  // expectedUrlChanges stayed false (L1's hardcoded guess), the click still
+  // caused a real navigation, and this fell all the way through to UNKNOWN —
+  // pausing the task after a single step instead of continuing it.
+  //
+  // Deliberately narrow, per two independent conditions:
+  //   (a) SAME ORIGIN — a different site is far more likely to be the user
+  //       browsing away on their own than evidence of this workflow's own
+  //       action.
+  //   (b) NO expectedUrlPattern was ever set — when a pattern WAS predicted,
+  //       Case 1 above already tried and failed to match it; that mismatch is
+  //       itself evidence the navigation went somewhere OTHER than expected
+  //       (an auth wall, an error page, an unrelated redirect), so staying
+  //       UNKNOWN there is the safer call. This is what keeps a genuine
+  //       auth-redirect (e.g. /login?next=/settings, expectedUrlPattern
+  //       '/settings' set but not matched) correctly UNKNOWN rather than
+  //       silently treated as workflow progress.
+  //   (c) within WORKFLOW_NAVIGATION_WINDOW_MS of the step actually starting —
+  //       rules out a stale/resumed session where the user has since
+  //       navigated elsewhere on their own, long after the step began.
+  if (
+    pending?.urlBefore &&
+    currentUrl !== pending.urlBefore &&
+    !pending.expectedUrlPattern &&
+    sameOrigin(pending.urlBefore, currentUrl) &&
+    typeof pending.stepStartedAt === 'number' &&
+    (Date.now() - pending.stepStartedAt) <= WORKFLOW_NAVIGATION_WINDOW_MS
+  ) {
+    return { classification: NavClassification.WORKFLOW_NAVIGATION, matchedStepIndex: null };
+  }
+
+  // Case 5: unknown — manual navigation, auth redirect, or unrecognized destination
   return { classification: NavClassification.UNKNOWN, matchedStepIndex: null };
 }
