@@ -4,11 +4,11 @@ import { motion } from "framer-motion";
 import {
   Globe,
   MousePointer2,
-  Camera,
-  Brain,
-  GitBranch,
   ScanSearch,
+  Zap,
+  Brain,
   Crosshair,
+  RefreshCw,
 } from "lucide-react";
 
 const pipeline = [
@@ -27,38 +27,38 @@ const pipeline = [
     color: "#2563EB",
   },
   {
-    icon: Camera,
-    title: "Tab screenshot captured",
+    icon: ScanSearch,
+    title: "Page structure read locally",
     description:
-      "The extension silently captures what's visible in the tab using Chrome's built-in screen capture API — no extra permissions.",
+      "ScreenPilot extracts a normalized snapshot of every visible button, link, and field on the page directly in your browser.",
+    color: "#2563EB",
+  },
+  {
+    icon: Zap,
+    title: "Fast deterministic and DOM/semantic grounding",
+    description:
+      "A deterministic matcher, then a DOM/semantic grounding pass, try to resolve your goal against that snapshot for straightforward, unambiguous targets.",
     color: "#2563EB",
   },
   {
     icon: Brain,
-    title: "Gemini 2.5 Flash analyzes it",
+    title: "Multimodal LLM handles ambiguous or complex cases",
     description:
-      "The screenshot, URL, page title, and your goal are sent to Gemini. It reasons about the page layout and decides the next action.",
-    color: "#2563EB",
-  },
-  {
-    icon: GitBranch,
-    title: "Workflow broken into steps",
-    description:
-      "Gemini returns a structured plan: which element to interact with, what action to take, and what comes after.",
-    color: "#2563EB",
-  },
-  {
-    icon: ScanSearch,
-    title: "DOM matched to real elements",
-    description:
-      "The extension searches the live DOM for the AI-identified element — by text, aria-label, role, or position scoring.",
+      "When the target isn't clear-cut, a screenshot plus your goal go to a multimodal LLM (via the configured cloud or OpenRouter planner, or an optional local Qwen model), which returns the single next action as structured JSON.",
     color: "#2563EB",
   },
   {
     icon: Crosshair,
-    title: "Highlight appears on the element",
+    title: "Highlight appears on the real element",
     description:
-      "A pulsing ring, arrow, and instruction bubble appear directly on the target. You click it. The loop restarts with the new page state.",
+      "The target is located in the live DOM and highlighted with a pulsing ring and instruction bubble. You click it.",
+    color: "#10B981",
+  },
+  {
+    icon: RefreshCw,
+    title: "ScreenPilot re-checks and continues",
+    description:
+      "The moment you act, it re-reads the page to confirm the goal is met — or plans the next single step from the new state. The loop is self-correcting by design.",
     color: "#10B981",
   },
 ];
@@ -85,7 +85,8 @@ export default function HowItWorks() {
           </h2>
           <p className="text-[#64748B] text-lg leading-relaxed">
             Seven things happen between you typing a goal and a highlight appearing
-            on your screen — all in under two seconds.
+            on your screen — page observation and grounding happen locally, and a
+            multimodal model steps in for the cases that need it.
           </p>
         </motion.div>
 

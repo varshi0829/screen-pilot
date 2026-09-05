@@ -36,7 +36,7 @@ export default function Hero() {
             <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB]" />
             Chrome Extension
             <span className="text-black/20">·</span>
-            <span className="text-[#10B981] font-semibold">Gemini 2.5 Flash</span>
+            <span className="text-[#10B981] font-semibold">Multimodal AI</span>
           </div>
 
           {/* Headline */}
@@ -87,7 +87,7 @@ export default function Hero() {
               </div>
             </div>
             <p className="text-[11px] text-[#10B981] font-medium">
-              No API key needed. No account. Works instantly.
+              Bring your own API key. No account. Works instantly.
             </p>
           </div>
 
@@ -184,7 +184,7 @@ function BrowserMockup() {
           {[
             { from: "GitHub", subject: "PR review requested: screen-pilot", time: "9:41 AM", unread: true },
             { from: "Vercel", subject: "Deployment successful", time: "Yesterday", unread: false },
-            { from: "Google Cloud", subject: "Gemini API usage summary", time: "Mon", unread: false },
+            { from: "Calendar", subject: "Sprint retro — Thu 3pm", time: "Mon", unread: false },
             { from: "Team", subject: "Sprint planning notes", time: "Jun 18", unread: false },
           ].map((email, i) => (
             <div

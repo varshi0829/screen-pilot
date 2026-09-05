@@ -3,11 +3,11 @@
 import { motion } from "framer-motion";
 import {
   Chrome,
-  Camera,
-  Brain,
-  GitBranch,
   ScanSearch,
-  Layers,
+  Layers3,
+  GitBranch,
+  Crosshair,
+  ShieldCheck,
   ArrowRight,
   ArrowDown,
 } from "lucide-react";
@@ -16,40 +16,40 @@ const topRow = [
   {
     icon: Chrome,
     title: "Chrome Extension",
-    description: "Injects widget, routes messages, triggers capture",
+    description: "Injects widget, routes messages, orchestrates the plan loop",
     color: "#2563EB",
   },
   {
-    icon: Camera,
-    title: "Screenshot Capture",
-    description: "captureVisibleTab → JPEG compressed via OffscreenCanvas",
+    icon: ScanSearch,
+    title: "Page State Extraction",
+    description: "Live DOM → normalized, website-agnostic JSON every cycle",
     color: "#2563EB",
   },
   {
-    icon: Brain,
-    title: "Gemini 2.5 Flash",
-    description: "Vision + reasoning → structured next-action JSON",
+    icon: Layers3,
+    title: "L1/L2/L3 Decision Router",
+    description: "Deterministic grounding → DOM/semantic grounding → multimodal LLM",
     color: "#10B981",
   },
 ];
 
 const bottomRow = [
   {
-    icon: Layers,
+    icon: Crosshair,
     title: "Guidance Overlay",
     description: "Spotlight + ring + arrow + instruction bubble on the element",
     color: "#10B981",
   },
   {
-    icon: ScanSearch,
-    title: "DOM Matcher",
-    description: "Text, aria-label, role, position scoring → real DOM node",
+    icon: GitBranch,
+    title: "Executor + Session State",
+    description: "Resolves the target, detects the real click, persists progress",
     color: "#2563EB",
   },
   {
-    icon: GitBranch,
-    title: "Workflow Planner",
-    description: "Sequences goal into steps, tracks history, detects completion",
+    icon: ShieldCheck,
+    title: "Goal Verifier",
+    description: "Confirms the goal against the live page before ever replanning",
     color: "#2563EB",
   },
 ];
@@ -75,8 +75,10 @@ export default function Architecture() {
             Technical architecture
           </h2>
           <p className="text-[#64748B] text-lg leading-relaxed">
-            Everything runs in the browser. No backend server. No data stored
-            outside Chrome. The extension talks directly to the Gemini API.
+            ScreenPilot observes the live page locally, then routes each step
+            through deterministic grounding, DOM/semantic grounding, or
+            multimodal reasoning. The browser executes the action and verifies
+            the resulting state before continuing or replanning.
           </p>
         </motion.div>
 
@@ -168,7 +170,7 @@ export default function Architecture() {
             className="hidden md:flex mt-8 justify-center"
           >
             <div className="flex items-center gap-3 px-4 py-2 rounded-full border border-black/[0.07] bg-[#F8FAFC] text-xs text-[#64748B]">
-              Data flows: Extension → Screenshot → Gemini → Planner → DOM Matcher → Overlay → you click → repeat
+              Extension → Page Observation → L1/L2/L3 Decision → Executor → Action → Observe → Verify → Replan
             </div>
           </motion.div>
         </div>

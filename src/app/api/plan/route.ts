@@ -11,9 +11,12 @@ const MAX_GEMINI_RETRIES    = 2;
 const GLOBAL_MAX            = 12;
 const MAX_SERVER_SIDE_CALLS = 12;
 
+// Submission-day stabilization: Gemini free-tier quota exhausted — temporarily
+// switched to a free OpenRouter multimodal model. Swap back by changing this
+// one string; nothing else in the OpenRouter path is model-specific.
 // Phase 1: single model only. Phase 2: add "anthropic/claude-haiku-4-5-20251001".
 const VISION_MODELS: readonly string[] = [
-  "google/gemini-2.5-flash-lite",
+  "google/gemma-4-26b-a4b-it:free",
 ];
 
 // 400/401/403 mean the request itself is broken — retrying a different model won't help.
@@ -255,6 +258,9 @@ async function callOpenRouter(
     return { ok: false, status: 0, message: (name === "AbortError" || name === "TimeoutError") ? "timeout" : (err as Error).message };
   }
 
+  // TEMPORARY DEBUG (submission-day Gemma compatibility diagnosis — remove after) —
+  // never logs the key; content-type + status only, no body read yet.
+
   if (!upstream.ok) {
     const errBody = await upstream.json().catch(() => null);
     return { ok: false, status: upstream.status, message: errBody?.error?.message ?? JSON.stringify(errBody ?? "").slice(0, 500) };
@@ -263,6 +269,10 @@ async function callOpenRouter(
   const data         = await upstream.json();
   const rawText      = (data?.choices?.[0]?.message?.content as string | undefined) ?? "";
   const finishReason = (data?.choices?.[0]?.finish_reason   as string | undefined) ?? "stop";
+  // TEMPORARY DEBUG — truncated raw content only, never the API key.
+  console.log(
+    ` raw_len=${rawText.length} raw_content=${JSON.stringify(rawText.slice(0, 800))}`
+  );
   return {
     ok: true,
     data: {
@@ -307,7 +317,13 @@ function assemblePlanResponse(
   let parsed: PlannerOutput;
   try {
     parsed = JSON.parse(extractJson(rawText));
-  } catch {
+  } catch (err) {
+    // TEMPORARY DEBUG (submission-day Gemma compatibility diagnosis — remove after) —
+    // exact parse error plus what extraction produced, so we can see whether
+    // extractJson even isolated something JSON-shaped before JSON.parse threw.
+    console.error(
+      ` extracted=${JSON.stringify(extractJson(rawText).slice(0, 800))}`
+    );
     console.error(`[SP:PLAN] reqId=${reqId} parse_failed model=${modelUsed} raw=${rawText.slice(0, 300)}`);
     logTelemetry({ event: "plan_failed", reqId, keyType, model: modelUsed, latencyMs: Date.now() - t0, errorCode: "PARSE_ERROR", success: false });
     return errorResponse(reqId, "Planner returned an unparseable response.", "PARSE_ERROR", 502, t0);

@@ -9,7 +9,7 @@ export const metadata: Metadata = {
     "AI assistant",
     "Chrome Extension",
     "software navigation",
-    "Gemini Vision",
+    "multimodal AI",
     "productivity",
     "screen guidance",
     "AI copilot",

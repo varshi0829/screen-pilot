@@ -14,7 +14,8 @@ const footerLinks = [
 
 const techStack = [
   "Chrome Extensions MV3",
-  "Gemini 2.5 Flash",
+  "Multimodal AI",
+  "Layered UI Grounding",
   "JavaScript",
   "Next.js 15",
 ];

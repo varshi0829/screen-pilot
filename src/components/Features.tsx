@@ -15,9 +15,9 @@ import {
 const features = [
   {
     icon: Camera,
-    title: "Screenshot-based understanding",
+    title: "Layered AI grounding",
     description:
-      "ScreenPilot captures the current tab visually and sends it to Gemini. It sees the page the same way you do — not just the HTML.",
+      "Fast deterministic and DOM/semantic matching handles straightforward targets locally, while multimodal reasoning handles ambiguous cases.",
   },
   {
     icon: ListChecks,
@@ -59,7 +59,7 @@ const features = [
     icon: History,
     title: "Knows what it already did",
     description:
-      "Completed steps are passed back with every new request so Gemini never suggests repeating an action you've already taken.",
+      "Completed steps are tracked against the live page state, so the planner never suggests repeating an action that already took effect.",
   },
 ];
 

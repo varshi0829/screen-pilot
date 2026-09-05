@@ -47,7 +47,7 @@ export default function Hackathon() {
                   Open Innovation + Multimodal AI
                 </p>
                 <p className="text-xs text-[#94A3B8] mt-1.5">
-                  Using Gemini&apos;s vision to solve a genuine everyday friction — not a toy problem.
+                  Layered multimodal AI, applied to a genuine everyday friction — not a toy problem.
                 </p>
               </div>
 
@@ -75,9 +75,12 @@ export default function Hackathon() {
                 <div className="flex flex-wrap gap-2">
                   {[
                     "Chrome Extensions MV3",
-                    "Gemini 2.5 Flash",
+                    "Multimodal AI",
+                    "Layered UI Grounding",
                     "Vanilla JavaScript",
                     "DOM APIs",
+                    "OpenRouter",
+                    "Optional Local Qwen",
                     "captureVisibleTab",
                     "OffscreenCanvas",
                     "Next.js 15",
