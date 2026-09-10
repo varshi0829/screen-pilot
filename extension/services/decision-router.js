@@ -3,13 +3,24 @@
 // Layer Control System for the Local-First Hierarchical Architecture:
 // 1. Fast Local Path (Deterministic DOMMatcher / exact match, threshold >= 0.85)
 // 2. Small ML Model (UI Element Grounding & Ranking, threshold >= 0.70)
-// 3. Reasoning fallback — Cloud LLM by default; Local Qwen is opt-in
-//    (executionMode === 'local-qwen') and itself falls back to cloud on
-//    any failure/timeout/unavailability, one attempt per provider, never
-//    both directions. executionMode === 'cloud' never contacts Ollama.
+// 3. Reasoning fallback — Cloud LLM by default; when executionMode ===
+//    'local-qwen' (the existing local-first opt-in):
+//      a. Local Moondream VISUAL PERCEPTION is tried first (privacy-vision
+//         Phase 2, corrected) — it only ever points at an element from the
+//         current page state's own element list; it is not a planner, and it
+//         runs even when Qwen would have succeeded. A validated pick is
+//         wrapped into a plan via _buildPlanFromElement, the exact same
+//         helper L1/L2 use.
+//      b. If vision is unavailable, fails, or names an elementId that
+//         doesn't actually exist in the current page state, local Qwen
+//         (text) is tried next — unchanged from before.
+//      c. Cloud is the final fallback.
+//    Each provider gets exactly one attempt, never bounced back and forth.
+//    executionMode === 'cloud' never contacts Ollama at all.
 
 import { UIGroundingService }     from './ui-grounding-service.js';
 import { LocalQwenAdapter }       from '../providers/local-qwen-adapter.js';
+import { LocalVisionAdapter }     from '../providers/local-vision-adapter.js';
 import { VercelBackendAdapter }   from '../providers/vercel-backend-adapter.js';
 
 import { GoalVerifier }      from './goal-verifier.js';
@@ -24,6 +35,7 @@ export class DecisionRouter {
    * @param {number} [options.mlGroundingThreshold]
    * @param {'cloud'|'local-qwen'} [options.executionMode] - L3 backend selection. Default 'cloud'.
    * @param {object} [options.localQwenAdapter]
+   * @param {object} [options.localVisionAdapter]
    * @param {object} [options.cloudAdapter]
    */
   constructor({
@@ -31,12 +43,14 @@ export class DecisionRouter {
     mlGroundingThreshold  = ML_GROUNDING_THRESHOLD,
     executionMode          = 'cloud',
     localQwenAdapter       = null,
+    localVisionAdapter    = null,
     cloudAdapter           = null
   } = {}) {
     this.deterministicThreshold = deterministicThreshold;
     this.mlGroundingThreshold  = mlGroundingThreshold;
     this.executionMode          = executionMode;
     this.localQwenAdapter       = localQwenAdapter ?? new LocalQwenAdapter();
+    this.localVisionAdapter    = localVisionAdapter ?? new LocalVisionAdapter();
     this.cloudAdapter           = cloudAdapter ?? new VercelBackendAdapter();
   }
 
@@ -106,15 +120,96 @@ export class DecisionRouter {
   }
 
   /**
-   * L3: exactly one Qwen attempt (only when executionMode === 'local-qwen' and
-   * Ollama reports available), then exactly one Cloud attempt as fallback/default.
-   * Never retries a provider and never bounces back and forth between them.
+   * L3: exactly one Moondream VISUAL PERCEPTION attempt (only when
+   * executionMode === 'local-qwen', before Qwen — so it runs even when Qwen
+   * would have succeeded), then exactly one Qwen (text) attempt if vision
+   * didn't yield a usable, validated element, then exactly one Cloud attempt
+   * as final fallback/default. Never retries a provider and never bounces
+   * back and forth between them.
    */
   async _runLayer3(goal, pageState, elements, options) {
     const { signal, cloudContext = {} } = options;
     let qwenMs = 0;
     let qwenFailureReason = null;
+    let visionMs = 0;
+    let visionFailureReason = null;
+    // Fetched at most once and reused by whichever of local-vision/cloud
+    // ends up needing it — never captured twice for a single planning cycle.
+    let screenshot = null;
+    const getScreenshotOnce = async () => {
+      if (!screenshot) {
+        screenshot = cloudContext.getScreenshot ? await cloudContext.getScreenshot() : null;
+      }
+      return screenshot;
+    };
 
+    // Local visual PERCEPTION (Moondream, privacy-vision Phase 2, corrected):
+    // tried first in local-qwen (local-first) mode, before Qwen, right after
+    // an L1/L2 miss — so it runs even when Qwen would have succeeded.
+    // LocalVisionAdapter.plan() returns a minimal perception result
+    // ({elementId, action, confidence, reason}), never a plan — it is not a
+    // second planner. The elementId is only ever trusted after being
+    // validated here against the CURRENT page-state element list; an
+    // elementId that isn't a real, currently-known element is treated
+    // exactly like a failure and falls through to Qwen/cloud, the same as
+    // any other unusable L3 result.
+    if (this.executionMode === 'local-qwen') {
+      const tVisionAvailStart = Date.now();
+      let visionAvail;
+      try {
+        visionAvail = await this.localVisionAdapter.checkAvailability();
+      } catch (err) {
+        visionAvail = { available: false, reason: err?.message || 'availability_check_failed' };
+      }
+      console.log(`[SP:DecisionRouter] Layer 3 Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
+
+      if (visionAvail.available) {
+        const tVisionStart = Date.now();
+        try {
+          const shot = await getScreenshotOnce();
+          const perception = await this.localVisionAdapter.plan({
+            schemaVersion: '1',
+            goal,
+            page: { url: pageState.url, title: pageState.title, screenshot: shot },
+            elements
+          }, { signal });
+          visionMs = Date.now() - tVisionStart;
+
+          if (perception?.result === 'FAILED') {
+            visionFailureReason = perception.error || perception.errorCode || 'vision_failed';
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) — falling back to Qwen/cloud`);
+          } else {
+            // Grounding/safety gate: Moondream may only ever point at an
+            // element PageStateService actually extracted this cycle. Any
+            // other id (invented, stale, or simply absent) is unusable —
+            // never trusted, never executed.
+            const resolvedElement = elements.find((el) => el.id === perception.elementId);
+            if (!resolvedElement) {
+              visionFailureReason = 'invalid_element_id';
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" — rejected, falling back to Qwen/cloud`);
+            } else {
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION succeeded (${visionMs}ms) elementId=${perception.elementId}`);
+              return {
+                layer: 'local_vision',
+                planResponse: this._buildPlanFromElement(goal, resolvedElement, perception.confidence ?? 0.75, 'local_vision'),
+                qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason: null
+              };
+            }
+          }
+        } catch (err) {
+          visionMs = Date.now() - tVisionStart;
+          visionFailureReason = err?.message || 'vision_error';
+          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) — falling back to Qwen/cloud`);
+        }
+      } else {
+        visionFailureReason = visionAvail.reason || 'moondream_unavailable';
+        console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) — falling back to Qwen/cloud`);
+      }
+    }
+
+    // Local Qwen (text planner) — unchanged, now the second local attempt,
+    // tried whenever vision didn't already resolve the step (unavailable,
+    // failed, or an unusable elementId).
     if (this.executionMode === 'local-qwen') {
       const tAvailStart = Date.now();
       let avail;
@@ -145,7 +240,7 @@ export class DecisionRouter {
             console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) — falling back to cloud once`);
           } else {
             console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms)`);
-            return { layer: 'local_qwen', planResponse, qwenMs, cloudMs: 0, qwenFailureReason: null };
+            return { layer: 'local_qwen', planResponse, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
           }
         } catch (err) {
           // Defense-in-depth: a custom/mock adapter (or a future code path) might
@@ -160,11 +255,12 @@ export class DecisionRouter {
       }
     }
 
-    // Cloud: the default L3 (executionMode==='cloud'), or the fallback after a
-    // failed/unavailable Qwen attempt. Screenshot is fetched here, lazily —
-    // only paid for when a cloud call is actually about to happen.
+    // Cloud: the default L3 (executionMode==='cloud'), or the fallback after
+    // vision and Qwen have both failed/been unavailable. Screenshot is
+    // fetched here, lazily — only paid for when a cloud call is actually
+    // about to happen (or reused from the local-vision attempt above).
     const tCloudStart = Date.now();
-    const screenshot = cloudContext.getScreenshot ? await cloudContext.getScreenshot() : null;
+    const shotForCloud = await getScreenshotOnce();
     const cloudRequest = {
       schemaVersion: '1',
       requestId: cloudContext.requestId,
@@ -172,7 +268,7 @@ export class DecisionRouter {
       page: {
         url: pageState.url,
         title: pageState.title,
-        screenshot: { image: screenshot?.image, mimeType: screenshot?.mimeType }
+        screenshot: { image: shotForCloud?.image, mimeType: shotForCloud?.mimeType }
       },
       ...(cloudContext.executionHistory && { executionHistory: cloudContext.executionHistory }),
       ...(cloudContext.clarifications?.length && { clarifications: cloudContext.clarifications }),
@@ -182,7 +278,7 @@ export class DecisionRouter {
     const cloudMs = Date.now() - tCloudStart;
     console.log(`[SP:DecisionRouter] Layer 3 CLOUD resolved (${cloudMs}ms)`);
 
-    return { layer: 'cloud', planResponse, qwenMs, cloudMs, qwenFailureReason };
+    return { layer: 'cloud', planResponse, qwenMs, visionMs, cloudMs, qwenFailureReason, visionFailureReason };
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
