@@ -27,6 +27,10 @@ import { GoalVerifier }      from './goal-verifier.js';
 
 export const DETERMINISTIC_THRESHOLD = 0.85;
 export const ML_GROUNDING_THRESHOLD  = 0.70;
+// SIH 2026 demo latency fix: cap on how many L2-ranked candidates get sent to
+// Moondream (see _runLayer3) — smaller prompt, faster local-vision inference,
+// without changing L1/L2's own matching/thresholds at all.
+export const VISION_CANDIDATE_LIMIT  = 10;
 
 export class DecisionRouter {
   /**
@@ -114,7 +118,7 @@ export class DecisionRouter {
     // ── Layer 3: reasoning fallback (Cloud default, Local Qwen opt-in) ─────────
     console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode}`);
     console.log(`[SP:V2:DEBUG] layer=L3 reason=confidence_below_threshold candidateCount=${elements.length} executionMode=${this.executionMode}`);
-    const l3 = await this._runLayer3(goal, pageState, elements, options);
+    const l3 = await this._runLayer3(goal, pageState, elements, options, ranked);
 
     return { ...l3, layer1Ms, layer2Ms };
   }
@@ -127,7 +131,7 @@ export class DecisionRouter {
    * as final fallback/default. Never retries a provider and never bounces
    * back and forth between them.
    */
-  async _runLayer3(goal, pageState, elements, options) {
+  async _runLayer3(goal, pageState, elements, options, ranked = []) {
     const { signal, cloudContext = {} } = options;
     let qwenMs = 0;
     let qwenFailureReason = null;
@@ -167,11 +171,21 @@ export class DecisionRouter {
         const tVisionStart = Date.now();
         try {
           const shot = await getScreenshotOnce();
+          // SIH 2026 demo latency fix: send Moondream only the most
+          // goal-relevant candidates (reusing the SAME ranking L2 already
+          // computed a moment ago — no extra scoring pass) instead of every
+          // element, shrinking its prompt/inference time. Validation below
+          // still checks the returned elementId against the FULL `elements`
+          // list, so this can only narrow what Moondream is offered, never
+          // what a valid response is allowed to reference.
+          const visionElements = ranked.length
+            ? ranked.slice(0, VISION_CANDIDATE_LIMIT).map((r) => r.element)
+            : elements;
           const perception = await this.localVisionAdapter.plan({
             schemaVersion: '1',
             goal,
             page: { url: pageState.url, title: pageState.title, screenshot: shot },
-            elements
+            elements: visionElements
           }, { signal });
           visionMs = Date.now() - tVisionStart;
 

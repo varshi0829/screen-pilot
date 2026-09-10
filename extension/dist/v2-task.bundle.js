@@ -930,6 +930,106 @@ ${lines.join("\n")}`);
     }
   };
 
+  // extension/lib/privacy-sanitizer.js
+  var REDACTED = "[REDACTED]";
+  var SENSITIVE_INPUT_TYPES = /* @__PURE__ */ new Set(["password", "email", "tel"]);
+  var SENSITIVE_AUTOCOMPLETE = /* @__PURE__ */ new Set([
+    "current-password",
+    "new-password",
+    "one-time-code",
+    "cc-number",
+    "cc-csc",
+    "cc-exp",
+    "cc-exp-month",
+    "cc-exp-year",
+    "cc-name",
+    "email",
+    "tel",
+    "tel-national",
+    "street-address",
+    "address-line1",
+    "address-line2",
+    "postal-code",
+    "bday",
+    "ssn"
+  ]);
+  var SENSITIVE_LABEL_PATTERN = new RegExp(
+    "\\b(" + [
+      "password",
+      "passcode",
+      "pin\\s*code",
+      "otp",
+      "one[- ]time[- ]code",
+      "cvv",
+      "cvc",
+      "security\\s*code",
+      "card\\s*number",
+      "credit\\s*card",
+      "ssn",
+      "social\\s*security",
+      "routing\\s*number",
+      "account\\s*number",
+      "api\\s*key",
+      "secret\\s*key",
+      "auth\\s*token"
+    ].join("|") + ")\\b",
+    "i"
+  );
+  var PII_PATTERNS = [
+    { name: "email", re: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
+    { name: "ssn", re: /\b\d{3}-\d{2}-\d{4}\b/ },
+    { name: "credit_card", re: /\b(?:\d[ -]?){13,19}\b/ },
+    { name: "phone", re: /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/ }
+  ];
+  function isSensitiveInputType(type) {
+    return SENSITIVE_INPUT_TYPES.has(String(type || "").toLowerCase());
+  }
+  function isSensitiveAutocomplete(autocomplete) {
+    return SENSITIVE_AUTOCOMPLETE.has(String(autocomplete || "").toLowerCase());
+  }
+  function hasSensitiveLabelSignal(...strings) {
+    return strings.some((s) => typeof s === "string" && s && SENSITIVE_LABEL_PATTERN.test(s));
+  }
+  function containsPII(text) {
+    if (!text || typeof text !== "string") return false;
+    return PII_PATTERNS.some((p) => p.re.test(text));
+  }
+  function isSensitiveElement(el) {
+    if (!el) return false;
+    if (isSensitiveInputType(el.type)) return true;
+    if (isSensitiveAutocomplete(el.autocomplete)) return true;
+    if (hasSensitiveLabelSignal(el.placeholder, el.ariaLabel)) return true;
+    if (containsPII(el.value) || containsPII(el.text)) return true;
+    return false;
+  }
+  function sanitizeElement(el) {
+    if (!isSensitiveElement(el)) return el;
+    return {
+      ...el,
+      text: el.text ? REDACTED : el.text,
+      value: el.value ? REDACTED : el.value,
+      sensitive: true
+    };
+  }
+  function sanitizeElements(elements) {
+    if (!Array.isArray(elements)) return elements;
+    return elements.map(sanitizeElement);
+  }
+  function getSensitiveRegions(elements) {
+    if (!Array.isArray(elements)) return [];
+    return elements.filter(isSensitiveElement).map((el) => el.bbox).filter((bbox) => bbox && bbox.width > 0 && bbox.height > 0);
+  }
+  var PrivacySanitizer = {
+    REDACTED,
+    isSensitiveElement,
+    sanitizeElement,
+    sanitizeElements,
+    getSensitiveRegions
+  };
+  if (typeof globalThis !== "undefined" && globalThis.module) {
+    globalThis.module.exports = PrivacySanitizer;
+  }
+
   // extension/services/page-state-service.js
   var PageStateService = (() => {
     "use strict";
@@ -990,6 +1090,8 @@ ${lines.join("\n")}`);
         const href = clean(el.getAttribute?.("href") || "", 120);
         const enabled = !el.disabled;
         const region = getRegion(el);
+        const type = tag === "input" ? clean(el.getAttribute?.("type") || el.type || "", 20) : "";
+        const autocomplete = clean(el.getAttribute?.("autocomplete") || "", 30);
         if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox") continue;
         let bbox = null;
         if (typeof el.getBoundingClientRect === "function") {
@@ -1010,14 +1112,19 @@ ${lines.join("\n")}`);
           visible,
           enabled,
           region,
-          bbox
+          bbox,
+          type,
+          autocomplete
         });
         if (count >= 300) break;
       }
+      const sanitizedElements = PrivacySanitizer.sanitizeElements(elements);
+      const sensitiveRegions = PrivacySanitizer.getSensitiveRegions(elements);
       return {
         url,
         title,
-        elements,
+        elements: sanitizedElements,
+        sensitiveRegions,
         timestamp: Date.now()
       };
     }
@@ -1357,6 +1464,267 @@ Return JSON ONLY:
         blockers: [],
         confidence: 0,
         providerMetadata: { provider: "local-qwen", model: this._model, latencyMs: 0 },
+        error,
+        errorCode
+      };
+    }
+  };
+
+  // extension/providers/local-vision-adapter.js
+  var DEFAULT_OLLAMA_URL2 = "http://127.0.0.1:11434";
+  var DEFAULT_MODEL2 = "moondream";
+  var DEFAULT_KEEP_ALIVE2 = "5m";
+  var VISION_GENERATE_TIMEOUT_MS = 8e3;
+  var VISION_AVAILABILITY_TIMEOUT_MS = 2500;
+  var LocalVisionAdapter = class extends BackendAdapter {
+    /**
+     * @param {object} [options]
+     * @param {string} [options.ollamaUrl] - Local Ollama server URL (defaults to http://127.0.0.1:11434)
+     * @param {string} [options.model]     - Local vision model name (defaults to "moondream")
+     * @param {string} [options.keepAlive] - Model warm duration (defaults to "5m")
+     */
+    constructor({ ollamaUrl = DEFAULT_OLLAMA_URL2, model = DEFAULT_MODEL2, keepAlive = DEFAULT_KEEP_ALIVE2 } = {}) {
+      super();
+      this._ollamaUrl = ollamaUrl.replace(/\/$/, "");
+      this._model = model;
+      this._keepAlive = keepAlive;
+    }
+    get name() {
+      return "LocalVisionAdapter";
+    }
+    /**
+     * Identify which one existing element (if any) visually matches the next
+     * step toward the goal. NOT a planner call — returns a minimal perception
+     * result, never a full PlanResponse. The caller (DecisionRouter) is
+     * responsible for validating the returned elementId against the current
+     * page-state element list before trusting it.
+     *
+     * @param {{goal:string, page:{url?:string, title?:string, screenshot?:{image:string,mimeType?:string}}, elements?:object[]}} request
+     * @param {object} [options]
+     * @param {AbortSignal} [options.signal]
+     * @returns {Promise<{result:'OK', elementId:string|null, action:string|null, confidence:number, reason:string}|{result:'FAILED', error:string, errorCode:string}>}
+     */
+    async plan(request, options = {}) {
+      const t0 = Date.now();
+      const callerSignal = options?.signal;
+      const reqId = request?.requestId || `req_vision_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      console.log(`[SP:V2:DEBUG] LocalVisionAdapter request start reqId=${reqId} model=${this._model}`);
+      if (callerSignal?.aborted) {
+        return this._networkFailure("Request aborted", "ABORTED");
+      }
+      const imageBase64 = request?.page?.screenshot?.image;
+      if (!imageBase64) {
+        return this._networkFailure("No screenshot provided for local vision reasoning", "NO_SCREENSHOT");
+      }
+      const prompt = this._buildVisionPrompt(request);
+      const targetUrl = `${this._ollamaUrl}/api/generate`;
+      const requestBody = {
+        model: this._model,
+        prompt,
+        images: [imageBase64],
+        format: "json",
+        stream: false,
+        keep_alive: this._keepAlive,
+        options: {
+          temperature: 0,
+          num_predict: 128
+        }
+      };
+      let data = null;
+      let isSuccess = false;
+      const hasChromeRuntime = typeof chrome !== "undefined" && chrome?.runtime?.sendMessage;
+      if (hasChromeRuntime) {
+        try {
+          let abortHandler = null;
+          if (callerSignal) {
+            abortHandler = () => {
+              try {
+                chrome.runtime.sendMessage({ type: "OLLAMA_CANCEL", reqId });
+              } catch {
+              }
+            };
+            callerSignal.addEventListener("abort", abortHandler, { once: true });
+          }
+          const bgResp = await new Promise((resolve) => {
+            chrome.runtime.sendMessage({
+              type: "OLLAMA_GENERATE",
+              reqId,
+              url: targetUrl,
+              body: requestBody
+            }, (response) => {
+              if (callerSignal && abortHandler) {
+                callerSignal.removeEventListener("abort", abortHandler);
+              }
+              if (chrome.runtime.lastError) {
+                resolve({ success: false, error: chrome.runtime.lastError.message });
+              } else {
+                resolve(response || { success: false, error: "No response from background script" });
+              }
+            });
+          });
+          if (!bgResp?.success) {
+            console.error(`[SP:V2:DEBUG] Background Ollama proxy failed (vision) reqId=${reqId}: ${bgResp?.error}`);
+            const errCode = bgResp?.errorCode || (callerSignal?.aborted ? "ABORTED" : "OLLAMA_UNAVAILABLE");
+            return this._networkFailure(bgResp?.error || "Background Ollama proxy failed", errCode);
+          }
+          data = bgResp.data;
+          isSuccess = true;
+        } catch (proxyErr) {
+          console.error(`[SP:V2:DEBUG] Background proxy error (vision) reqId=${reqId} message=${proxyErr?.message}`);
+        }
+      }
+      if (!isSuccess) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          controller.abort(`vision_timeout_${VISION_GENERATE_TIMEOUT_MS}ms`);
+        }, VISION_GENERATE_TIMEOUT_MS);
+        if (callerSignal) {
+          callerSignal.addEventListener("abort", () => {
+            controller.abort(callerSignal.reason || "caller_aborted");
+          }, { once: true });
+        }
+        let upstream;
+        try {
+          upstream = await fetch(targetUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+        } catch (err) {
+          clearTimeout(timeoutId);
+          const isCallerAborted = callerSignal?.aborted;
+          const isTimeout = err instanceof Error && err.name === "AbortError" && !isCallerAborted;
+          const message = isCallerAborted ? "Local vision request was aborted" : isTimeout ? "Local vision inference timed out" : err instanceof Error ? err.message : String(err);
+          const errorCode = isCallerAborted ? "ABORTED" : isTimeout ? "TIMEOUT" : "OLLAMA_UNAVAILABLE";
+          return this._networkFailure(message, errorCode);
+        }
+        if (!upstream.ok) {
+          return this._networkFailure(`Ollama returned status ${upstream.status}`, "OLLAMA_ERROR");
+        }
+        data = await upstream.json().catch(() => null);
+      }
+      const rawResponse = data?.response ?? "";
+      const latencyMs = Date.now() - t0;
+      console.log(`[SP:V2:PERF] visionLatencyMs=${latencyMs} model=${this._model}`);
+      let parsed;
+      try {
+        parsed = JSON.parse(rawResponse);
+      } catch {
+        return this._networkFailure("Local vision model returned invalid JSON", "PARSE_ERROR");
+      }
+      console.log(`[SP:V2:DEBUG] LocalVisionAdapter perception result reqId=${reqId} elementId=${parsed?.elementId ?? "null"} action=${parsed?.action ?? "n/a"}`);
+      return this._formatPerceptionResult(parsed);
+    }
+    async recover(request, options = {}) {
+      return this.plan(request, options);
+    }
+    async explain() {
+      return { success: true, screenContext: { application: "Web App", pageType: "other" } };
+    }
+    async ask() {
+      return { success: true, answer: "Local vision screen analysis complete." };
+    }
+    estimateCost() {
+      return { inputTokens: 0, outputTokens: 0, estimatedUSD: 0 };
+    }
+    /**
+     * Same proxy-with-direct-fetch-fallback pattern as LocalQwenAdapter.checkAvailability.
+     */
+    async checkAvailability() {
+      const hasChromeRuntime = typeof chrome !== "undefined" && chrome?.runtime?.sendMessage;
+      if (hasChromeRuntime) {
+        try {
+          const proxied = await Promise.race([
+            new Promise((resolve) => {
+              chrome.runtime.sendMessage({ type: "OLLAMA_CHECK", url: `${this._ollamaUrl}/api/tags` }, (response) => {
+                if (chrome.runtime.lastError) resolve({ __proxyFailed: true });
+                else resolve(response || { __proxyFailed: true });
+              });
+            }),
+            new Promise((resolve) => setTimeout(() => resolve({ __proxyTimeout: true }), VISION_AVAILABILITY_TIMEOUT_MS))
+          ]);
+          if (!proxied.__proxyFailed && !proxied.__proxyTimeout) {
+            return proxied.available ? { available: true } : { available: false, reason: proxied.error || "Ollama server not reachable at " + this._ollamaUrl };
+          }
+          if (proxied.__proxyTimeout) {
+            return { available: false, reason: "Ollama availability check timed out at " + this._ollamaUrl };
+          }
+        } catch {
+        }
+      }
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort("availability_timeout"), VISION_AVAILABILITY_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${this._ollamaUrl}/api/tags`, { method: "GET", signal: controller.signal });
+        return { available: res.ok };
+      } catch {
+        return { available: false, reason: "Ollama server not reachable at " + this._ollamaUrl };
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+    // ── Helpers ─────────────────────────────────────────────────────────────────
+    /**
+     * Minimum useful context for the vision model: the goal, and a compact
+     * (already-sanitized, already-capped) list of interactive elements with
+     * stable ids — not the full page state. The screenshot itself carries the
+     * visual context; this text just gives the model the fixed vocabulary of
+     * ids it is allowed to answer with.
+     */
+    _buildVisionPrompt(request) {
+      const page = request.page ?? {};
+      const elements = request.elements ?? [];
+      const compactElements = elements.slice(0, 25).map((e) => ({
+        id: e.id,
+        role: e.role,
+        text: e.text || e.ariaLabel || e.placeholder || ""
+      }));
+      return `Goal: "${request.goal}"
+Page: ${page.title || ""} (${page.url || ""})
+
+You are a VISUAL PERCEPTION assistant, not a planner. You are shown a
+screenshot of the current page (sensitive fields are already blacked out
+locally \u2014 you will never see real passwords, emails, or card numbers).
+
+Known interactive elements already extracted from the page (id, role, text):
+${JSON.stringify(compactElements)}
+
+Using the screenshot, identify which ONE of the elements above is the
+visually correct next target for the goal.
+
+Rules:
+- "elementId" MUST be copied exactly from the list above. Never invent,
+  guess, or construct a new id.
+- If none of the listed elements visually match, return elementId: null.
+
+Return JSON ONLY:
+{"action":"click"|"type"|"select"|"navigate","elementId":"el_12","confidence":0.91,"reason":"short reason"}`;
+    }
+    /**
+     * Deliberately minimal: this is a perception result, not a plan. It names
+     * which known element (if any) looks right and how confident the model is
+     * — it does NOT shape a step/PlanResponse. DecisionRouter validates
+     * elementId against the live page state and, only then, builds the actual
+     * executable step via the same _buildPlanFromElement helper L1/L2 use.
+     */
+    _formatPerceptionResult(visionOutput) {
+      return {
+        result: "OK",
+        elementId: typeof visionOutput?.elementId === "string" ? visionOutput.elementId : null,
+        action: typeof visionOutput?.action === "string" ? visionOutput.action : null,
+        confidence: Number.isFinite(visionOutput?.confidence) ? Math.max(0, Math.min(1, visionOutput.confidence)) : 0,
+        reason: typeof visionOutput?.reason === "string" ? visionOutput.reason : ""
+      };
+    }
+    _networkFailure(error, errorCode) {
+      return {
+        schemaVersion: "1",
+        result: "FAILED",
+        blockers: [],
+        confidence: 0,
+        providerMetadata: { provider: "local-vision", model: this._model, latencyMs: 0 },
         error,
         errorCode
       };
@@ -1713,6 +2081,7 @@ Return JSON ONLY:
   // extension/services/decision-router.js
   var DETERMINISTIC_THRESHOLD = 0.85;
   var ML_GROUNDING_THRESHOLD = 0.7;
+  var VISION_CANDIDATE_LIMIT = 10;
   var DecisionRouter = class {
     /**
      * @param {object} [options]
@@ -1720,6 +2089,7 @@ Return JSON ONLY:
      * @param {number} [options.mlGroundingThreshold]
      * @param {'cloud'|'local-qwen'} [options.executionMode] - L3 backend selection. Default 'cloud'.
      * @param {object} [options.localQwenAdapter]
+     * @param {object} [options.localVisionAdapter]
      * @param {object} [options.cloudAdapter]
      */
     constructor({
@@ -1727,12 +2097,14 @@ Return JSON ONLY:
       mlGroundingThreshold = ML_GROUNDING_THRESHOLD,
       executionMode = "cloud",
       localQwenAdapter = null,
+      localVisionAdapter = null,
       cloudAdapter = null
     } = {}) {
       this.deterministicThreshold = deterministicThreshold;
       this.mlGroundingThreshold = mlGroundingThreshold;
       this.executionMode = executionMode;
       this.localQwenAdapter = localQwenAdapter ?? new LocalQwenAdapter();
+      this.localVisionAdapter = localVisionAdapter ?? new LocalVisionAdapter();
       this.cloudAdapter = cloudAdapter ?? new VercelBackendAdapter();
     }
     /**
@@ -1787,18 +2159,82 @@ Return JSON ONLY:
       }
       console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode}`);
       console.log(`[SP:V2:DEBUG] layer=L3 reason=confidence_below_threshold candidateCount=${elements.length} executionMode=${this.executionMode}`);
-      const l3 = await this._runLayer3(goal, pageState, elements, options);
+      const l3 = await this._runLayer3(goal, pageState, elements, options, ranked);
       return { ...l3, layer1Ms, layer2Ms };
     }
     /**
-     * L3: exactly one Qwen attempt (only when executionMode === 'local-qwen' and
-     * Ollama reports available), then exactly one Cloud attempt as fallback/default.
-     * Never retries a provider and never bounces back and forth between them.
+     * L3: exactly one Moondream VISUAL PERCEPTION attempt (only when
+     * executionMode === 'local-qwen', before Qwen — so it runs even when Qwen
+     * would have succeeded), then exactly one Qwen (text) attempt if vision
+     * didn't yield a usable, validated element, then exactly one Cloud attempt
+     * as final fallback/default. Never retries a provider and never bounces
+     * back and forth between them.
      */
-    async _runLayer3(goal, pageState, elements, options) {
+    async _runLayer3(goal, pageState, elements, options, ranked = []) {
       const { signal, cloudContext = {} } = options;
       let qwenMs = 0;
       let qwenFailureReason = null;
+      let visionMs = 0;
+      let visionFailureReason = null;
+      let screenshot = null;
+      const getScreenshotOnce = async () => {
+        if (!screenshot) {
+          screenshot = cloudContext.getScreenshot ? await cloudContext.getScreenshot() : null;
+        }
+        return screenshot;
+      };
+      if (this.executionMode === "local-qwen") {
+        const tVisionAvailStart = Date.now();
+        let visionAvail;
+        try {
+          visionAvail = await this.localVisionAdapter.checkAvailability();
+        } catch (err) {
+          visionAvail = { available: false, reason: err?.message || "availability_check_failed" };
+        }
+        console.log(`[SP:DecisionRouter] Layer 3 Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
+        if (visionAvail.available) {
+          const tVisionStart = Date.now();
+          try {
+            const shot = await getScreenshotOnce();
+            const visionElements = ranked.length ? ranked.slice(0, VISION_CANDIDATE_LIMIT).map((r) => r.element) : elements;
+            const perception = await this.localVisionAdapter.plan({
+              schemaVersion: "1",
+              goal,
+              page: { url: pageState.url, title: pageState.title, screenshot: shot },
+              elements: visionElements
+            }, { signal });
+            visionMs = Date.now() - tVisionStart;
+            if (perception?.result === "FAILED") {
+              visionFailureReason = perception.error || perception.errorCode || "vision_failed";
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to Qwen/cloud`);
+            } else {
+              const resolvedElement = elements.find((el) => el.id === perception.elementId);
+              if (!resolvedElement) {
+                visionFailureReason = "invalid_element_id";
+                console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" \u2014 rejected, falling back to Qwen/cloud`);
+              } else {
+                console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION succeeded (${visionMs}ms) elementId=${perception.elementId}`);
+                return {
+                  layer: "local_vision",
+                  planResponse: this._buildPlanFromElement(goal, resolvedElement, perception.confidence ?? 0.75, "local_vision"),
+                  qwenMs,
+                  visionMs,
+                  cloudMs: 0,
+                  qwenFailureReason: null,
+                  visionFailureReason: null
+                };
+              }
+            }
+          } catch (err) {
+            visionMs = Date.now() - tVisionStart;
+            visionFailureReason = err?.message || "vision_error";
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to Qwen/cloud`);
+          }
+        } else {
+          visionFailureReason = visionAvail.reason || "moondream_unavailable";
+          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) \u2014 falling back to Qwen/cloud`);
+        }
+      }
       if (this.executionMode === "local-qwen") {
         const tAvailStart = Date.now();
         let avail;
@@ -1823,7 +2259,7 @@ Return JSON ONLY:
               console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) \u2014 falling back to cloud once`);
             } else {
               console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms)`);
-              return { layer: "local_qwen", planResponse: planResponse2, qwenMs, cloudMs: 0, qwenFailureReason: null };
+              return { layer: "local_qwen", planResponse: planResponse2, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
             }
           } catch (err) {
             qwenMs = Date.now() - tQwenStart;
@@ -1836,7 +2272,7 @@ Return JSON ONLY:
         }
       }
       const tCloudStart = Date.now();
-      const screenshot = cloudContext.getScreenshot ? await cloudContext.getScreenshot() : null;
+      const shotForCloud = await getScreenshotOnce();
       const cloudRequest = {
         schemaVersion: "1",
         requestId: cloudContext.requestId,
@@ -1844,7 +2280,7 @@ Return JSON ONLY:
         page: {
           url: pageState.url,
           title: pageState.title,
-          screenshot: { image: screenshot?.image, mimeType: screenshot?.mimeType }
+          screenshot: { image: shotForCloud?.image, mimeType: shotForCloud?.mimeType }
         },
         ...cloudContext.executionHistory && { executionHistory: cloudContext.executionHistory },
         ...cloudContext.clarifications?.length && { clarifications: cloudContext.clarifications },
@@ -1853,7 +2289,7 @@ Return JSON ONLY:
       const planResponse = await this.cloudAdapter.plan(cloudRequest, { signal });
       const cloudMs = Date.now() - tCloudStart;
       console.log(`[SP:DecisionRouter] Layer 3 CLOUD resolved (${cloudMs}ms)`);
-      return { layer: "cloud", planResponse, qwenMs, cloudMs, qwenFailureReason };
+      return { layer: "cloud", planResponse, qwenMs, visionMs, cloudMs, qwenFailureReason, visionFailureReason };
     }
     // ── Helpers ─────────────────────────────────────────────────────────────────
     _evalFastPath(goal, elements) {
@@ -2872,10 +3308,18 @@ Return JSON ONLY:
       }
     };
   }
-  async function captureScreenshot() {
-    const resp = await chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" });
+  async function captureScreenshot(sensitiveRegions) {
+    const resp = await chrome.runtime.sendMessage({
+      type: "CAPTURE_SCREENSHOT",
+      sensitiveRegions: sensitiveRegions || [],
+      devicePixelRatio: window.devicePixelRatio || 1
+    });
     if (!resp?.success) throw new Error(resp?.error || "Screenshot capture failed");
     return { image: resp.image, mimeType: resp.mimeType || "image/png" };
+  }
+  function sanitizeControlField(value) {
+    if (!value) return value;
+    return PrivacySanitizer.isSensitiveElement({ ariaLabel: value, text: value }) ? PrivacySanitizer.REDACTED : value;
   }
   function collectPageControls() {
     if (!window.DOMMatcher) return [];
@@ -2889,10 +3333,10 @@ Return JSON ONLY:
       if (!window.DOMMatcher.isVisible(el)) continue;
       if (el.closest?.(SP_SEL)) continue;
       seen.add(el);
-      const text = (el.innerText || "").trim().replace(/\s+/g, " ").slice(0, 80);
-      const ariaLabel = (el.getAttribute("aria-label") || "").trim().slice(0, 80);
-      const title = (el.getAttribute("title") || "").trim().slice(0, 80);
-      const imgAlt = el.querySelector?.("img[alt]")?.getAttribute?.("alt")?.trim() ?? "";
+      const text = sanitizeControlField((el.innerText || "").trim().replace(/\s+/g, " ").slice(0, 80));
+      const ariaLabel = sanitizeControlField((el.getAttribute("aria-label") || "").trim().slice(0, 80));
+      const title = sanitizeControlField((el.getAttribute("title") || "").trim().slice(0, 80));
+      const imgAlt = sanitizeControlField(el.querySelector?.("img[alt]")?.getAttribute?.("alt")?.trim() ?? "");
       if (!text && !ariaLabel && !title && !imgAlt) continue;
       const region = window.DOMMatcher.detectRegion(el);
       const key = buckets[region] !== void 0 ? region : "other";
@@ -3167,7 +3611,7 @@ Return JSON ONLY:
         }
         const getScreenshot = async () => {
           const tSnap = Date.now();
-          const shot = await captureScreenshot();
+          const shot = await captureScreenshot(pageState.sensitiveRegions);
           screenshotMs = Date.now() - tSnap;
           return shot;
         };

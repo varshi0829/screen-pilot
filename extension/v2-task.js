@@ -13,6 +13,7 @@ import { TaskState, TaskEvent, transition }       from './shared/state-machine/t
 import { SessionStore }                           from './services/session-store.js';
 import { GoalVerifier }                           from './services/goal-verifier.js';
 import { classifyNavigation, NavClassification }  from './services/navigation-classifier.js';
+import { PrivacySanitizer }                       from './lib/privacy-sanitizer.js';
 
 let _state = TaskState.IDLE;
 function ts() {
@@ -382,6 +383,19 @@ async function captureScreenshot(sensitiveRegions) {
   if (!resp?.success) throw new Error(resp?.error || "Screenshot capture failed");
   return { image: resp.image, mimeType: resp.mimeType || "image/png" };
 }
+// pageControls is sent to the CLOUD planner as-is (decision-router.js attaches
+// it to cloudContext.pageControls verbatim) — unlike PageStateService.elements,
+// it is built here from raw DOM reads and never passed through
+// PrivacySanitizer upstream. Each field is checked independently and, only
+// when actually sensitive, replaced with PrivacySanitizer.REDACTED — an
+// ordinary control (e.g. "Search") is returned completely unchanged, and a
+// control with only one sensitive field (e.g. a sign-out button whose text
+// embeds an email) keeps its other fields/region/tag so it still contributes
+// to grounding.
+function sanitizeControlField(value) {
+  if (!value) return value;
+  return PrivacySanitizer.isSensitiveElement({ ariaLabel: value, text: value }) ? PrivacySanitizer.REDACTED : value;
+}
 function collectPageControls() {
   if (!window.DOMMatcher) return [];
   const selector = 'button, a[href], [role="button"], [role="menuitem"], '
@@ -397,10 +411,10 @@ function collectPageControls() {
     if (el.closest?.(SP_SEL)) continue;
     seen.add(el);
 
-    const text     = (el.innerText     || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-    const ariaLabel = (el.getAttribute('aria-label') || '').trim().slice(0, 80);
-    const title    = (el.getAttribute('title')       || '').trim().slice(0, 80);
-    const imgAlt   = el.querySelector?.('img[alt]')?.getAttribute?.('alt')?.trim() ?? '';
+    const text      = sanitizeControlField((el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 80));
+    const ariaLabel = sanitizeControlField((el.getAttribute('aria-label') || '').trim().slice(0, 80));
+    const title     = sanitizeControlField((el.getAttribute('title')       || '').trim().slice(0, 80));
+    const imgAlt    = sanitizeControlField(el.querySelector?.('img[alt]')?.getAttribute?.('alt')?.trim() ?? '');
 
     if (!text && !ariaLabel && !title && !imgAlt) continue;
 

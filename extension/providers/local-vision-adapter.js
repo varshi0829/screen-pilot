@@ -27,12 +27,15 @@ const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 const DEFAULT_MODEL      = 'moondream';
 const DEFAULT_KEEP_ALIVE = '5m';
 
-// Not yet benchmarked on real hardware (unlike QWEN_GENERATE_TIMEOUT_MS in
-// local-qwen-adapter.js, which cites measured cold/warm figures). Moondream
-// is a much smaller model (~1.8B) than qwen2.5-coder:7b, so this starts at
-// the same budget as a conservative placeholder — revisit once real-hardware
-// latency is measured, the same way that constant's own comment describes.
-const VISION_GENERATE_TIMEOUT_MS     = 15_000;
+// SIH 2026 demo latency fix: this used to copy Qwen's 15s budget verbatim,
+// but Moondream (~1.8B) is a much smaller/faster model than qwen2.5-coder:7b
+// (7B) — a 15s timeout meant a stuck/slow vision call could block the entire
+// task for 15s before Qwen/cloud fallback even started. Still not benchmarked
+// on real hardware (revisit once it is, the same way QWEN_GENERATE_TIMEOUT_MS's
+// own comment describes), but 8s is a deliberately tighter, still-generous
+// budget for a model this size, so a hang degrades to fallback fast instead
+// of stalling the whole demo.
+const VISION_GENERATE_TIMEOUT_MS     = 8_000;
 const VISION_AVAILABILITY_TIMEOUT_MS = 2_500;
 
 export class LocalVisionAdapter extends BackendAdapter {
