@@ -369,8 +369,16 @@ function resolveHighlighter() {
     }
   };
 }
-async function captureScreenshot() {
-  const resp = await chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" });
+async function captureScreenshot(sensitiveRegions) {
+  // sensitiveRegions come from this cycle's own PageStateService.extractPageState()
+  // (CSS-pixel bboxes of password/email/PII fields) — forwarded here so the
+  // background service worker can black them out before returning the image,
+  // ensuring an unredacted screenshot never exists past this same content-script cycle.
+  const resp = await chrome.runtime.sendMessage({
+    type: "CAPTURE_SCREENSHOT",
+    sensitiveRegions: sensitiveRegions || [],
+    devicePixelRatio: window.devicePixelRatio || 1
+  });
   if (!resp?.success) throw new Error(resp?.error || "Screenshot capture failed");
   return { image: resp.image, mimeType: resp.mimeType || "image/png" };
 }
@@ -735,7 +743,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
 
       const getScreenshot = async () => {
         const tSnap = Date.now();
-        const shot = await captureScreenshot();
+        const shot = await captureScreenshot(pageState.sensitiveRegions);
         screenshotMs = Date.now() - tSnap;
         return shot;
       };

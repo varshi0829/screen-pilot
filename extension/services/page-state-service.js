@@ -3,6 +3,12 @@
 // Extracts a website-agnostic, lightweight, normalized JSON representation of
 // the current live webpage DOM state. Used by Fast Path, Small ML Scorer, and
 // Local Qwen Planner to reason without raw HTML or cloud LLM calls.
+//
+// Every element passes through PrivacySanitizer before this function returns,
+// so sensitive text/value content never enters the L1/L2/L3 pipeline (and
+// therefore never reaches a cloud request) in the first place.
+
+import { PrivacySanitizer } from '../lib/privacy-sanitizer.js';
 
 export const PageStateService = (() => {
   'use strict';
@@ -95,6 +101,8 @@ export const PageStateService = (() => {
       const href        = clean(el.getAttribute?.('href') || '', 120);
       const enabled     = !el.disabled;
       const region      = getRegion(el);
+      const type        = tag === 'input' ? clean(el.getAttribute?.('type') || el.type || '', 20) : '';
+      const autocomplete = clean(el.getAttribute?.('autocomplete') || '', 30);
 
       // Skip elements without machine-readable or visible labels
       if (!text && !placeholder && !ariaLabel && !value && !href && role !== 'textbox') continue;
@@ -120,7 +128,9 @@ export const PageStateService = (() => {
         visible,
         enabled,
         region,
-        bbox
+        bbox,
+        type,
+        autocomplete
       });
 
       // Cap in raw DOM order. Real-Chrome finding (getbootstrap.com docs page,
@@ -141,10 +151,16 @@ export const PageStateService = (() => {
       if (count >= 300) break;
     }
 
+    // Sanitize before this ever returns — no caller (L1/L2 matching, the Qwen
+    // prompt builder, or a cloud request) ever sees an unredacted element.
+    const sanitizedElements = PrivacySanitizer.sanitizeElements(elements);
+    const sensitiveRegions  = PrivacySanitizer.getSensitiveRegions(elements);
+
     return {
       url,
       title,
-      elements,
+      elements: sanitizedElements,
+      sensitiveRegions,
       timestamp: Date.now()
     };
   }

@@ -35,7 +35,7 @@ async function handleMessage(message, sender) {
     case 'GET_STATE':              return { success: true, state: StateManager.getState() };
     case 'COMPLETE_TASK':          return completeTask(message);
     case 'ABORT_TASK':             return abortTask(message);
-    case 'CAPTURE_SCREENSHOT':     return captureScreenshot(sender);
+    case 'CAPTURE_SCREENSHOT':     return captureScreenshot(message, sender);
     case 'GET_SCREEN_EXPLANATION': return getScreenExplanation(message, sender);
     case 'ASK_QUESTION':           return askQuestion(message, sender);
     case 'TELEMETRY_EVENT':        return handleTelemetryEvent(message);
@@ -460,8 +460,16 @@ async function abortTask(message) {
 
 // ─── V2 SCREENSHOT CAPTURE ───────────────────────────────────────────────────
 
-async function captureScreenshot(sender) {
-  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+async function captureScreenshot(message, sender) {
+  // sensitiveRegions/devicePixelRatio come from the content script's own
+  // same-cycle page state (it has the DOM and window.devicePixelRatio; this
+  // service worker has neither) so the resulting screenshot is redacted
+  // before it's ever returned to a caller that might forward it to the cloud.
+  const screenshot = await ScreenshotService.captureVisibleTab(
+    sender.tab?.windowId,
+    message?.sensitiveRegions,
+    message?.devicePixelRatio
+  );
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) return { success: false, error: validation.error };
   return { success: true, image: screenshot.image, mimeType: screenshot.mimeType };
