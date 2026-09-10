@@ -21,6 +21,80 @@
   // Stage definitions for progressive loading UI
   const STAGES = ['understanding', 'capturing', 'analyzing', 'matching'];
 
+  // ─── PRIVACY: sensitive screenshot regions ─────────────────────────────────
+  // content.js is a classic (non-module) content script and can't `import`
+  // PrivacySanitizer/PageStateService (ES modules used by v2-task.js's own
+  // capture path). This is a small, self-contained equivalent — mirroring
+  // PrivacySanitizer's own detection rules (input type, autocomplete, sensitive
+  // label/placeholder/aria-label keywords, and PII patterns in typed value) —
+  // so the ANALYZE_GOAL/GET_SCREEN_EXPLANATION/ASK_QUESTION screenshot requests
+  // below get real regions to redact in background.js, the same way
+  // v2-task.js's PageStateService-driven path already does.
+  const SP_SENSITIVE_INPUT_TYPES = new Set(['password', 'email', 'tel']);
+  const SP_SENSITIVE_AUTOCOMPLETE = new Set([
+    'current-password', 'new-password', 'one-time-code',
+    'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-name',
+    'email', 'tel', 'tel-national',
+    'street-address', 'address-line1', 'address-line2', 'postal-code',
+    'bday', 'ssn'
+  ]);
+  // Same keyword set as PrivacySanitizer.SENSITIVE_LABEL_PATTERN.
+  const SP_SENSITIVE_LABEL_PATTERN = new RegExp(
+    '\\b(' + [
+      'password', 'passcode', 'pin\\s*code', 'otp', 'one[- ]time[- ]code',
+      'cvv', 'cvc', 'security\\s*code', 'card\\s*number', 'credit\\s*card',
+      'ssn', 'social\\s*security', 'routing\\s*number', 'account\\s*number',
+      'api\\s*key', 'secret\\s*key', 'auth\\s*token'
+    ].join('|') + ')\\b',
+    'i'
+  );
+  // Same patterns as PrivacySanitizer.PII_PATTERNS.
+  const SP_PII_PATTERNS = [
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i,                              // email
+    /\b\d{3}-\d{2}-\d{4}\b/,                                               // ssn
+    /\b(?:\d[ -]?){13,19}\b/,                                              // credit card
+    /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/,             // phone
+  ];
+
+  function isSpSensitiveField(el, type, autocomplete) {
+    if (SP_SENSITIVE_INPUT_TYPES.has(type)) return true;
+    if (SP_SENSITIVE_AUTOCOMPLETE.has(autocomplete)) return true;
+
+    const placeholder = el.getAttribute('placeholder') || '';
+    const ariaLabel    = el.getAttribute('aria-label') || '';
+    if (SP_SENSITIVE_LABEL_PATTERN.test(placeholder) || SP_SENSITIVE_LABEL_PATTERN.test(ariaLabel)) return true;
+
+    const value = typeof el.value === 'string' ? el.value : '';
+    if (value && SP_PII_PATTERNS.some((re) => re.test(value))) return true;
+
+    return false;
+  }
+
+  function getSensitiveScreenshotRegions() {
+    const regions = [];
+    try {
+      document.querySelectorAll('input, textarea').forEach((el) => {
+        const type = (el.getAttribute('type') || el.type || '').toLowerCase();
+        const autocomplete = (el.getAttribute('autocomplete') || '').toLowerCase();
+        if (!isSpSensitiveField(el, type, autocomplete)) return;
+        const rect = el.getBoundingClientRect?.();
+        if (rect && rect.width > 0 && rect.height > 0) {
+          regions.push({ x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) });
+        }
+      });
+    } catch { /* best-effort — never block a request on this */ }
+    return regions;
+  }
+
+  // On-demand helper: computed fresh right before each screenshot-triggering
+  // request, never cached, so it always reflects the current DOM.
+  function getScreenshotPrivacyContext() {
+    return {
+      sensitiveRegions: getSensitiveScreenshotRegions(),
+      devicePixelRatio: window.devicePixelRatio || 1
+    };
+  }
+
   // ─── PERF TRACER ────────────────────────────────────────────────────────────
   // Measures each phase of an analysis cycle and prints a structured table.
   // Phases: screenshot → gemini → dom_match → highlight
@@ -956,6 +1030,7 @@
         type:  'GET_SCREEN_EXPLANATION',
         url:   window.location.href,
         title: document.title,
+        ...getScreenshotPrivacyContext(),
       });
       if (!response?.success) {
         body.innerHTML = `<div class="sp-explain-row"><span class="sp-explain-row-value" style="color:var(--sp-red)">${escHtml(response?.error || 'Could not analyze screen.')}</span></div>`;
@@ -1009,6 +1084,7 @@
         question,
         url:      window.location.href,
         title:    document.title,
+        ...getScreenshotPrivacyContext(),
       });
       if (!response?.success) {
         ansText.textContent = response?.error || 'Could not answer that question.';
@@ -1123,6 +1199,7 @@
           title:            document.title,
           reason,
           enterpriseContext: state.enterpriseContext || null,
+          ...getScreenshotPrivacyContext(),
         });
         const geminiMs = Math.round(performance.now() - t0Gemini);
         PerfTracer.mark('gemini_roundtrip');

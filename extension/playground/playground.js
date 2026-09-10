@@ -13,6 +13,7 @@
 import { ExecutorEngine }       from '../services/executor-engine.js';
 import { VercelBackendAdapter } from '../providers/vercel-backend-adapter.js';
 import { capturePageSnapshot }  from '../lib/page-snapshot.js';
+import { PageStateService }     from '../services/page-state-service.js';
 import { TaskState, TaskEvent, transition } from '../shared/state-machine/transitions.js';
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
@@ -678,7 +679,16 @@ async function runWorkflow(goal) {
   // ── 1. Screenshot ──────────────────────────────────────────────────────────
   let screenshotImage, screenshotMime;
   try {
-    const resp = await chrome.runtime.sendMessage({ type: 'CAPTURE_SCREENSHOT' });
+    // Same privacy contract as v2-task.js's own capture path: compute this
+    // cycle's sensitive regions from the live DOM via PageStateService before
+    // requesting the screenshot, so background.js redacts them before we
+    // ever see the image.
+    const { sensitiveRegions } = PageStateService.extractPageState();
+    const resp = await chrome.runtime.sendMessage({
+      type: 'CAPTURE_SCREENSHOT',
+      sensitiveRegions,
+      devicePixelRatio: window.devicePixelRatio || 1,
+    });
     if (!resp?.success) throw new Error(resp?.error ?? 'Screenshot capture failed');
     screenshotImage = resp.image;
     screenshotMime  = resp.mimeType ?? 'image/png';

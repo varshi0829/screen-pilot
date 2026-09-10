@@ -73,6 +73,8 @@ async function analyzeGoal(message, sender) {
       enterpriseContext: message.enterpriseContext || null,
       reason:           'initial-analysis',
       forceNew:         true,
+      sensitiveRegions: message.sensitiveRegions,
+      devicePixelRatio: message.devicePixelRatio,
     });
   }
 
@@ -112,6 +114,8 @@ async function analyzeGoal(message, sender) {
     enterpriseContext: ec,
     reason:           'initial-analysis',
     forceNew:         true,
+    sensitiveRegions: message.sensitiveRegions,
+    devicePixelRatio: message.devicePixelRatio,
   });
 }
 
@@ -139,10 +143,12 @@ async function reanalyzeGoal(message, sender) {
     enterpriseContext: message.enterpriseContext || null,
     reason:           message.reason || 'reanalyze',
     forceNew:         false,
+    sensitiveRegions: message.sensitiveRegions,
+    devicePixelRatio: message.devicePixelRatio,
   });
 }
 
-function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason, forceNew }) {
+function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason, forceNew, sensitiveRegions, devicePixelRatio }) {
   const taskState = StateManager.getState();
   const signature = `${taskState?.goal || goal}|${pageContext.url || ''}|${pageContext.title || ''}`;
 
@@ -153,14 +159,14 @@ function queueVisionCycle({ sender, goal, pageContext, enterpriseContext, reason
   }
 
   console.log(`[SP:TRACE:BG] QUEUE_CYCLE NEW reason=${reason} forceNew=${forceNew} signature="${signature.slice(0,70)}" activeAnalysis=${!!activeAnalysis}`);
-  const promise = runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }).finally(() => {
+  const promise = runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason, sensitiveRegions, devicePixelRatio }).finally(() => {
     if (activeAnalysis?.promise === promise) activeAnalysis = null;
   });
   activeAnalysis = { signature, promise, taskState };
   return promise;
 }
 
-async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason }) {
+async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, reason, sensitiveRegions, devicePixelRatio }) {
   const t0     = Date.now();
   const taskId = StateManager.getState()?.taskId;
   console.log(`[CALL #${++_bgCallSeq}] reason=${reason}`);
@@ -194,7 +200,7 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
     return { success: false, error: msg, state: StateManager.getState() };
   }
 
-  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId, sensitiveRegions, devicePixelRatio);
   log(`screenshot: ${Date.now() - t0}ms`);
 
   const validation = ScreenshotService.validateScreenshot(screenshot);
@@ -487,7 +493,7 @@ async function getScreenExplanation(message, sender) {
     return { success: true, screenContext: ctx, fromCache: true };
   }
 
-  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId, message.sensitiveRegions, message.devicePixelRatio);
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) return { success: false, error: validation.error };
 
@@ -515,7 +521,7 @@ async function askQuestion(message, sender) {
     }
   }
 
-  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId);
+  const screenshot = await ScreenshotService.captureVisibleTab(sender.tab?.windowId, message.sensitiveRegions, message.devicePixelRatio);
   const validation = ScreenshotService.validateScreenshot(screenshot);
   if (!validation.valid) return { success: false, error: validation.error };
 
