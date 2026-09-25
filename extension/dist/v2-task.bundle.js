@@ -131,6 +131,13 @@
   });
 
   // extension/services/executor-engine.js
+  var FILL_IDLE_MS = 600;
+  function valueSatisfies(actual, requested) {
+    const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const want = norm(requested);
+    if (!want) return norm(actual).length > 0;
+    return norm(actual).includes(want);
+  }
   var ExecutorEngine = class {
     /**
      * @param {object} deps
@@ -147,7 +154,10 @@
       // the real 2s one. Defaults mirror the existing post-click URL-poll
       // precedent elsewhere in this file (100ms interval, 2s budget).
       elementResolvePollIntervalMs = 100,
-      elementResolveMaxWaitMs = 2e3
+      elementResolveMaxWaitMs = 2e3,
+      // Quiet period before a fill with no requested value counts as finished —
+      // injectable so tests need not wait out the real budget.
+      fillIdleMs = FILL_IDLE_MS
     } = {}) {
       if (!domMatcher) throw new TypeError("ExecutorEngine: domMatcher is required");
       if (!highlighter) throw new TypeError("ExecutorEngine: highlighter is required");
@@ -156,6 +166,7 @@
       this._captureSnapshot = captureSnapshot;
       this._elementResolvePollIntervalMs = elementResolvePollIntervalMs;
       this._elementResolveMaxWaitMs = elementResolveMaxWaitMs;
+      this._fillIdleMs = fillIdleMs;
       this._plan = null;
       this._stepIndex = 0;
       this._status = "idle";
@@ -420,8 +431,14 @@
         text: step.targetElement?.text,
         type: step.targetElement?.type,
         region: step.targetElement?.region,
-        alternatives: step.targetElement?.alternatives
+        alternatives: step.targetElement?.alternatives,
+        elementId: step.targetElement?.elementId,
+        bbox: step.targetElement?.bbox
       });
+      if (!step.targetElement.text?.trim() && step.targetElement.elementId && step.targetElement.bbox) {
+        const positional = this._resolveElementByPosition(step.targetElement);
+        if (positional) return positional;
+      }
       const primary = this._domMatcher.matchElement(step.targetElement);
       if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
         this._logCandidates(step.targetElement.text, primary.candidates);
@@ -436,6 +453,45 @@
         }
       }
       return best;
+    }
+    /**
+     * Resolve a target directly by its already-known on-page position, for a
+     * step whose element has no accessible name to search the live DOM by
+     * (see the caller in _resolveElement). Uses `elementFromPoint` — a
+     * standard DOM API, not a new targeting system — at the center of the
+     * element's own `bbox`, exactly as PageStateService already captured it
+     * via getBoundingClientRect() (the same bbox already used for vision
+     * candidate markers). Entirely generic: this has no knowledge of what the
+     * element is, what site it's on, or what the goal was — only where it is.
+     *
+     * `elementId` is not itself used to look anything up here — pageState ids
+     * are per-extraction-cycle labels with no live DOM binding of their own —
+     * its presence just confirms the step really does carry a page-state-
+     * resolved target before this bypasses text matching at all.
+     *
+     * Returns null (never throws, never guesses) whenever there's nothing
+     * live at that position, that position is disabled, or the runtime
+     * doesn't support `elementFromPoint` (e.g. these unit tests) — every one
+     * of those cases falls back to the caller's existing failure path.
+     *
+     * @param {object} targetElement
+     * @returns {{element:Element, score:number, alternatives:object[], candidates:object[]}|null}
+     */
+    _resolveElementByPosition(targetElement) {
+      const bbox = targetElement?.bbox;
+      if (!bbox || !(bbox.width > 0) || !(bbox.height > 0)) return null;
+      if (typeof document === "undefined" || typeof document.elementFromPoint !== "function") return null;
+      let element;
+      try {
+        element = document.elementFromPoint(bbox.x + bbox.width / 2, bbox.y + bbox.height / 2);
+      } catch {
+        return null;
+      }
+      if (!element) return null;
+      if (this._domMatcher.isDisabled?.(element)) return null;
+      if (typeof this._domMatcher.isVisible === "function" && !this._domMatcher.isVisible(element)) return null;
+      console.log(`[SP:Exec] Resolved by position (no accessible text on target) elementId=${targetElement.elementId} bbox=${JSON.stringify(bbox)} <${element.tagName?.toLowerCase?.() ?? "?"}>`);
+      return { element, score: 100, alternatives: [], candidates: [] };
     }
     /**
      * Verify the element is still safe to highlight.
@@ -484,13 +540,13 @@ ${lines.join("\n")}`);
      */
     _watchForUserAction(step) {
       let fired = false;
-      const onUserAction = (trigger) => {
+      const onUserAction = (trigger, observedValue = null) => {
         if (fired) return;
         fired = true;
         this._teardownListeners();
         this._highlighter.clear();
         this._activeElement = null;
-        this._emit("user:acted", { step, trigger, timestamp: Date.now() });
+        this._emit("user:acted", { step, trigger, observedValue, timestamp: Date.now() });
       };
       const isFillStep = step.phase === "fill_form" || step.completionCondition === "input_filled";
       const clickHandler = (e) => {
@@ -517,7 +573,8 @@ ${lines.join("\n")}`);
           return false;
         };
         const fieldValue = (el) => el.isContentEditable === true ? el.textContent ?? "" : el.value ?? "";
-        const inputHandler = (e) => {
+        let fillIdleTimer = null;
+        const handleFieldEvent = (e, eventKind) => {
           console.log("[SP:FILL] activeElement", {
             tag: this._activeElement?.tagName,
             id: this._activeElement?.id,
@@ -542,14 +599,31 @@ ${lines.join("\n")}`);
           if (!this._activeElement.contains(field)) return;
           if (!isTextLikeField(field)) return;
           if (fieldValue(field).trim().length === 0) return;
-          console.log("[SP:FILL] USER_ACTION_EMITTED");
-          onUserAction("input");
+          const requested = (step.targetElement?.value ?? "").trim();
+          const settle = (reason) => {
+            clearTimeout(fillIdleTimer);
+            console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} value="${fieldValue(field)}"`);
+            onUserAction("input", fieldValue(field));
+          };
+          if (requested) {
+            if (valueSatisfies(fieldValue(field), requested)) settle("requested_value_present");
+            return;
+          }
+          if (eventKind === "change") {
+            settle("change_committed");
+            return;
+          }
+          clearTimeout(fillIdleTimer);
+          fillIdleTimer = setTimeout(() => settle("typing_idle"), this._fillIdleMs);
         };
+        const inputHandler = (e) => handleFieldEvent(e, "input");
+        const changeHandler = (e) => handleFieldEvent(e, "change");
         document.addEventListener("input", inputHandler, { capture: true });
-        document.addEventListener("change", inputHandler, { capture: true });
+        document.addEventListener("change", changeHandler, { capture: true });
         this._cleanups.push(() => {
+          clearTimeout(fillIdleTimer);
           document.removeEventListener("input", inputHandler, { capture: true });
-          document.removeEventListener("change", inputHandler, { capture: true });
+          document.removeEventListener("change", changeHandler, { capture: true });
         });
       }
       const getHref = () => {
@@ -1058,6 +1132,53 @@ ${lines.join("\n")}`);
       }
       return true;
     }
+    function resolveAriaLabelledBy(el, doc) {
+      const idList = (el.getAttribute?.("aria-labelledby") || "").trim();
+      if (!idList || typeof doc?.getElementById !== "function") return "";
+      return idList.split(/\s+/).map((id) => {
+        const ref = doc.getElementById(id);
+        return ref ? ref.innerText || ref.textContent || "" : "";
+      }).filter(Boolean).join(" ");
+    }
+    function buildLabelForMap(doc) {
+      const map = /* @__PURE__ */ new Map();
+      if (typeof doc?.querySelectorAll !== "function") return map;
+      for (const label of doc.querySelectorAll("label[for]")) {
+        const forId = label.getAttribute?.("for");
+        if (!forId || map.has(forId)) continue;
+        map.set(forId, label.innerText || label.textContent || "");
+      }
+      return map;
+    }
+    function resolveLabelFor(el, labelForMap) {
+      const id = el.id || el.getAttribute?.("id") || "";
+      if (!id || !labelForMap) return "";
+      return labelForMap.get(id) || "";
+    }
+    function resolveAncestorLabel(el) {
+      const label = typeof el.closest === "function" ? el.closest("label") : null;
+      if (!label || label === el) return "";
+      return label.innerText || label.textContent || "";
+    }
+    function resolveAccessibleName(el, doc, labelForMap = null) {
+      const direct = clean(el.getAttribute?.("aria-label") || "");
+      if (direct) return direct;
+      const labelledBy = clean(resolveAriaLabelledBy(el, doc));
+      if (labelledBy) return labelledBy;
+      const labelFor = clean(resolveLabelFor(el, labelForMap ?? buildLabelForMap(doc)));
+      if (labelFor) return labelFor;
+      const ancestorLabel = clean(resolveAncestorLabel(el));
+      if (ancestorLabel) return ancestorLabel;
+      const title = clean(el.getAttribute?.("title") || "");
+      if (title) return title;
+      return clean(el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
+    }
+    function resolveFormId(el, formMap) {
+      const form = el.form ?? (typeof el.closest === "function" ? el.closest("form") : null);
+      if (!form) return null;
+      if (!formMap.map.has(form)) formMap.map.set(form, `form_${formMap.count++}`);
+      return formMap.map.get(form);
+    }
     function getRegion(el) {
       if (!el || typeof el.closest !== "function") return "main_content";
       if (el.closest('nav, header, [role="banner"], [role="navigation"]')) return "top_navigation";
@@ -1073,26 +1194,32 @@ ${lines.join("\n")}`);
       const title = doc?.title ?? "";
       const selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"], summary';
       const rawEls = doc && typeof doc.querySelectorAll === "function" ? Array.from(doc.querySelectorAll(selector)) : [];
+      const SP_SEL = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
       const elements = [];
       let count = 0;
       const seen = /* @__PURE__ */ new Set();
+      const formMap = { map: /* @__PURE__ */ new WeakMap(), count: 0 };
+      const labelForMap = buildLabelForMap(doc);
       for (const el of rawEls) {
         if (seen.has(el)) continue;
         seen.add(el);
+        if (el.closest?.(SP_SEL)) continue;
         const visible = isVisible(el);
         if (!visible) continue;
         const tag = el.tagName ? el.tagName.toLowerCase() : "div";
         const role = getRole(el);
         const text = clean(el.innerText || el.textContent || "");
         const placeholder = clean(el.getAttribute?.("placeholder") || "");
-        const ariaLabel = clean(el.getAttribute?.("aria-label") || el.getAttribute?.("title") || el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
+        const ariaLabel = resolveAccessibleName(el, doc, labelForMap);
         const value = typeof el.value === "string" ? clean(el.value) : "";
         const href = clean(el.getAttribute?.("href") || "", 120);
         const enabled = !el.disabled;
         const region = getRegion(el);
         const type = tag === "input" ? clean(el.getAttribute?.("type") || el.type || "", 20) : "";
         const autocomplete = clean(el.getAttribute?.("autocomplete") || "", 30);
-        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox") continue;
+        const formId = resolveFormId(el, formMap);
+        const required = Boolean(el.required) || el.getAttribute?.("required") != null;
+        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox" && role !== "button") continue;
         let bbox = null;
         if (typeof el.getBoundingClientRect === "function") {
           const r = el.getBoundingClientRect();
@@ -1114,7 +1241,9 @@ ${lines.join("\n")}`);
           region,
           bbox,
           type,
-          autocomplete
+          autocomplete,
+          formId,
+          required
         });
         if (count >= 300) break;
       }
@@ -1128,7 +1257,7 @@ ${lines.join("\n")}`);
         timestamp: Date.now()
       };
     }
-    return { extractPageState, clean, getRole };
+    return { extractPageState, clean, getRole, resolveAccessibleName };
   })();
   if (typeof globalThis !== "undefined" && globalThis.module) {
     globalThis.module.exports = PageStateService;
@@ -1144,46 +1273,112 @@ ${lines.join("\n")}`);
       const stopWords = /* @__PURE__ */ new Set(["a", "an", "the", "to", "for", "in", "on", "at", "by", "with", "from", "is", "it", "and", "or"]);
       return normalize2(str).replace(/[^\w\s]/g, "").split(/\s+/).filter((t) => t.length > 1 && !stopWords.has(t));
     }
-    function scoreElement(intent, el) {
-      if (!el || !el.visible || el.enabled === false) return 0;
-      const intentTokens = tokenize(intent);
-      if (!intentTokens.length) return 0;
+    const MORPH_MIN_LEN = 4;
+    const MORPH_CREDIT = 0.9;
+    function morphRelated(a, b) {
+      if (a === b) return false;
+      const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+      return short.length >= MORPH_MIN_LEN && long.startsWith(short);
+    }
+    function matchStrength(token, tokenSet) {
+      if (tokenSet.has(token)) return 1;
+      for (const candidate of tokenSet) {
+        if (morphRelated(token, candidate)) return MORPH_CREDIT;
+      }
+      return 0;
+    }
+    function elementLabelTokens(el) {
       const textTokens = tokenize(el.text || "");
       const placeTokens = tokenize(el.placeholder || "");
       const ariaTokens = tokenize(el.ariaLabel || "");
       const valTokens = tokenize(el.value || "");
-      const allElTokens = /* @__PURE__ */ new Set([...textTokens, ...placeTokens, ...ariaTokens, ...valTokens]);
-      if (!allElTokens.size) return 0;
-      const textMatches = intentTokens.filter((t) => allElTokens.has(t)).length;
-      const textScore = textMatches / intentTokens.length;
-      const ariaMatches = intentTokens.filter((t) => ariaTokens.includes(t)).length;
-      const ariaScore = ariaTokens.length ? ariaMatches / intentTokens.length : textScore;
-      let roleScore = 0.5;
+      return /* @__PURE__ */ new Set([...textTokens, ...placeTokens, ...ariaTokens, ...valTokens]);
+    }
+    function computeIdf(elementTokenSets) {
+      const df = /* @__PURE__ */ new Map();
+      for (const tokens of elementTokenSets) {
+        for (const t of tokens) {
+          df.set(t, (df.get(t) || 0) + 1);
+        }
+      }
+      const n = elementTokenSets.length;
+      const idf = /* @__PURE__ */ new Map();
+      for (const [t, d] of df) {
+        idf.set(t, Math.log((n + 1) / (d + 1)) + 1);
+      }
+      return { idf, df };
+    }
+    function scoreElement(intent, el, corpus = null) {
+      if (!el || !el.visible || el.enabled === false) return 0;
+      const intentTokens = tokenize(intent);
+      if (!intentTokens.length) return 0;
+      const elTokens = elementLabelTokens(el);
+      if (!elTokens.size) return 0;
+      const { idf, df } = corpus || computeIdf([elTokens]);
+      const scorableTokens = [];
+      for (const t of intentTokens) {
+        if ((df.get(t) || 0) > 0) {
+          scorableTokens.push({ token: t, weight: idf.get(t) || 1 });
+          continue;
+        }
+        let best = null;
+        for (const pageToken of df.keys()) {
+          if (!morphRelated(t, pageToken)) continue;
+          const w = idf.get(pageToken) || 1;
+          if (!best || w > best.weight) best = { token: t, weight: w };
+        }
+        if (best) scorableTokens.push(best);
+      }
+      if (!scorableTokens.length) return 0;
+      let totalWeight = 0;
+      let matchedWeight = 0;
+      for (const { token, weight } of scorableTokens) {
+        totalWeight += weight;
+        matchedWeight += weight * matchStrength(token, elTokens);
+      }
+      if (totalWeight <= 0) return 0;
+      const coverage = matchedWeight / totalWeight;
+      if (coverage <= 0) return 0;
+      let bonus = 0;
       const normIntent = normalize2(intent);
       if (normIntent.includes("click") || normIntent.includes("open") || normIntent.includes("press")) {
-        if (["button", "link", "combobox", "tab"].includes(el.role) || el.tag === "button" || el.tag === "a") roleScore = 1;
+        if (["button", "link", "combobox", "tab"].includes(el.role) || el.tag === "button" || el.tag === "a") bonus += 0.08;
       } else if (normIntent.includes("type") || normIntent.includes("fill") || normIntent.includes("search") || normIntent.includes("enter")) {
-        if (["textbox", "combobox", "search"].includes(el.role) || ["input", "textarea"].includes(el.tag)) roleScore = 1;
+        if (["textbox", "combobox", "search"].includes(el.role) || ["input", "textarea"].includes(el.tag)) bonus += 0.08;
       }
-      let regionScore = 0.6;
-      if (el.region === "top_navigation" || el.region === "side_navigation" || el.region === "modal") regionScore = 1;
-      let boost = 0;
-      const fullElText = normalize2(`${el.text} ${el.placeholder} ${el.ariaLabel}`);
+      if (el.region === "top_navigation" || el.region === "side_navigation" || el.region === "modal") bonus += 0.04;
+      const fullElText = normalize2(`${el.text || ""} ${el.placeholder || ""} ${el.ariaLabel || ""}`);
       if (normIntent && fullElText && (fullElText.includes(normIntent) || normIntent.includes(fullElText))) {
-        boost = 1;
+        bonus += 0.03;
       }
-      const finalScore = 0.35 * textScore + 0.3 * ariaScore + 0.15 * roleScore + 0.1 * regionScore + 0.1 * boost;
-      return Math.min(1, Math.round(finalScore * 100) / 100);
+      const finalScore = Math.min(1, coverage * 0.85 + bonus);
+      return Math.round(finalScore * 100) / 100;
     }
     function rankElements(intent, elements) {
       if (!Array.isArray(elements) || !elements.length) return [];
+      const elementTokenSets = elements.map((el) => elementLabelTokens(el));
+      const corpus = computeIdf(elementTokenSets);
       const scored = elements.map((el) => ({
         element: el,
-        score: scoreElement(intent, el)
+        score: scoreElement(intent, el, corpus)
       }));
       return scored.filter((item) => item.score > 0.05).sort((a, b) => b.score - a.score);
     }
-    return { scoreElement, rankElements, tokenize };
+    function assessGrounding(intent, elements) {
+      const ranked = rankElements(intent, elements);
+      const list = Array.isArray(elements) ? elements : [];
+      const { df } = computeIdf(list.map((el) => elementLabelTokens(el)));
+      const unmatchedIntentTokens = tokenize(intent).filter((t) => {
+        if ((df.get(t) || 0) > 0) return false;
+        for (const pageToken of df.keys()) if (morphRelated(t, pageToken)) return false;
+        return true;
+      });
+      const topScore = ranked[0]?.score ?? 0;
+      const runnerUpScore = ranked[1]?.score ?? 0;
+      const margin = topScore - runnerUpScore;
+      return { ranked, topScore, runnerUpScore, margin, rivals: ranked.length, unmatchedIntentTokens };
+    }
+    return { scoreElement, rankElements, tokenize, assessGrounding };
   })();
   if (typeof globalThis !== "undefined" && globalThis.module) {
     globalThis.module.exports = UIGroundingService;
@@ -1193,7 +1388,8 @@ ${lines.join("\n")}`);
   var DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
   var DEFAULT_MODEL = "qwen2.5-coder:7b";
   var DEFAULT_KEEP_ALIVE = "5m";
-  var QWEN_GENERATE_TIMEOUT_MS = 15e3;
+  var DEFAULT_KEEP_ALIVE_MS = 5 * 60 * 1e3;
+  var QWEN_GENERATE_TIMEOUT_MS = 45e3;
   var QWEN_AVAILABILITY_TIMEOUT_MS = 2500;
   var LocalQwenAdapter = class extends BackendAdapter {
     /**
@@ -1207,6 +1403,7 @@ ${lines.join("\n")}`);
       this._ollamaUrl = ollamaUrl.replace(/\/$/, "");
       this._model = model;
       this._keepAlive = keepAlive;
+      this._warmUntilMs = 0;
     }
     get name() {
       return "LocalQwenAdapter";
@@ -1229,6 +1426,7 @@ ${lines.join("\n")}`);
         console.log(`[SP:V2:DEBUG] LocalQwenAdapter callerSignal already aborted reqId=${reqId} reason=${callerSignal.reason}`);
         return this._networkFailure("Request aborted", "ABORTED");
       }
+      await this._warmModelIfNeeded(callerSignal, reqId);
       const prompt = this._buildQwenPrompt(request);
       const targetUrl = `${this._ollamaUrl}/api/generate`;
       const requestBody = {
@@ -1267,7 +1465,8 @@ ${lines.join("\n")}`);
               type: "OLLAMA_GENERATE",
               reqId,
               url: targetUrl,
-              body: requestBody
+              body: requestBody,
+              timeoutMs: QWEN_GENERATE_TIMEOUT_MS
             }, (response) => {
               if (callerSignal && abortHandler) {
                 callerSignal.removeEventListener("abort", abortHandler);
@@ -1331,6 +1530,7 @@ ${lines.join("\n")}`);
         }
         data = await upstream.json().catch(() => null);
       }
+      this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS;
       const rawResponse = data?.response ?? "";
       const latencyMs = Date.now() - t0;
       console.log(`[SP:V2:PERF] qwenLatencyMs=${latencyMs} model=${this._model} keep_alive=${this._keepAlive}`);
@@ -1389,6 +1589,68 @@ ${lines.join("\n")}`);
       }
     }
     // ── Helpers ─────────────────────────────────────────────────────────────────
+    /**
+     * Preload this adapter's own model into Ollama's memory before the real
+     * generate call, so that call itself doesn't pay the cold-load cost.
+     * Reuses the exact same OLLAMA_GENERATE proxy path plan() uses — no second
+     * client/architecture — but the request body carries no `prompt`, which is
+     * Ollama's own documented mechanism for loading (and keep_alive-refreshing)
+     * a model without running any generation: not a second inference task.
+     *
+     * No-ops entirely when we already believe the model is warm (bookkeeping
+     * only — see _warmUntilMs), when the caller already aborted, or outside a
+     * real chrome-extension context (the rare direct-fetch-fallback path just
+     * skips warming and pays whatever cold-load cost the real call hits, same
+     * as before this feature existed). Never throws — a failed/timed-out
+     * preload just means the real call below proceeds exactly as it already
+     * would have.
+     */
+    async _warmModelIfNeeded(callerSignal, reqId) {
+      if (Date.now() < this._warmUntilMs) {
+        console.log(`[SP:V2:DEBUG] LocalQwenAdapter model already warm reqId=${reqId} warmUntilMs=${this._warmUntilMs} \u2014 skipping preload`);
+        return;
+      }
+      if (callerSignal?.aborted) return;
+      const hasChromeRuntime = typeof chrome !== "undefined" && chrome?.runtime?.sendMessage;
+      if (!hasChromeRuntime) return;
+      const warmReqId = `${reqId}_warmup`;
+      const targetUrl = `${this._ollamaUrl}/api/generate`;
+      const warmBody = { model: this._model, keep_alive: this._keepAlive, stream: false };
+      console.log(`[SP:V2:DEBUG] LocalQwenAdapter warming model=${this._model} reqId=${warmReqId}`);
+      try {
+        const resp = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            type: "OLLAMA_GENERATE",
+            reqId: warmReqId,
+            url: targetUrl,
+            body: warmBody,
+            timeoutMs: QWEN_GENERATE_TIMEOUT_MS
+          }, (response) => {
+            if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+            else resolve(response || { success: false, error: "No response from background script" });
+          });
+        });
+        if (resp?.success) {
+          this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS;
+          console.log(`[SP:V2:DEBUG] LocalQwenAdapter model warm reqId=${warmReqId} warmUntilMs=${this._warmUntilMs}`);
+        } else {
+          console.log(`[SP:V2:DEBUG] LocalQwenAdapter warm-up failed reqId=${warmReqId} error=${resp?.error} \u2014 proceeding to real generate anyway`);
+        }
+      } catch (err) {
+        console.log(`[SP:V2:DEBUG] LocalQwenAdapter warm-up threw reqId=${warmReqId} message=${err?.message} \u2014 proceeding to real generate anyway`);
+      }
+    }
+    /**
+     * Explicitly separates two different things Qwen must reason about:
+     * - the TARGET element (an id from the given list — its own label/
+     *   placeholder/text is metadata describing that control, not user input);
+     * - the VALUE (the actual content the user wants entered, extracted from
+     *   the goal's own meaning — never the target's own label, never the goal
+     *   sentence itself, empty for any action that isn't "type").
+     * This is a semantic-reasoning instruction for the LLM, not a sentence
+     * template/regex — Qwen is the tier meant to do this kind of extraction
+     * generically, for any phrasing or site.
+     */
     _buildQwenPrompt(request) {
       const page = request.page ?? {};
       const history2 = request.executionHistory?.completedSteps ?? [];
@@ -1405,13 +1667,22 @@ ${history2.length ? `History: ${history2.map((h) => h.description).join(" -> ")}
 Elements:
 ${JSON.stringify(compactElements)}
 
-Select single action.
+Select the single next action.
+
+Distinguish two different things:
+- TARGET: which element (by id, from the list above) to act on. An
+  element's own text/placeholder/label is metadata describing that control \u2014
+  it is never something the user typed.
+- VALUE: only when the action is "type" \u2014 the actual content the user wants
+  entered, understood from the goal's own meaning. It is never the target
+  element's own label, and never the goal sentence itself. For any other
+  action (click/select/navigate/finish), value must be an empty string.
+
 Return JSON ONLY:
-{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","text":"label","confidence":0.95}`;
+{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","value":"","confidence":0.95}`;
     }
     _formatPlanResponse(request, qwenOutput, latencyMs) {
       const action = qwenOutput.action ?? "click";
-      const text = qwenOutput.text || request.goal;
       const isFinish = action === "finish";
       const elementId = qwenOutput.elementId;
       if (isFinish) {
@@ -1425,16 +1696,22 @@ Return JSON ONLY:
           providerMetadata: { provider: "local-qwen", model: this._model, latencyMs, inputTokens: 0, outputTokens: 0 }
         };
       }
+      const resolvedElement = (request.elements || []).find((e) => e.id === elementId);
+      const elementLabel = resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || "the target";
+      const isFillAction = action === "type";
+      const value = isFillAction && typeof qwenOutput.value === "string" ? qwenOutput.value.trim() : "";
+      const description = value ? `Type '${value}' into '${elementLabel}'` : `${isFillAction ? "Fill" : "Click"} '${elementLabel}'`;
       const step = {
         id: 1,
-        description: text,
-        intent: text,
-        phase: action === "type" ? "fill_form" : "navigate",
+        description,
+        intent: description,
+        phase: isFillAction ? "fill_form" : "navigate",
         completionCondition: "dom_change",
         targetElement: {
-          text,
-          type: action === "type" ? "input" : "button",
-          intent: qwenOutput.value ?? text,
+          text: elementLabel,
+          type: isFillAction ? "input" : "button",
+          intent: elementLabel,
+          value,
           elementId
         },
         // Provisional — Qwen's own action verb is an unreliable signal for whether a
@@ -1447,7 +1724,7 @@ Return JSON ONLY:
         schemaVersion: "1",
         result: "OK",
         state: "planned",
-        plannerSummary: `Action: ${action} on ${elementId ?? text}`,
+        plannerSummary: `Action: ${action} on ${elementId ?? elementLabel}`,
         confidence: qwenOutput.confidence ?? 0.85,
         plan: {
           goalType: "action",
@@ -1474,8 +1751,99 @@ Return JSON ONLY:
   var DEFAULT_OLLAMA_URL2 = "http://127.0.0.1:11434";
   var DEFAULT_MODEL2 = "moondream";
   var DEFAULT_KEEP_ALIVE2 = "5m";
-  var VISION_GENERATE_TIMEOUT_MS = 8e3;
+  var DEFAULT_KEEP_ALIVE_MS2 = 5 * 60 * 1e3;
+  var VISION_GENERATE_TIMEOUT_MS = 3e4;
   var VISION_AVAILABILITY_TIMEOUT_MS = 2500;
+  var VISION_IMAGE_MAX_WIDTH = 512;
+  var VISION_IMAGE_QUALITY = 0.7;
+  function computeVisionResizeDimensions(sourceWidth, sourceHeight, targetWidth = VISION_IMAGE_MAX_WIDTH) {
+    if (!sourceWidth || !sourceHeight) return { width: sourceWidth || 0, height: sourceHeight || 0 };
+    const scale = Math.min(1, targetWidth / sourceWidth);
+    return {
+      width: Math.max(1, Math.round(sourceWidth * scale)),
+      height: Math.max(1, Math.round(sourceHeight * scale))
+    };
+  }
+  var BBOX_COORD_PRECISION = 1e3;
+  function normalizeBboxForVision(bbox, viewportWidth, viewportHeight) {
+    if (!bbox || !viewportWidth || !viewportHeight) return null;
+    if (!(bbox.width > 0) || !(bbox.height > 0)) return null;
+    const clamp01 = (n) => Math.max(0, Math.min(1, n));
+    const round = (n) => Math.round(n * BBOX_COORD_PRECISION) / BBOX_COORD_PRECISION;
+    return {
+      x: round(clamp01(bbox.x / viewportWidth)),
+      y: round(clamp01(bbox.y / viewportHeight)),
+      width: round(clamp01(bbox.width / viewportWidth)),
+      height: round(clamp01(bbox.height / viewportHeight))
+    };
+  }
+  function computeCandidateMarkerPositions(elements, canvasWidth, canvasHeight, viewportWidth, viewportHeight) {
+    if (!Array.isArray(elements) || !canvasWidth || !canvasHeight) return [];
+    const positions = [];
+    for (const el of elements) {
+      if (!el?.id) continue;
+      const norm = normalizeBboxForVision(el.bbox, viewportWidth, viewportHeight);
+      if (!norm) continue;
+      positions.push({
+        id: el.id,
+        x: Math.round(norm.x * canvasWidth),
+        y: Math.round(norm.y * canvasHeight)
+      });
+    }
+    return positions;
+  }
+  var MARKER_RADIUS = 4;
+  var MARKER_FONT = "bold 11px sans-serif";
+  var MARKER_COLOR = "#ff00ff";
+  var MARKER_TEXT_COLOR = "#000000";
+  var MARKER_TEXT_BG = "#ffff00";
+  function drawCandidateMarkers(ctx, positions) {
+    for (const { id, x, y } of positions) {
+      try {
+        ctx.beginPath();
+        ctx.arc(x, y, MARKER_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = MARKER_COLOR;
+        ctx.fill();
+        const label = `[${id}]`;
+        ctx.font = MARKER_FONT;
+        const textWidth = typeof ctx.measureText === "function" ? ctx.measureText(label).width : label.length * 6;
+        const labelX = x + MARKER_RADIUS + 2;
+        const labelY = y - MARKER_RADIUS - 2;
+        ctx.fillStyle = MARKER_TEXT_BG;
+        ctx.fillRect(labelX - 1, labelY - 10, textWidth + 2, 12);
+        ctx.fillStyle = MARKER_TEXT_COLOR;
+        ctx.fillText(label, labelX, labelY);
+      } catch {
+      }
+    }
+  }
+  async function resizeImageForVision(base64Image, elements = [], viewportWidth = 0, viewportHeight = 0) {
+    try {
+      const binary = atob(base64Image);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+      const { width, height } = computeVisionResizeDimensions(bitmap.width, bitmap.height, VISION_IMAGE_MAX_WIDTH);
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      if (typeof bitmap.close === "function") bitmap.close();
+      const positions = computeCandidateMarkerPositions(elements, width, height, viewportWidth, viewportHeight);
+      if (positions.length) drawCandidateMarkers(ctx, positions);
+      const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: VISION_IMAGE_QUALITY });
+      const buffer = await outBlob.arrayBuffer();
+      const outBytes = new Uint8Array(buffer);
+      const CHUNK = 8192;
+      let str = "";
+      for (let i = 0; i < outBytes.length; i += CHUNK) {
+        str += String.fromCharCode.apply(null, outBytes.subarray(i, Math.min(i + CHUNK, outBytes.length)));
+      }
+      return btoa(str);
+    } catch (err) {
+      console.log(`[SP:V2:DEBUG] LocalVisionAdapter image resize failed, using original image: ${err?.message}`);
+      return base64Image;
+    }
+  }
   var LocalVisionAdapter = class extends BackendAdapter {
     /**
      * @param {object} [options]
@@ -1488,6 +1856,7 @@ Return JSON ONLY:
       this._ollamaUrl = ollamaUrl.replace(/\/$/, "");
       this._model = model;
       this._keepAlive = keepAlive;
+      this._warmUntilMs = 0;
     }
     get name() {
       return "LocalVisionAdapter";
@@ -1516,12 +1885,17 @@ Return JSON ONLY:
       if (!imageBase64) {
         return this._networkFailure("No screenshot provided for local vision reasoning", "NO_SCREENSHOT");
       }
+      await this._warmModelIfNeeded(callerSignal, reqId);
+      const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 0;
+      const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 0;
+      const candidateElements = (request?.elements ?? []).slice(0, 25);
+      const visionImageBase64 = await resizeImageForVision(imageBase64, candidateElements, viewportWidth, viewportHeight);
       const prompt = this._buildVisionPrompt(request);
       const targetUrl = `${this._ollamaUrl}/api/generate`;
       const requestBody = {
         model: this._model,
         prompt,
-        images: [imageBase64],
+        images: [visionImageBase64],
         format: "json",
         stream: false,
         keep_alive: this._keepAlive,
@@ -1550,7 +1924,8 @@ Return JSON ONLY:
               type: "OLLAMA_GENERATE",
               reqId,
               url: targetUrl,
-              body: requestBody
+              body: requestBody,
+              timeoutMs: VISION_GENERATE_TIMEOUT_MS
             }, (response) => {
               if (callerSignal && abortHandler) {
                 callerSignal.removeEventListener("abort", abortHandler);
@@ -1605,6 +1980,7 @@ Return JSON ONLY:
         }
         data = await upstream.json().catch(() => null);
       }
+      this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS2;
       const rawResponse = data?.response ?? "";
       const latencyMs = Date.now() - t0;
       console.log(`[SP:V2:PERF] visionLatencyMs=${latencyMs} model=${this._model}`);
@@ -1667,32 +2043,121 @@ Return JSON ONLY:
     }
     // ── Helpers ─────────────────────────────────────────────────────────────────
     /**
-     * Minimum useful context for the vision model: the goal, and a compact
+     * Preload this adapter's own model into Ollama's memory before the real
+     * generate call, so that call itself doesn't pay the cold-load cost.
+     * Reuses the exact same OLLAMA_GENERATE proxy path plan() uses — no second
+     * client/architecture — but the request body carries no `prompt`/`images`,
+     * which is Ollama's own documented mechanism for loading (and
+     * keep_alive-refreshing) a model without running any generation: not a
+     * second inference task.
+     *
+     * No-ops entirely when we already believe the model is warm (bookkeeping
+     * only — see _warmUntilMs), when the caller already aborted, or outside a
+     * real chrome-extension context. Never throws — a failed/timed-out preload
+     * just means the real call below proceeds exactly as it already would have.
+     */
+    async _warmModelIfNeeded(callerSignal, reqId) {
+      if (Date.now() < this._warmUntilMs) {
+        console.log(`[SP:V2:DEBUG] LocalVisionAdapter model already warm reqId=${reqId} warmUntilMs=${this._warmUntilMs} \u2014 skipping preload`);
+        return;
+      }
+      if (callerSignal?.aborted) return;
+      const hasChromeRuntime = typeof chrome !== "undefined" && chrome?.runtime?.sendMessage;
+      if (!hasChromeRuntime) return;
+      const warmReqId = `${reqId}_warmup`;
+      const targetUrl = `${this._ollamaUrl}/api/generate`;
+      const warmBody = { model: this._model, keep_alive: this._keepAlive, stream: false };
+      console.log(`[SP:V2:DEBUG] LocalVisionAdapter warming model=${this._model} reqId=${warmReqId}`);
+      try {
+        const resp = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            type: "OLLAMA_GENERATE",
+            reqId: warmReqId,
+            url: targetUrl,
+            body: warmBody,
+            timeoutMs: VISION_GENERATE_TIMEOUT_MS
+          }, (response) => {
+            if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+            else resolve(response || { success: false, error: "No response from background script" });
+          });
+        });
+        if (resp?.success) {
+          this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS2;
+          console.log(`[SP:V2:DEBUG] LocalVisionAdapter model warm reqId=${warmReqId} warmUntilMs=${this._warmUntilMs}`);
+        } else {
+          console.log(`[SP:V2:DEBUG] LocalVisionAdapter warm-up failed reqId=${warmReqId} error=${resp?.error} \u2014 proceeding to real generate anyway`);
+        }
+      } catch (err) {
+        console.log(`[SP:V2:DEBUG] LocalVisionAdapter warm-up threw reqId=${warmReqId} message=${err?.message} \u2014 proceeding to real generate anyway`);
+      }
+    }
+    /**
+     * P1 #2: a concise visual-PERCEPTION question, not a planning prompt.
+     * Moondream is only ever reached when the L3 router found zero viable
+     * text candidates (see decision-router.js) — its one job here is to look
+     * at the screenshot and point at which known element (if any) is the
+     * visual target. It is explicitly NOT asked to decide what kind of
+     * interaction to perform (click/type/select/...) — decision-router.js
+     * derives that itself from the resolved element's own role/tag via
+     * _buildPlanFromElement, the same as L1/L2 already do, so asking the
+     * model to also choose an action would be asking it to plan, not perceive.
+     *
+     * Context given is the minimum useful amount: the goal, and a compact
      * (already-sanitized, already-capped) list of interactive elements with
      * stable ids — not the full page state. The screenshot itself carries the
      * visual context; this text just gives the model the fixed vocabulary of
      * ids it is allowed to answer with.
+     *
+     * Each candidate also carries its own bbox WHEN one can be derived (see
+     * normalizeBboxForVision) — normalized to a 0-1 fraction of the viewport,
+     * not raw pixels, so it stays correct after the screenshot is resized for
+     * this model. This exists because an element with no distinguishing text
+     * (a purely visual/icon-only control) previously gave the model nothing
+     * to connect what it sees to which known id that is; bbox is the same kind
+     * of ground truth id/role/text already are — read from pageState, never
+     * invented — it just happens to describe WHERE instead of WHAT.
      */
     _buildVisionPrompt(request) {
       const page = request.page ?? {};
       const elements = request.elements ?? [];
-      const compactElements = elements.slice(0, 25).map((e) => ({
-        id: e.id,
-        role: e.role,
-        text: e.text || e.ariaLabel || e.placeholder || ""
-      }));
+      const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 0;
+      const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 0;
+      const compactElements = elements.slice(0, 25).map((e) => {
+        const entry = {
+          id: e.id,
+          role: e.role,
+          text: e.text || e.ariaLabel || e.placeholder || ""
+        };
+        const bbox = normalizeBboxForVision(e.bbox, viewportWidth, viewportHeight);
+        if (bbox) entry.bbox = bbox;
+        return entry;
+      });
       return `Goal: "${request.goal}"
 Page: ${page.title || ""} (${page.url || ""})
 
-You are a VISUAL PERCEPTION assistant, not a planner. You are shown a
-screenshot of the current page (sensitive fields are already blacked out
-locally \u2014 you will never see real passwords, emails, or card numbers).
+You are a VISUAL PERCEPTION component, not a planner. You do not decide how
+to interact with anything \u2014 only WHICH element is the visual target. Sensitive
+fields in the screenshot are already blacked out locally; you will never see
+real passwords, emails, or card numbers.
 
-Known interactive elements already extracted from the page (id, role, text):
+The screenshot contains TEMPORARY candidate markers \u2014 small colored dots, each
+with a "[elementId]" label next to it (for example "[el_7]") \u2014 placed at the
+known position of each element listed below. These markers are not part of
+the real page; they exist only in this copy of the screenshot to help you
+answer this question, and are the most direct way to identify a visually
+distinctive but unlabeled element (e.g. an icon-only button with no visible
+text): find the marker at the right visual spot, then read its label.
+
+Known interactive elements already extracted from the page (id, role, text,
+and bbox when available). bbox gives that same element's location in the
+screenshot as {x, y, width, height} \u2014 each a fraction from 0 to 1 of the full
+image (0,0 is the top-left corner, 1,1 is the bottom-right corner),
+independent of the image's actual pixel size \u2014 matching where its marker is
+drawn, for elements whose marker you cannot read clearly:
 ${JSON.stringify(compactElements)}
 
-Using the screenshot, identify which ONE of the elements above is the
-visually correct next target for the goal.
+Question: looking at the screenshot and its candidate markers, which ONE
+element from the list above is visually the target for this goal?
 
 Rules:
 - "elementId" MUST be copied exactly from the list above. Never invent,
@@ -1700,7 +2165,7 @@ Rules:
 - If none of the listed elements visually match, return elementId: null.
 
 Return JSON ONLY:
-{"action":"click"|"type"|"select"|"navigate","elementId":"el_12","confidence":0.91,"reason":"short reason"}`;
+{"elementId":"el_12","confidence":0.91,"reason":"short reason"}`;
     }
     /**
      * Deliberately minimal: this is a perception result, not a plan. It names
@@ -2054,15 +2519,16 @@ Return JSON ONLY:
             }
             return { complete: true, reason: "signals_satisfied", verdict };
           }
+          let genericCheck;
           if (goal) {
-            const genericCheck = this.isGoalSatisfied(goal, pageState, env);
+            genericCheck = this.isGoalSatisfied(goal, pageState, env);
             if (genericCheck.satisfied) {
-              return { complete: true, reason: "goal_already_satisfied", verdict: { satisfied: true, reason: genericCheck.reason } };
+              return { complete: true, reason: "goal_already_satisfied", verdict: { satisfied: true, reason: genericCheck.reason }, genericCheck };
             }
           }
-          if (!criteria) return { complete: false, reason: "no_criteria", verdict: null };
-          if (criteria.requiresEffect !== true) return { complete: false, reason: "no_effect_contract", verdict: null };
-          return { complete: false, reason: "unsatisfied", verdict: null };
+          if (!criteria) return { complete: false, reason: "no_criteria", verdict: null, genericCheck };
+          if (criteria.requiresEffect !== true) return { complete: false, reason: "no_effect_contract", verdict: null, genericCheck };
+          return { complete: false, reason: "unsatisfied", verdict: null, genericCheck };
         } catch {
           return { complete: false, reason: "evaluation_error", verdict: null };
         }
@@ -2081,7 +2547,36 @@ Return JSON ONLY:
   // extension/services/decision-router.js
   var DETERMINISTIC_THRESHOLD = 0.85;
   var ML_GROUNDING_THRESHOLD = 0.7;
-  var VISION_CANDIDATE_LIMIT = 10;
+  var QWEN_CANDIDATE_LIMIT = 25;
+  var AMBIGUITY_MARGIN = 0.05;
+  var RIVAL_SHARE = 0.3;
+  var DECISIVE_MARGIN = 0.15;
+  var SOLE_UNLABELED_CANDIDATE_CONFIDENCE = 0.6;
+  var INTERACTIVE_ROLES = /* @__PURE__ */ new Set(["button", "link", "menuitem", "tab", "textbox", "combobox"]);
+  var INTERACTIVE_TAGS = /* @__PURE__ */ new Set(["button", "a", "input", "select", "textarea", "summary"]);
+  var VALUE_TRAILS_MARKERS = ["for", "to", "with"];
+  var VALUE_PRECEDES_MARKERS = ["into"];
+  function extractRequestedValue(goal, targetLabel = "") {
+    const words = String(goal ?? "").trim().split(/\s+/).filter(Boolean);
+    if (words.length < 2) return "";
+    const bare = words.map((w) => w.toLowerCase().replace(/[.,!?;:]+$/, ""));
+    let payload = "";
+    const precedesAt = bare.findIndex((w) => VALUE_PRECEDES_MARKERS.includes(w));
+    if (precedesAt > 1) {
+      payload = words.slice(1, precedesAt).join(" ");
+    } else {
+      let trailsAt = -1;
+      for (let i = 0; i < bare.length - 1; i++) {
+        if (VALUE_TRAILS_MARKERS.includes(bare[i])) trailsAt = i;
+      }
+      if (trailsAt >= 0) payload = words.slice(trailsAt + 1).join(" ");
+    }
+    payload = payload.replace(/^(the|a|an)\s+/i, "").trim();
+    if (!payload) return "";
+    const norm = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
+    if (norm(payload) === norm(targetLabel)) return "";
+    return payload;
+  }
   var DecisionRouter = class {
     /**
      * @param {object} [options]
@@ -2120,16 +2615,39 @@ Return JSON ONLY:
      * @param {string[]} [options.cloudContext.clarifications]
      * @param {object[]} [options.cloudContext.pageControls]
      * @param {string} [options.cloudContext.requestId]
+     * @param {object[]} [options.completedSteps] - This task's own completed-step
+     *   history (session order, oldest first).
+     * @param {object[]} [options.settledSteps] - The subset of completedSteps whose
+     *   own post-action state IS the state being routed against right now (see
+     *   the TASK PROGRESS note on the class above). Supplied by the caller, which
+     *   owns the session and the page snapshot; derived fresh every cycle and
+     *   never persisted, so it cannot go stale.
      * @returns {Promise<{ layer: 'deterministic'|'ml_grounding'|'local_qwen'|'cloud', planResponse: object, layer1Ms: number, layer2Ms: number, qwenMs: number, cloudMs: number, qwenFailureReason: string|null }>}
      */
     async route(goal, pageState, options = {}) {
       const elements = Array.isArray(pageState?.elements) ? pageState.elements : [];
+      const completedSteps = Array.isArray(options.completedSteps) ? options.completedSteps : [];
+      const settledSteps = Array.isArray(options.settledSteps) ? options.settledSteps : [];
+      const clarifications = Array.isArray(options.cloudContext?.clarifications) ? options.cloudContext.clarifications.filter(Boolean) : [];
+      const groundingIntent = clarifications.length ? `${goal} ${clarifications.join(" ")}` : goal;
+      if (clarifications.length) {
+        console.log(`[SP:DecisionRouter] Grounding with ${clarifications.length} clarification(s) folded into the intent`);
+      }
+      const candidates = settledSteps.length ? elements.filter((el) => !this._isSettledTarget(el, settledSteps)) : elements;
+      if (settledSteps.length) {
+        console.log(`[SP:DecisionRouter] Task progress: ${settledSteps.length} settled action(s) \u2014 ${elements.length - candidates.length} target(s) withheld, ${candidates.length} candidate(s) remain`);
+      }
       const tL1Start = Date.now();
-      const fastMatch = this._evalFastPath(goal, elements);
+      const fastMatch = this._evalFastPath(groundingIntent, candidates);
       const layer1Ms = Date.now() - tL1Start;
       if (fastMatch && fastMatch.score >= this.deterministicThreshold) {
+        const requiredGate = this._resolveRequiredFieldGate(goal, elements, fastMatch.element);
+        if (requiredGate) {
+          console.log(`[SP:DecisionRouter] Layer 1 target's form has an unmet required field \u2014 redirecting to elementId=${requiredGate.plan.steps[0].targetElement.elementId}`);
+          return { layer: "ml_grounding", planResponse: requiredGate, layer1Ms, layer2Ms: 0, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+        }
         console.log(`[SP:DecisionRouter] Layer 1 FAST PATH matched (score=${fastMatch.score}):`, fastMatch.element.text || fastMatch.element.placeholder);
-        console.log(`[SP:V2:DEBUG] layer=deterministic reason=exact_label_match candidateCount=${elements.length} confidence=${fastMatch.score}`);
+        console.log(`[SP:V2:DEBUG] layer=deterministic reason=exact_label_match candidateCount=${candidates.length} confidence=${fastMatch.score}`);
         return {
           layer: "deterministic",
           planResponse: this._buildPlanFromElement(goal, fastMatch.element, fastMatch.score, "deterministic"),
@@ -2141,12 +2659,20 @@ Return JSON ONLY:
         };
       }
       const tL2Start = Date.now();
-      const ranked = UIGroundingService.rankElements(goal, elements);
+      const assessment = UIGroundingService.assessGrounding(groundingIntent, candidates);
+      const ranked = assessment.ranked;
       const layer2Ms = Date.now() - tL2Start;
-      if (ranked.length > 0 && ranked[0].score >= this.mlGroundingThreshold) {
+      const clearsThreshold = ranked.length > 0 && ranked[0].score >= this.mlGroundingThreshold;
+      const insufficientEvidence = clearsThreshold ? this._assessAmbiguity(assessment) : null;
+      if (clearsThreshold && !insufficientEvidence) {
         const top = ranked[0];
+        const requiredGate = this._resolveRequiredFieldGate(goal, elements, top.element);
+        if (requiredGate) {
+          console.log(`[SP:DecisionRouter] Layer 2 target's form has an unmet required field \u2014 redirecting to elementId=${requiredGate.plan.steps[0].targetElement.elementId}`);
+          return { layer: "ml_grounding", planResponse: requiredGate, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+        }
         console.log(`[SP:DecisionRouter] Layer 2 ML GROUNDING matched (score=${top.score}):`, top.element.text || top.element.placeholder);
-        console.log(`[SP:V2:DEBUG] layer=ml_grounding reason=feature_vector_score candidateCount=${elements.length} confidence=${top.score}`);
+        console.log(`[SP:V2:DEBUG] layer=ml_grounding reason=feature_vector_score candidateCount=${candidates.length} confidence=${top.score}`);
         return {
           layer: "ml_grounding",
           planResponse: this._buildPlanFromElement(goal, top.element, top.score, "ml_grounding"),
@@ -2157,18 +2683,47 @@ Return JSON ONLY:
           qwenFailureReason: null
         };
       }
-      console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode}`);
-      console.log(`[SP:V2:DEBUG] layer=L3 reason=confidence_below_threshold candidateCount=${elements.length} executionMode=${this.executionMode}`);
-      const l3 = await this._runLayer3(goal, pageState, elements, options, ranked);
+      const continuation = this._resolveActionContinuation(elements, settledSteps);
+      if (continuation) {
+        console.log(`[SP:DecisionRouter] Structural continuation of settled action -> elementId=${continuation.plan.steps[0].targetElement.elementId} (no model invoked)`);
+        return { layer: "ml_grounding", planResponse: continuation, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+      }
+      const l3Reason = insufficientEvidence ? `lexical_evidence_insufficient(${insufficientEvidence})` : "confidence_below_threshold";
+      console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode} reason=${l3Reason}`);
+      console.log(`[SP:V2:DEBUG] layer=L3 reason=${l3Reason} candidateCount=${candidates.length} topScore=${assessment.topScore} margin=${assessment.margin.toFixed(3)} executionMode=${this.executionMode}`);
+      const l3 = await this._runLayer3(groundingIntent, pageState, candidates, options, ranked);
+      if (insufficientEvidence && l3?.planResponse?.result !== "OK") {
+        const options2 = ranked.slice(0, 5).map((r) => r.element.text || r.element.ariaLabel || r.element.placeholder || r.element.id).filter(Boolean);
+        console.log(`[SP:DecisionRouter] Reasoning tier failed after an evidence escalation (${insufficientEvidence}) \u2014 reporting unresolved ambiguity rather than guessing among ${options2.length} candidate(s)`);
+        return {
+          layer: l3.layer,
+          planResponse: {
+            schemaVersion: "1",
+            result: "NEEDS_USER",
+            state: "ambiguous",
+            confidence: 0,
+            plannerSummary: options2.length ? `Several controls match this goal equally well: ${options2.join(", ")}. Which one did you mean?` : "Could not determine the next action from this page.",
+            providerMetadata: { provider: l3.layer, model: "none", latencyMs: 0 }
+          },
+          layer1Ms,
+          layer2Ms,
+          qwenMs: l3.qwenMs ?? 0,
+          cloudMs: l3.cloudMs ?? 0,
+          qwenFailureReason: l3.qwenFailureReason ?? null
+        };
+      }
       return { ...l3, layer1Ms, layer2Ms };
     }
     /**
-     * L3: exactly one Moondream VISUAL PERCEPTION attempt (only when
-     * executionMode === 'local-qwen', before Qwen — so it runs even when Qwen
-     * would have succeeded), then exactly one Qwen (text) attempt if vision
-     * didn't yield a usable, validated element, then exactly one Cloud attempt
-     * as final fallback/default. Never retries a provider and never bounces
-     * back and forth between them.
+     * L3 router: picks exactly ONE local provider per cycle — Moondream and
+     * Qwen are never both invoked in the same cycle. `ranked` (L2's own
+     * scoring, already computed by the caller) decides which: any candidate
+     * at all (even below L2's own threshold) means Qwen (text) is used; zero
+     * candidates means the DOM/text representation has nothing to reason
+     * over, so Moondream (visual perception) is used instead. Whichever one
+     * is chosen, on failure/unavailability the router falls straight through
+     * to Cloud — it does not then try the other local provider. Never retries
+     * a provider.
      */
     async _runLayer3(goal, pageState, elements, options, ranked = []) {
       const { signal, cloudContext = {} } = options;
@@ -2183,7 +2738,12 @@ Return JSON ONLY:
         }
         return screenshot;
       };
-      if (this.executionMode === "local-qwen") {
+      const hasViableTextCandidates = ranked.length > 0;
+      if (hasViableTextCandidates) {
+        const topCandidates = ranked.slice(0, 5).map((r) => `${r.element.id}(${(r.element.text || r.element.ariaLabel || r.element.placeholder || "").slice(0, 40)}):${r.score.toFixed(3)}`).join(", ");
+        console.log(`[SP:DecisionRouter] Layer 3 top candidates: ${topCandidates}`);
+      }
+      if (this.executionMode === "local-qwen" && !hasViableTextCandidates) {
         const tVisionAvailStart = Date.now();
         let visionAvail;
         try {
@@ -2191,29 +2751,42 @@ Return JSON ONLY:
         } catch (err) {
           visionAvail = { available: false, reason: err?.message || "availability_check_failed" };
         }
-        console.log(`[SP:DecisionRouter] Layer 3 Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
+        console.log(`[SP:DecisionRouter] Layer 3 router=vision (no text candidates) Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
         if (visionAvail.available) {
           const tVisionStart = Date.now();
           try {
             const shot = await getScreenshotOnce();
-            const visionElements = ranked.length ? ranked.slice(0, VISION_CANDIDATE_LIMIT).map((r) => r.element) : elements;
             const perception = await this.localVisionAdapter.plan({
               schemaVersion: "1",
               goal,
               page: { url: pageState.url, title: pageState.title, screenshot: shot },
-              elements: visionElements
+              elements
             }, { signal });
             visionMs = Date.now() - tVisionStart;
             if (perception?.result === "FAILED") {
               visionFailureReason = perception.error || perception.errorCode || "vision_failed";
-              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to Qwen/cloud`);
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to cloud`);
             } else {
               const resolvedElement = elements.find((el) => el.id === perception.elementId);
               if (!resolvedElement) {
                 visionFailureReason = "invalid_element_id";
-                console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" \u2014 rejected, falling back to Qwen/cloud`);
+                console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" \u2014 rejected, checking for a sole unlabeled interactive candidate before falling back to cloud`);
+                const soleCandidate = this._findSoleUnlabeledInteractiveCandidate(elements);
+                if (soleCandidate) {
+                  console.log(`[SP:DecisionRouter] Layer 3 sole unlabeled interactive candidate resolved structurally -> elementId=${soleCandidate.id} (no model invoked)`);
+                  return {
+                    layer: "local_vision",
+                    planResponse: this._buildPlanFromElement(goal, soleCandidate, SOLE_UNLABELED_CANDIDATE_CONFIDENCE, "local_vision"),
+                    qwenMs,
+                    visionMs,
+                    cloudMs: 0,
+                    qwenFailureReason: null,
+                    visionFailureReason: null
+                  };
+                }
               } else {
                 console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION succeeded (${visionMs}ms) elementId=${perception.elementId}`);
+                console.log(`SP LOCAL VISION \u2192 Moondream (${visionMs}ms) elementId=${perception.elementId} confidence=${perception.confidence ?? "n/a"}`);
                 return {
                   layer: "local_vision",
                   planResponse: this._buildPlanFromElement(goal, resolvedElement, perception.confidence ?? 0.75, "local_vision"),
@@ -2228,14 +2801,13 @@ Return JSON ONLY:
           } catch (err) {
             visionMs = Date.now() - tVisionStart;
             visionFailureReason = err?.message || "vision_error";
-            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to Qwen/cloud`);
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) \u2014 falling back to cloud`);
           }
         } else {
           visionFailureReason = visionAvail.reason || "moondream_unavailable";
-          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) \u2014 falling back to Qwen/cloud`);
+          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) \u2014 falling back to cloud`);
         }
-      }
-      if (this.executionMode === "local-qwen") {
+      } else if (this.executionMode === "local-qwen" && hasViableTextCandidates) {
         const tAvailStart = Date.now();
         let avail;
         try {
@@ -2243,22 +2815,32 @@ Return JSON ONLY:
         } catch (err) {
           avail = { available: false, reason: err?.message || "availability_check_failed" };
         }
-        console.log(`[SP:DecisionRouter] Layer 3 Qwen availability=${avail.available} (${Date.now() - tAvailStart}ms)`);
+        console.log(`[SP:DecisionRouter] Layer 3 router=qwen (${ranked.length} text candidate(s)) Qwen availability=${avail.available} (${Date.now() - tAvailStart}ms)`);
         if (avail.available) {
           const tQwenStart = Date.now();
           try {
+            const qwenElements = ranked.length ? ranked.slice(0, QWEN_CANDIDATE_LIMIT).map((r) => r.element) : elements;
             const planResponse2 = await this.localQwenAdapter.plan({
               schemaVersion: "1",
               goal,
               page: { url: pageState.url, title: pageState.title },
-              elements
+              elements: qwenElements,
+              // What this task has already done. _buildQwenPrompt has always
+              // rendered a History line from this field, but nothing ever
+              // supplied it locally — so the one tier whose whole job is
+              // semantic reasoning was reasoning about a multi-step task with
+              // no idea which steps were already done, and could only re-derive
+              // the same first action. Same structure the cloud tier receives.
+              ...cloudContext.executionHistory && { executionHistory: cloudContext.executionHistory }
             }, { signal });
             qwenMs = Date.now() - tQwenStart;
             if (planResponse2?.result === "FAILED") {
               qwenFailureReason = planResponse2.error || planResponse2.errorCode || "qwen_failed";
               console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) \u2014 falling back to cloud once`);
             } else {
-              console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms)`);
+              const step = planResponse2?.plan?.steps?.[0];
+              const t = step?.targetElement || {};
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? "n/a"} phase=${step?.phase ?? "n/a"} value=${JSON.stringify(t.value ?? "")}`);
               return { layer: "local_qwen", planResponse: planResponse2, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
             }
           } catch (err) {
@@ -2292,6 +2874,184 @@ Return JSON ONLY:
       return { layer: "cloud", planResponse, qwenMs, visionMs, cloudMs, qwenFailureReason, visionFailureReason };
     }
     // ── Helpers ─────────────────────────────────────────────────────────────────
+    /**
+     * Does this element correspond to the target of one of the given steps?
+     *
+     * Matches an element's own accessible label against the step's recorded
+     * intent/description using the exact string-containment convention the
+     * dedup guard in v2-task.js already uses, so "which element did that step
+     * act on" means the same thing everywhere. Element ids are deliberately NOT
+     * used: they are positional (`el_N`) and recomputed per extraction, so they
+     * are not stable across cycles — the label is.
+     *
+     * @param {object} el
+     * @param {object[]} steps
+     * @returns {boolean}
+     */
+    /**
+     * Is L2's ranking resting on evidence strong enough to ACT on?
+     *
+     * Returns a reason string when it is not (so the caller escalates to the
+     * semantic tier), or null when L2 may commit. Both criteria come from
+     * assessGrounding and are measured properties of the current candidate set,
+     * never a site, phrase or synonym rule. A single viable candidate is never
+     * treated as ambiguous — with no rival there is nothing to confuse it with.
+     *
+     * @param {{topScore:number, margin:number, rivals:number, unmatchedIntentTokens:string[]}} a
+     * @returns {string|null}
+     */
+    _assessAmbiguity(a) {
+      if (a.rivals <= 1) return null;
+      if (a.margin < AMBIGUITY_MARGIN) {
+        return `insufficient_margin:${a.margin.toFixed(3)}`;
+      }
+      const top = a.ranked?.[0]?.element;
+      const receivesValue = !!top && (["textbox", "combobox", "searchbox", "search"].includes(top.role) || ["input", "textarea"].includes(top.tag));
+      const contention = a.topScore > 0 ? a.runnerUpScore / a.topScore : 0;
+      if (!receivesValue && a.unmatchedIntentTokens.length > 0 && contention >= RIVAL_SHARE && a.margin < DECISIVE_MARGIN) {
+        return `unmatched_intent_vocabulary:${a.unmatchedIntentTokens.join(",")}@contention=${contention.toFixed(2)}`;
+      }
+      return null;
+    }
+    /**
+     * Structural, single-candidate fallback for when visual perception ran but
+     * named no usable element (null, or an id that doesn't match anything in
+     * the current page state). Not a second perception attempt and not a
+     * guess: it looks for exactly ONE candidate that is already, on its own
+     * metadata, an "unlabeled interactive control" — the same generic shape a
+     * visually-only icon button has — and only resolves when there is no
+     * ambiguity about which one that is.
+     *
+     * "Unlabeled interactive candidate" is determined ENTIRELY from existing
+     * pageState metadata, never from what the element is or looks like:
+     *   - an interactive role/tag (the same set PageStateService's own
+     *     extraction selector already recognizes as a control worth
+     *     extracting at all — see INTERACTIVE_ROLES/INTERACTIVE_TAGS above)
+     *   - no text, no ariaLabel, no placeholder, no value — nothing lexical
+     *     for L1/L2 to have matched it on, which is exactly why grounding and
+     *     visual perception both had nothing to name it with
+     *   - a valid element id and an existing, non-zero-area bbox — the two
+     *     concrete pieces of evidence that this is a real, located control on
+     *     the current page, not a phantom
+     *
+     * Returns the sole eligible element, or null when there are zero or two-or-
+     * more equally eligible candidates — ambiguity is left to the existing
+     * cloud fallback, never resolved by guessing between them.
+     *
+     * @param {object[]} elements - This cycle's full pageState.elements.
+     * @returns {object|null}
+     */
+    _findSoleUnlabeledInteractiveCandidate(elements) {
+      const eligible = (elements || []).filter((el) => {
+        if (!el || el.visible === false || el.enabled === false) return false;
+        if (!(INTERACTIVE_ROLES.has(el.role) || INTERACTIVE_TAGS.has(el.tag))) return false;
+        if ((el.text || "").trim() || (el.ariaLabel || "").trim() || (el.placeholder || "").trim() || (el.value || "").trim()) return false;
+        if (typeof el.id !== "string" || !el.id) return false;
+        if (!el.bbox || !(el.bbox.width > 0) || !(el.bbox.height > 0)) return false;
+        return true;
+      });
+      return eligible.length === 1 ? eligible[0] : null;
+    }
+    _isSettledTarget(el, steps) {
+      const label = (el.text || el.placeholder || el.ariaLabel || "").trim().toLowerCase();
+      if (!label) return false;
+      return (steps || []).some((step) => {
+        const stepIntent = (step.intent || "").trim().toLowerCase();
+        const stepDesc = (step.description || "").trim().toLowerCase();
+        return stepDesc.includes(label) || stepIntent.includes(label);
+      });
+    }
+    /**
+     * Required-field gate: before treating a resolved CLICK target as the next
+     * action, check whether its own form still has an empty required field.
+     *
+     * L1/L2 ground the goal's words against element labels — that is a lexical
+     * match, not a check of whether the form is actually fillable yet. A
+     * required field whose own label shares none of the goal's vocabulary
+     * (measured: "Repository name" scores 0 against "create a new repo" — no
+     * token in common at all, a limitation no threshold fixes) never becomes a
+     * candidate on lexical grounds, so nothing here stopped a submit control
+     * from winning even though the form it belongs to isn't ready to submit.
+     *
+     * The gate is structural, not lexical: the standard native `element.form`
+     * association (`formId`) plus the standard `required` HTML attribute — the
+     * same two signals a real browser already uses to refuse a premature submit.
+     * No site knowledge, no synonym, no phrase table.
+     *
+     * When a gate fires, the redirect reuses _buildPlanFromElement exactly as
+     * any other fill step: it extracts a value from the goal if one was stated,
+     * or leaves it empty. The guide model does not type on the user's behalf
+     * either way — an empty-value fill step highlights the field and waits for
+     * the user, which is already how ScreenPilot asks for input. No new
+     * clarification path is needed for this case.
+     *
+     * Only ever redirects TO the field, never invents a value FOR it, and only
+     * applies when the resolved target is not itself the field being asked for
+     * (an input target proceeds untouched — it IS the missing field).
+     *
+     * @param {string} goal
+     * @param {object[]} elements - This cycle's full pageState.elements.
+     * @param {object} candidate - L1/L2's own resolved target.
+     * @returns {object|null} A ready plan response redirected to the missing
+     *   field, or null when nothing gates the candidate.
+     */
+    _resolveRequiredFieldGate(goal, elements, candidate) {
+      const candidateIsInput = ["textbox", "combobox"].includes(candidate.role) || ["input", "textarea"].includes(candidate.tag);
+      if (candidateIsInput || !candidate.formId) return null;
+      const missing = (elements || []).find(
+        (el) => el.formId === candidate.formId && el.required && (["textbox", "combobox"].includes(el.role) || ["input", "textarea"].includes(el.tag)) && el.visible && el.enabled !== false && !(el.value || "").trim()
+      );
+      if (!missing) return null;
+      return this._buildPlanFromElement(goal, missing, 0.9, "ml_grounding");
+    }
+    /**
+     * Structural continuation of an interaction a settled action STARTED but
+     * did not finish.
+     *
+     * Withholding settled targets (see route()) is enough whenever the next
+     * action is itself findable by grounding the goal — a newly revealed
+     * control usually shares the goal's own vocabulary. It is NOT enough when
+     * the continuation control's wording is unrelated to what remains of the
+     * goal: measured on a filled search form, the next control scored 0.450,
+     * below L2's threshold, so the cycle would fall through to a reasoning
+     * model for something the page structure already determines.
+     *
+     * HTML defines exactly one such relationship generically: a control that
+     * submits the form its filled field belongs to, via the standard native
+     * `element.form` association (surfaced as `formId` by
+     * page-state-service.js). That is what this resolves — no selector, no
+     * phrase, no site knowledge, and nothing specific to search.
+     *
+     * Requires BOTH:
+     *   (a) the field's live value is currently non-empty, AND
+     *   (b) a settled action of this task targeted that field
+     * — (a) alone is deliberately not enough: a field that merely had unrelated
+     * pre-existing content (a genuine "change the email to..." goal on a
+     * pre-filled field) must stay re-fillable, not be redirected to a submit
+     * control it was never asked to reach.
+     *
+     * @param {object[]} elements - This cycle's full pageState.elements.
+     * @param {object[]} settledSteps - Steps whose effect is the current state.
+     * @returns {object|null} A ready plan response, or null to fall through.
+     */
+    _resolveActionContinuation(elements, settledSteps) {
+      if (!settledSteps?.length) return null;
+      const candidate = (elements || []).find((el) => {
+        const isInput = ["textbox", "combobox"].includes(el.role) || ["input", "textarea"].includes(el.tag);
+        return isInput && el.formId && (el.value || "").trim() && this._isSettledTarget(el, settledSteps);
+      });
+      if (!candidate) return null;
+      const submitCandidates = elements.filter(
+        (el) => el.formId === candidate.formId && el.id !== candidate.id && el.visible && el.enabled !== false && (el.type === "submit" || el.tag === "button" || el.role === "button")
+      );
+      if (!submitCandidates.length) return null;
+      const target = submitCandidates.find((el) => el.type === "submit") || (submitCandidates.length === 1 ? submitCandidates[0] : null);
+      if (!target) return null;
+      const candidateLabel = (candidate.text || candidate.placeholder || candidate.ariaLabel || "").trim();
+      const plan = this._buildPlanFromElement(candidateLabel, target, 0.9, "ml_grounding");
+      plan.plan.steps[0].completionCondition = "final";
+      return plan;
+    }
     _evalFastPath(goal, elements) {
       const normGoal = goal.trim().toLowerCase();
       if (!normGoal || !elements.length) return null;
@@ -2320,20 +3080,28 @@ Return JSON ONLY:
     }
     _buildPlanFromElement(goal, element, confidence, layer) {
       const isInput = ["textbox", "combobox", "search"].includes(element.role) || ["input", "textarea"].includes(element.tag);
-      const label = element.text || element.placeholder || element.ariaLabel || goal;
+      const elementOwnLabel = element.text || element.placeholder || element.ariaLabel || "";
+      const displayLabel = elementOwnLabel || goal;
+      const value = isInput ? extractRequestedValue(goal, displayLabel) : "";
       const action = isInput ? "fill_form" : "navigate";
       const step = {
         id: 1,
-        description: `${isInput ? "Fill" : "Click"} '${label}'`,
-        intent: `${isInput ? "fill" : "click"}_${label}`,
+        description: value ? `Type '${value}' into '${displayLabel}'` : `${isInput ? "Fill" : "Click"} '${displayLabel}'`,
+        intent: `${isInput ? "fill" : "click"}_${displayLabel}`,
         phase: action,
         completionCondition: "dom_change",
         targetElement: {
-          text: label,
+          text: elementOwnLabel,
           type: isInput ? "input" : "button",
-          intent: label,
+          intent: displayLabel,
+          value,
           elementId: element.id,
-          region: element.region ?? null
+          region: element.region ?? null,
+          // Already produced by PageStateService (getBoundingClientRect) and
+          // already used for vision candidate markers — forwarded here, not
+          // recomputed, so the executor has the same known on-page position to
+          // fall back to when targetElement.text is empty (see above).
+          bbox: element.bbox ?? null
         },
         // Provisional default — corrected centrally in v2-task.js's plan-loop enrichment
         // step, which looks the resolved element back up in PageStateService's element
@@ -2345,7 +3113,7 @@ Return JSON ONLY:
         schemaVersion: "1",
         result: "OK",
         state: "planned",
-        plannerSummary: `[Layer: ${layer}] Resolved target element '${label}' with confidence ${confidence}`,
+        plannerSummary: `[Layer: ${layer}] Resolved target element '${displayLabel}' with confidence ${confidence}`,
         confidence,
         plan: {
           goalType: "action",
@@ -3009,6 +3777,8 @@ Return JSON ONLY:
   var _executor = null;
   var _taskContext = null;
   var _taskStartedAt = null;
+  var _lastUserActedAtMs = null;
+  var _lastUserActedIntent = null;
   var MAX_CLARIFICATIONS = 5;
   var RETRYABLE_PLAN_ERRORS = /* @__PURE__ */ new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
   var MAX_PLAN_RETRIES = 2;
@@ -3351,6 +4121,11 @@ Return JSON ONLY:
       description: step.description,
       intent: step.intent,
       completionCondition: step.completionCondition,
+      // What this step is supposed to ACHIEVE, kept alongside it so a later cycle
+      // can re-check the effect itself rather than only whether the page as a
+      // whole still looks identical. See deriveSettledSteps.
+      targetLabel: (step.targetElement?.text || "").trim(),
+      requestedValue: (step.targetElement?.value || "").trim(),
       expectedUrlPattern: step.expectedPageState?.urlPattern ?? null,
       expectedUrlChanges: step.expectedPageState?.urlChanges ?? false,
       urlBefore: window.location.href,
@@ -3368,6 +4143,8 @@ Return JSON ONLY:
       description: pendingStep.description,
       intent: pendingStep.intent,
       completionCondition: pendingStep.completionCondition,
+      targetLabel: pendingStep.targetLabel ?? "",
+      requestedValue: pendingStep.requestedValue ?? "",
       urlBefore: pendingStep.urlBefore,
       domHashBefore: pendingStep.domHashBefore ?? null,
       // carry through for dedup guard
@@ -3448,6 +4225,39 @@ Return JSON ONLY:
     }
     return { matchingCompleted, urlSame, domHashSame };
   }
+  function stepEffectStillHolds(step, pageState, currentSnap = null) {
+    const want = (step.requestedValue || "").trim();
+    const label = (step.targetLabel || "").trim().toLowerCase();
+    if (want && label && Array.isArray(pageState?.elements)) {
+      const satisfied = pageState.elements.some((el) => {
+        const elLabel = (el.text || el.placeholder || el.ariaLabel || "").trim().toLowerCase();
+        return elLabel === label && valueSatisfies(el.value || "", want);
+      });
+      if (satisfied) return true;
+    }
+    const from = step.urlBefore;
+    const to = step.urlAfter;
+    if (from && to && from !== to && currentSnap?.url === to) return true;
+    return false;
+  }
+  function deriveSettledSteps(completedSteps, currentSnap, pageState = null) {
+    if (!currentSnap) return [];
+    return (completedSteps || []).slice(-3).filter((step) => {
+      if (stepEffectStillHolds(step, pageState, currentSnap)) return true;
+      const urlBaseline = step.urlAfter ?? step.urlBefore;
+      if (urlBaseline != null && currentSnap.url !== urlBaseline) return false;
+      if (step.domHashAfter != null) return currentSnap.domHash === step.domHashAfter;
+      if (step.domHashBefore != null) return currentSnap.domHash === step.domHashBefore;
+      return false;
+    });
+  }
+  function isGoalConsumed(session, pageState, settledSteps, router) {
+    if (!settledSteps?.length || !Array.isArray(pageState?.elements)) return false;
+    const intent = [session?.goal, ...(session?.clarifications ?? []).map((c) => c.text)].filter(Boolean).join(" ");
+    const unsettled = pageState.elements.filter((el) => !router._isSettledTarget(el, settledSteps));
+    if (UIGroundingService.rankElements(intent, unsettled).length) return false;
+    return !router._resolveActionContinuation(pageState.elements, settledSteps);
+  }
   function makeSingleStepPlan(step, goal) {
     return {
       planId: crypto.randomUUID(),
@@ -3526,9 +4336,13 @@ Return JSON ONLY:
       }
       if (_generation !== myGen) return;
       console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${session.goal}"`);
+      let settledSteps = [];
+      let entrySnap = null;
       try {
         const lastStep = session.completedSteps[session.completedSteps.length - 1];
         const currentSnap = capturePageSnapshot("");
+        entrySnap = currentSnap;
+        settledSteps = deriveSettledSteps(session.completedSteps, currentSnap);
         console.log(`[SP:V2:DIAG] Plan loop entry \u2014 completedSteps=${session.completedSteps.length} stepAttemptCount=${session.stepAttemptCount} phase=${session.phase}`, {
           pendingStep: session.pendingStep ? { intent: session.pendingStep.intent, domHashBefore: session.pendingStep.domHashBefore } : null,
           lastCompletedStep: lastStep ? { intent: lastStep.intent, domHashBefore: lastStep.domHashBefore, urlBefore: lastStep.urlBefore } : null,
@@ -3537,13 +4351,23 @@ Return JSON ONLY:
         });
       } catch {
       }
+      let cyclePageState = null;
+      let cycleExtractMs = 0;
+      let cycleGenericCheck = null;
       {
         console.log("[SP:V2:TRACE] verify START");
         const tGoalStart = Date.now();
+        const tExtractStart = Date.now();
         const pageState = PageStateService.extractPageState();
+        cycleExtractMs = Date.now() - tExtractStart;
+        cyclePageState = pageState;
+        settledSteps = deriveSettledSteps(session.completedSteps, entrySnap, pageState);
+        console.log(`[SP:V2:PERF] stage=task_progress settledActions=${settledSteps.length} of ${session.completedSteps.length} completed`);
         const gate = GoalVerifier.shouldComplete(session.goalCompletionCriteria, {}, session.goal, pageState);
+        cycleGenericCheck = gate.genericCheck ?? null;
         const goalVerifyMs = Date.now() - tGoalStart;
         console.log(`[SP:V2:TRACE] verify END complete=${gate.complete} reason=${gate.reason}`);
+        console.log(`[SP:V2:PERF] stage=verifier_gate extractMs=${cycleExtractMs} goalVerifyMs=${goalVerifyMs} elements=${pageState.elements.length}`);
         if (gate.complete) {
           console.log("[SP:GoalCompletion]", {
             source: "verifier",
@@ -3554,6 +4378,15 @@ Return JSON ONLY:
           applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
           await _showGoalCompleteCard(tabId, session.goal);
           return;
+        }
+        {
+          if (isGoalConsumed(session, pageState, settledSteps, decisionRouter)) {
+            console.log("[SP:GoalCompletion]", { source: "verifier", satisfied: true, reason: "goal_consumed", settledActions: settledSteps.length });
+            console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_consumed`);
+            applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
+            await _showGoalCompleteCard(tabId, session.goal);
+            return;
+          }
         }
       }
       const { isStuck: budgetExhausted, reason: budgetReason } = await SessionStore.incrementPlannerAttemptOnly(tabId);
@@ -3572,7 +4405,9 @@ Return JSON ONLY:
       }
       if (_generation !== myGen) return;
       const nClarifications = freshSession.clarifications?.length ?? 0;
+      const tPageControlsStart = Date.now();
       const pageControls = collectPageControls();
+      const pageControlsMs = Date.now() - tPageControlsStart;
       const reqId = `req_v2_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const planController = new AbortController();
       console.log(`[SP:V2:TRACE] plan START reqId=${reqId}`);
@@ -3597,10 +4432,10 @@ Return JSON ONLY:
       let planResp;
       try {
         const tDomStart = Date.now();
-        const pageState = PageStateService.extractPageState();
+        const pageState = cyclePageState ?? PageStateService.extractPageState();
         localPageState = pageState;
-        const domMs = Date.now() - tDomStart;
-        const preL3Check = GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
+        const domMs = cyclePageState ? cycleExtractMs : Date.now() - tDomStart;
+        const preL3Check = cycleGenericCheck ?? GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
         if (preL3Check.satisfied) {
           window.removeEventListener("popstate", onNavCheck);
           console.log(`[SP:V2:TRACE] plan END reqId=${reqId} outcome=goal_already_satisfied`);
@@ -3632,7 +4467,12 @@ Return JSON ONLY:
           ...nClarifications && { clarifications: freshSession.clarifications.map((c) => c.text) },
           ...pageControls.length && { pageControls }
         };
-        const routed = await decisionRouter.route(freshSession.goal, pageState, { signal: planController.signal, cloudContext });
+        const routed = await decisionRouter.route(freshSession.goal, pageState, {
+          signal: planController.signal,
+          cloudContext,
+          completedSteps: freshSession.completedSteps,
+          settledSteps
+        });
         planResp = routed.planResponse;
         const layer1Ms = routed.layer1Ms ?? 0;
         const layer2Ms = routed.layer2Ms ?? 0;
@@ -3641,6 +4481,7 @@ Return JSON ONLY:
         const totalPlanningMs = Date.now() - tReqStart;
         console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? "n/a"}`);
         console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
+        console.log(`[SP:V2:PERF] stage=routing routeMs=${layer1Ms + layer2Ms + qwenMs + cloudMs} pageControlsMs=${pageControlsMs} domReused=${cyclePageState ? "yes" : "no"} goalCheckReused=${cycleGenericCheck ? "yes" : "no"}`);
       } catch (err) {
         window.removeEventListener("popstate", onNavCheck);
         console.log(`[SP:V2:TRACE] plan ERROR reqId=${reqId} name=${err?.name} message=${err?.message}`);
@@ -3884,6 +4725,7 @@ Return JSON ONLY:
       console.error("[SP:V2] DOMMatcher not available \u2014 cannot execute step");
       return "element_not_found";
     }
+    const tExecuteStart = Date.now();
     return new Promise((resolve) => {
       if (_generation !== myGen) {
         resolve("aborted");
@@ -3907,6 +4749,11 @@ Return JSON ONLY:
       }
       executor.on("element:ready", async ({ step, element }) => {
         applyEvent(TaskEvent.ELEMENT_READY, { intent: plannerStep.intent });
+        if (_lastUserActedAtMs !== null) {
+          console.log(`[SP:V2:PERF] stage=action_to_next_highlight fillToHighlightMs=${Date.now() - _lastUserActedAtMs} fromIntent="${_lastUserActedIntent ?? ""}" toIntent="${plannerStep.intent ?? ""}"`);
+          _lastUserActedAtMs = null;
+          _lastUserActedIntent = null;
+        }
         const elementNav = computeExpectedNavigationFromElement(element);
         if (elementNav) {
           step.expectedPageState = { ...step.expectedPageState, ...elementNav };
@@ -3918,15 +4765,36 @@ Return JSON ONLY:
         } else {
           showStatus(step.description, "info");
         }
+        const tMarkStart = Date.now();
         await SessionStore.markPendingStep(tabId, buildPendingStepContext(step));
+        console.log(`[SP:V2:PERF] stage=executor executorMs=${Date.now() - tExecuteStart} markPendingStepMs=${Date.now() - tMarkStart} intent="${plannerStep.intent ?? ""}"`);
       });
       executor.on("element:not_found", ({ reason, isOptional }) => {
         if (isOptional) return;
         applyEvent(TaskEvent.ELEMENT_NOT_FOUND, { reason });
         done("element_not_found");
       });
-      executor.on("user:acted", async ({ step, trigger }) => {
+      executor.on("user:acted", async ({ step, trigger, observedValue }) => {
         applyEvent(TaskEvent.USER_ACTED, { trigger });
+        const isFillStep = plannerStep.phase === "fill_form" || plannerStep.completionCondition === "input_filled";
+        const requestedValue = (plannerStep.targetElement?.value ?? "").trim();
+        if (isFillStep && requestedValue && observedValue !== null && observedValue !== void 0 && !valueSatisfies(observedValue, requestedValue)) {
+          console.warn(`[SP:V2] Fill verification FAILED \u2014 requested="${requestedValue}" observed="${observedValue ?? ""}" \u2014 step NOT settled, replanning`);
+          console.log(`[SP:V2:PERF] stage=post_action_verify verdict=FAILED reason=requested_value_not_present`);
+          const { isStuck, reason } = await SessionStore.incrementStepAttempt(tabId);
+          if (isStuck) {
+            applyEvent(TaskEvent.PLAN_FAILED, { reason });
+            showStatus(`ScreenPilot: ${reason}`, "error");
+            await SessionStore.clear(tabId);
+            done("aborted");
+            return;
+          }
+          applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "fill_value_not_satisfied" });
+          done("completed");
+          return;
+        }
+        _lastUserActedAtMs = Date.now();
+        _lastUserActedIntent = plannerStep.intent ?? null;
         if (expectsNavigation) {
           if (_taskContext) {
             _taskContext.steps.push({ description: step.description });
@@ -3943,10 +4811,7 @@ Return JSON ONLY:
           await new Promise((r) => setTimeout(r, 25));
           post = capturePageSnapshot("");
         }
-        if (Date.now() - tVerifyStart < 150) {
-          const rem = 150 - (Date.now() - tVerifyStart);
-          if (rem > 0) await new Promise((r) => setTimeout(r, rem));
-        }
+        const verifyMs = Date.now() - tVerifyStart;
         if (_generation !== myGen) {
           done("aborted");
           return;
@@ -3954,10 +4819,13 @@ Return JSON ONLY:
         post = capturePageSnapshot("");
         const verdict = validateStep(pre, post);
         console.log(`[SP:V2] user:acted verdict=${verdict} domHashBefore=${pre?.domHash} domHashAfter=${post.domHash} urlBefore=${pre?.url} urlAfter=${post.url}`);
+        console.log(`[SP:V2:PERF] stage=post_action_verify postActionVerifyMs=${verifyMs} verdict=${verdict} trigger=${trigger}`);
         await SessionStore.completeStep(tabId, {
           description: step.description,
           intent: plannerStep.intent,
           completionCondition: step.completionCondition,
+          targetLabel: (plannerStep.targetElement?.text || "").trim(),
+          requestedValue: (plannerStep.targetElement?.value || "").trim(),
           urlBefore: pre?.url ?? window.location.href,
           domHashBefore: pre?.domHash ?? null,
           // stored so dedup guard works post-completion

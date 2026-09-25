@@ -1,5 +1,7 @@
 # ScreenPilot V2 Architecture Specification
 
+> **Current state (final implementation):** the cascade is now Goal → PageStateService (+ PrivacySanitizer) → L1 → L2 → L3 (Qwen **or** Moondream, then cloud fallback) → Executor → Verify → replan only when needed. Screenshots are redacted locally before any model or network use. See **docs/SCREENPILOT_FINAL_DOCUMENTATION.md** (single source of truth).
+
 ## 1. Overview & Vision
 ScreenPilot V2 evolves the system from a cloud-dependent LLM wrapper into a **local-first, hierarchical web automation agent**. 
 

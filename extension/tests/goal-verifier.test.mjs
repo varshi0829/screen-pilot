@@ -188,6 +188,40 @@ test('shouldComplete: missing criteria → not complete', () => {
   assert.equal(GoalVerifier.shouldComplete(undefined).reason, 'no_criteria');
 });
 
+// ── Latency: the generic check is returned so ONE planning cycle can reuse ──
+// ── it rather than re-scanning the same live document for the same answer ──
+
+test('shouldComplete exposes the generic check it computed, so a cycle can reuse it', () => {
+  const env = { doc: makeDoc(), loc: loc('https://example.com/home') };
+  const g = GoalVerifier.shouldComplete(null, env, 'open billing settings', null);
+
+  assert.equal(g.complete, false);
+  assert.ok(g.genericCheck, 'the generic result must be exposed for reuse');
+  assert.equal(g.genericCheck.satisfied, false);
+  // Reusing it must equal recomputing it against the same unchanged state.
+  assert.deepEqual(
+    { satisfied: g.genericCheck.satisfied, reason: g.genericCheck.reason },
+    (({ satisfied, reason }) => ({ satisfied, reason }))(GoalVerifier.isGoalSatisfied('open billing settings', null, env)),
+  );
+});
+
+test('shouldComplete omits genericCheck when no generic check was performed', () => {
+  // No goal given → nothing generic was computed, so a caller must be able to
+  // tell that apart from "computed and came back unsatisfied".
+  assert.equal(GoalVerifier.shouldComplete(null, {}).genericCheck, undefined);
+  // A requiresEffect contract short-circuits before the generic check.
+  assert.equal(GoalVerifier.shouldComplete(repoCriteria(), postEffectEnv(), 'some goal', null).genericCheck, undefined);
+});
+
+test('shouldComplete preserves its existing reason strings alongside genericCheck', () => {
+  const env = { doc: makeDoc(), loc: loc('https://example.com/home') };
+  assert.equal(GoalVerifier.shouldComplete(null, env, 'open billing settings', null).reason, 'no_criteria');
+  assert.equal(
+    GoalVerifier.shouldComplete(repoCriteria({ requiresEffect: false }), env, 'open billing settings', null).reason,
+    'no_effect_contract',
+  );
+});
+
 test('shouldComplete: confidenceThreshold blocks a weak any-match', () => {
   const c = repoCriteria({
     match: 'any', confidenceThreshold: 0.75,

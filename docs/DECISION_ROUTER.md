@@ -1,5 +1,7 @@
 # Decision Router Specification
 
+> **Current state (final implementation):** Layer 3 now routes to exactly ONE local provider per planning cycle: **Qwen** (`qwen2.5-coder:7b`, text reasoning) when L2 ranked at least one text candidate, **Moondream** (visual perception) when L2 ranked none. If Moondream returns a null/unknown elementId and exactly one unlabeled interactive candidate exists, it is resolved structurally (`_findSoleUnlabeledInteractiveCandidate`); otherwise the router falls back to the cloud once. Ambiguity escalation, the required-field gate, action continuations and settled-target withholding also live here. See **docs/SCREENPILOT_FINAL_DOCUMENTATION.md** (single source of truth).
+
 ## 1. Overview
 The `DecisionRouter` is the control center of ScreenPilot V2. It evaluates incoming tasks against extracted page states and decides which layer of the hierarchy to invoke:
 

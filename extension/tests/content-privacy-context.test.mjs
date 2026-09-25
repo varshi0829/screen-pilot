@@ -51,10 +51,13 @@ function makeInputStub({
   };
 }
 
-function runHelper({ inputs = [], textareas = [], devicePixelRatio = 1 } = {}) {
+function runHelper({ inputs = [], textareas = [], devicePixelRatio = 1, byId = {} } = {}) {
   const sandbox = {
     document: {
       querySelectorAll: (sel) => (sel === 'input, textarea' ? [...inputs, ...textareas] : []),
+      // Optional — only needed by aria-labelledby tests; every other caller
+      // passes no byId and sees null, exactly as before.
+      getElementById: (id) => byId[id] ?? null,
     },
     window: { devicePixelRatio },
     exports: {},
@@ -179,4 +182,77 @@ test('the ANALYZE_GOAL/REANALYZE message (sent via the shared messageType variab
   assert.ok(idx !== -1, 'content.js must still build the shared ANALYZE_GOAL/REANALYZE request object');
   const windowText = source.slice(idx, idx + 400);
   assert.ok(windowText.includes('getScreenshotPrivacyContext()'));
+});
+
+// ── Fields named only by an associated label ─────────────────────────────────
+//
+// A field is very often named by a <label> rather than by any attribute on the
+// input itself. The detector used to read only placeholder/aria-label, so a
+// short secret typed into a plain text box — too short for any PII value
+// pattern — was never masked on the Explain/Ask/Analyze screenshot path, while
+// the task path (PageStateService, which resolves labels) masked the very same
+// field. Generic: these are standard DOM/ARIA label relationships, nothing
+// about any particular page.
+
+function labelled({ labelText = '', labelledBy = '', value = '', type = 'text' } = {}) {
+  const attrs = { type, 'aria-labelledby': labelledBy };
+  return {
+    getAttribute: (name) => (name in attrs ? attrs[name] || null : null),
+    type,
+    value,
+    // Native HTMLInputElement.labels — covers <label for="id"> AND an ancestor
+    // <label> wrapping the control, exactly as a real browser reports them.
+    labels: labelText ? [{ innerText: labelText, textContent: labelText }] : [],
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 100, height: 20 }),
+  };
+}
+
+test('a short secret named only by <label for> is flagged (CVV, PIN, one-time code, account number)', () => {
+  const inputs = [
+    labelled({ labelText: 'CVV', value: '123' }),
+    labelled({ labelText: 'PIN code', value: '4821' }),
+    labelled({ labelText: 'One-time code', value: '905512' }),
+    labelled({ labelText: 'Account number', value: '12345678' }),
+  ];
+  const { getSensitiveScreenshotRegions } = runHelper({ inputs });
+  assert.equal(getSensitiveScreenshotRegions().length, 4,
+    'none of these values match a PII pattern — the label is the only signal');
+});
+
+test('a field named via aria-labelledby is flagged', () => {
+  const { getSensitiveScreenshotRegions } = runHelper({
+    inputs: [labelled({ labelledBy: 'lbl-sec', value: '777' })],
+    byId: { 'lbl-sec': { innerText: 'Security code', textContent: 'Security code' } },
+  });
+  assert.equal(getSensitiveScreenshotRegions().length, 1);
+});
+
+test('a field whose associated label is not sensitive is not flagged', () => {
+  const { getSensitiveScreenshotRegions } = runHelper({
+    inputs: [
+      labelled({ labelText: 'City', value: 'Pune' }),
+      labelled({ labelText: 'Nickname', value: 'rr' }),
+    ],
+  });
+  assert.equal(getSensitiveScreenshotRegions().length, 0,
+    'label resolution must not turn ordinary labelled fields into redactions');
+});
+
+test('a labelled form mixing sensitive and ordinary fields masks exactly the sensitive ones', () => {
+  // Shape of a typical profile form: each field named by its own <label for>.
+  const inputs = [
+    labelled({ labelText: 'Full Name',     value: 'Asha Verma' }),                  // not a credential
+    labelled({ labelText: 'Email Address', value: 'asha@example.org' }),            // value pattern
+    labelled({ labelText: 'Password',      value: 'hunter2', type: 'password' }),   // type
+    labelled({ labelText: 'Card Number',   value: '4000 0000 0000 0002' }),         // label + value
+    labelled({ labelText: 'CVV',           value: '321' }),                          // label ONLY
+  ];
+  const { getSensitiveScreenshotRegions } = runHelper({ inputs });
+  assert.equal(getSensitiveScreenshotRegions().length, 4);
+});
+
+test('a control exposing no labels property still works (older/partial DOMs)', () => {
+  const stub = makeInputStub({ type: 'text', value: 'plain' });
+  const { getSensitiveScreenshotRegions } = runHelper({ inputs: [stub] });
+  assert.equal(getSensitiveScreenshotRegions().length, 0, 'missing el.labels must degrade safely, never throw');
 });

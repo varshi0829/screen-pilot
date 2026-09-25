@@ -96,11 +96,16 @@ test('V2 Integration D: LocalQwenAdapter formats 1-action prompt and parses stru
   };
 
   const router = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: mockQwen });
+  // P0 #1: genuine (not floor-inflated) partial lexical overlap, split
+  // across two elements so neither alone fully covers the goal's
+  // page-relatable vocabulary — L2 correctly misses (ranked.length > 0 but
+  // top score < 0.70), and the L3 router picks Qwen, not vision.
   const pageState = {
     url: 'https://store.example.com/cart',
     title: 'Shopping Cart',
     elements: [
-      { id: 'el_1', role: 'generic', tag: 'div', text: 'Cart Items', visible: true, enabled: true }
+      { id: 'el_1', role: 'generic', tag: 'div', text: 'Cart Items Checkout', visible: true, enabled: true },
+      { id: 'el_2', role: 'generic', tag: 'div', text: 'Proceed Section', visible: true, enabled: true }
     ]
   };
 

@@ -540,15 +540,23 @@ export const GoalVerifier = {
           }
           return { complete: true, reason: 'signals_satisfied', verdict };
         }
+        // `genericCheck` is attached to whichever result is returned below so a
+        // caller running several checks in ONE planning cycle can reuse this
+        // exact result instead of re-scanning the same live document with the
+        // same inputs a few milliseconds later. It stays undefined whenever no
+        // generic check was actually performed (no goal given, or a
+        // requiresEffect contract short-circuited above), so a caller can
+        // always tell "computed and unsatisfied" from "not computed".
+        let genericCheck;
         if (goal) {
-          const genericCheck = this.isGoalSatisfied(goal, pageState, env);
+          genericCheck = this.isGoalSatisfied(goal, pageState, env);
           if (genericCheck.satisfied) {
-            return { complete: true, reason: 'goal_already_satisfied', verdict: { satisfied: true, reason: genericCheck.reason } };
+            return { complete: true, reason: 'goal_already_satisfied', verdict: { satisfied: true, reason: genericCheck.reason }, genericCheck };
           }
         }
-        if (!criteria) return { complete: false, reason: 'no_criteria', verdict: null };
-        if (criteria.requiresEffect !== true) return { complete: false, reason: 'no_effect_contract', verdict: null };
-        return { complete: false, reason: 'unsatisfied', verdict: null };
+        if (!criteria) return { complete: false, reason: 'no_criteria', verdict: null, genericCheck };
+        if (criteria.requiresEffect !== true) return { complete: false, reason: 'no_effect_contract', verdict: null, genericCheck };
+        return { complete: false, reason: 'unsatisfied', verdict: null, genericCheck };
       } catch {
         return { complete: false, reason: 'evaluation_error', verdict: null };
       }

@@ -1,0 +1,926 @@
+{
+  "generatedAt": "2026-09-25T08:04:24.405Z",
+  "machine": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13620H",
+    "logicalCores": 16,
+    "totalRamGB": 15.7,
+    "platform": "win32 10.0.26200",
+    "node": "v25.2.1"
+  },
+  "config": {
+    "reps": 3,
+    "timeoutMs": 180000,
+    "executionMode": "local-qwen",
+    "idleBaselineMs": 10000,
+    "tasks": [
+      "deterministic-click",
+      "vision-icon-click",
+      "qwen-search-two-step"
+    ]
+  },
+  "latency": {
+    "deterministic-click": {
+      "path": "L1/L2 deterministic grounding (no model)",
+      "goal": "Click Submit Profile",
+      "successRate": 1,
+      "completedRuns": 3,
+      "measuredRuns": 3,
+      "totalMs": {
+        "n": 3,
+        "mean": 131,
+        "median": 127,
+        "min": 116,
+        "max": 150
+      },
+      "systemMs": {
+        "n": 3,
+        "mean": 85.33333333333333,
+        "median": 80,
+        "min": 73,
+        "max": 103
+      },
+      "planningMs": {
+        "n": 3,
+        "mean": 25.666666666666668,
+        "median": 25,
+        "min": 21,
+        "max": 31
+      },
+      "highlightMs": {
+        "n": 3,
+        "mean": 14,
+        "median": 15,
+        "min": 12,
+        "max": 15
+      },
+      "verificationMs": {
+        "n": 3,
+        "mean": 45.666666666666664,
+        "median": 34,
+        "min": 33,
+        "max": 70
+      },
+      "simulatedUserActionMs": {
+        "n": 3,
+        "mean": 45.666666666666664,
+        "median": 47,
+        "min": 36,
+        "max": 54
+      },
+      "qwenInferenceMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "moondreamInferenceMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "planningCycles": {
+        "n": 3,
+        "mean": 2,
+        "median": 2,
+        "min": 2,
+        "max": 2
+      },
+      "warmupRun": {
+        "outcome": "COMPLETE",
+        "totalMs": 177,
+        "systemMs": 141,
+        "qwenLatencyMs": [],
+        "visionLatencyMs": [],
+        "modelsLoadedBeforeRun": [
+          "moondream:latest",
+          "qwen2.5-coder:7b"
+        ]
+      }
+    },
+    "vision-icon-click": {
+      "path": "Layer 3 local vision (Moondream) on an icon-only control",
+      "goal": "Click the button with the warning icon",
+      "successRate": 1,
+      "completedRuns": 3,
+      "measuredRuns": 3,
+      "totalMs": {
+        "n": 3,
+        "mean": 1852,
+        "median": 1894,
+        "min": 1748,
+        "max": 1914
+      },
+      "systemMs": {
+        "n": 3,
+        "mean": 1799.3333333333333,
+        "median": 1846,
+        "min": 1681,
+        "max": 1871
+      },
+      "planningMs": {
+        "n": 3,
+        "mean": 1588.3333333333333,
+        "median": 1632,
+        "min": 1444,
+        "max": 1689
+      },
+      "highlightMs": {
+        "n": 3,
+        "mean": 29.666666666666668,
+        "median": 32,
+        "min": 16,
+        "max": 41
+      },
+      "verificationMs": {
+        "n": 3,
+        "mean": 181.33333333333334,
+        "median": 173,
+        "min": 166,
+        "max": 205
+      },
+      "simulatedUserActionMs": {
+        "n": 3,
+        "mean": 52.666666666666664,
+        "median": 67,
+        "min": 23,
+        "max": 68
+      },
+      "qwenInferenceMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "moondreamInferenceMs": {
+        "n": 3,
+        "mean": 1147.3333333333333,
+        "median": 1155,
+        "min": 1037,
+        "max": 1250
+      },
+      "planningCycles": {
+        "n": 3,
+        "mean": 2,
+        "median": 2,
+        "min": 2,
+        "max": 2
+      },
+      "warmupRun": {
+        "outcome": "COMPLETE",
+        "totalMs": 13422,
+        "systemMs": 13348,
+        "qwenLatencyMs": [],
+        "visionLatencyMs": [
+          12864
+        ],
+        "modelsLoadedBeforeRun": [
+          "moondream:latest",
+          "qwen2.5-coder:7b"
+        ]
+      }
+    },
+    "qwen-search-two-step": {
+      "path": "Layer 3 local Qwen, two steps (fill, then submit) with navigation",
+      "goal": "Search for artificial intelligence",
+      "successRate": 0,
+      "completedRuns": 0,
+      "measuredRuns": 3,
+      "totalMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "systemMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "planningMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "highlightMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "verificationMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "simulatedUserActionMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "qwenInferenceMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "moondreamInferenceMs": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "planningCycles": {
+        "n": 0,
+        "mean": null,
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "warmupRun": {
+        "outcome": "INCOMPLETE",
+        "totalMs": 23434,
+        "systemMs": 23286,
+        "qwenLatencyMs": [
+          22897
+        ],
+        "visionLatencyMs": [],
+        "modelsLoadedBeforeRun": [
+          "moondream:latest",
+          "qwen2.5-coder:7b"
+        ]
+      }
+    }
+  },
+  "runs": [
+    {
+      "taskId": "deterministic-click",
+      "rep": 0,
+      "warmup": true,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 177,
+      "planningMs": 38,
+      "highlightMs": 27,
+      "userActionMs": 36,
+      "verificationMs": 76,
+      "otherMs": 0,
+      "systemMs": 141,
+      "cycles": 2,
+      "mechanisms": [
+        "L1_deterministic"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "submit-profile"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        2
+      ],
+      "screenshotMs": [
+        0
+      ],
+      "postActionVerifyMs": [
+        66
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322719677,
+        "end": 1790322719900
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "deterministic-click",
+      "rep": 1,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 150,
+      "planningMs": 21,
+      "highlightMs": 12,
+      "userActionMs": 47,
+      "verificationMs": 70,
+      "otherMs": 0,
+      "systemMs": 103,
+      "cycles": 2,
+      "mechanisms": [
+        "L1_deterministic"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "submit-profile"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        1
+      ],
+      "screenshotMs": [
+        0
+      ],
+      "postActionVerifyMs": [
+        57
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322720183,
+        "end": 1790322720381
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "deterministic-click",
+      "rep": 2,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 127,
+      "planningMs": 25,
+      "highlightMs": 15,
+      "userActionMs": 54,
+      "verificationMs": 33,
+      "otherMs": 0,
+      "systemMs": 73,
+      "cycles": 2,
+      "mechanisms": [
+        "L1_deterministic"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "submit-profile"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        2
+      ],
+      "screenshotMs": [
+        0
+      ],
+      "postActionVerifyMs": [
+        25
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322720660,
+        "end": 1790322720815
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "deterministic-click",
+      "rep": 3,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 116,
+      "planningMs": 31,
+      "highlightMs": 15,
+      "userActionMs": 36,
+      "verificationMs": 34,
+      "otherMs": 0,
+      "systemMs": 80,
+      "cycles": 2,
+      "mechanisms": [
+        "L1_deterministic"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "submit-profile"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        1
+      ],
+      "screenshotMs": [
+        0
+      ],
+      "postActionVerifyMs": [
+        27
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322721059,
+        "end": 1790322721205
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "vision-icon-click",
+      "rep": 0,
+      "warmup": true,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 13422,
+      "planningMs": 13130,
+      "highlightMs": 42,
+      "userActionMs": 74,
+      "verificationMs": 176,
+      "otherMs": 0,
+      "systemMs": 13348,
+      "cycles": 2,
+      "mechanisms": [
+        "structural_fallback"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "warning-btn"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [
+        12864
+      ],
+      "totalPlanningMsPerCycle": [
+        13090
+      ],
+      "screenshotMs": [
+        190
+      ],
+      "postActionVerifyMs": [
+        152
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322721414,
+        "end": 1790322734883
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": [
+          {
+            "start": 1790322721467,
+            "end": 1790322734527
+          }
+        ]
+      }
+    },
+    {
+      "taskId": "vision-icon-click",
+      "rep": 1,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 1894,
+      "planningMs": 1689,
+      "highlightMs": 16,
+      "userActionMs": 23,
+      "verificationMs": 166,
+      "otherMs": 0,
+      "systemMs": 1871,
+      "cycles": 2,
+      "mechanisms": [
+        "structural_fallback"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "warning-btn"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [
+        1250
+      ],
+      "totalPlanningMsPerCycle": [
+        1644
+      ],
+      "screenshotMs": [
+        340
+      ],
+      "postActionVerifyMs": [
+        158
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322735478,
+        "end": 1790322737383
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": [
+          {
+            "start": 1790322735578,
+            "end": 1790322737169
+          }
+        ]
+      }
+    },
+    {
+      "taskId": "vision-icon-click",
+      "rep": 2,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 1914,
+      "planningMs": 1632,
+      "highlightMs": 41,
+      "userActionMs": 68,
+      "verificationMs": 173,
+      "otherMs": 0,
+      "systemMs": 1846,
+      "cycles": 2,
+      "mechanisms": [
+        "structural_fallback"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "warning-btn"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [
+        1155
+      ],
+      "totalPlanningMsPerCycle": [
+        1580
+      ],
+      "screenshotMs": [
+        379
+      ],
+      "postActionVerifyMs": [
+        152
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322737875,
+        "end": 1790322739850
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": [
+          {
+            "start": 1790322737951,
+            "end": 1790322739486
+          }
+        ]
+      }
+    },
+    {
+      "taskId": "vision-icon-click",
+      "rep": 3,
+      "warmup": false,
+      "completed": true,
+      "outcome": "COMPLETE",
+      "stopReason": "terminal_state",
+      "totalMs": 1748,
+      "planningMs": 1444,
+      "highlightMs": 32,
+      "userActionMs": 67,
+      "verificationMs": 205,
+      "otherMs": 0,
+      "systemMs": 1681,
+      "cycles": 2,
+      "mechanisms": [
+        "structural_fallback"
+      ],
+      "actions": [
+        {
+          "action": "click",
+          "target": "warning-btn"
+        }
+      ],
+      "qwenLatencyMs": [],
+      "visionLatencyMs": [
+        1037
+      ],
+      "totalPlanningMsPerCycle": [
+        1391
+      ],
+      "screenshotMs": [
+        297
+      ],
+      "postActionVerifyMs": [
+        176
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322740342,
+        "end": 1790322742111
+      },
+      "inferenceWindows": {
+        "qwen": [],
+        "moondream": [
+          {
+            "start": 1790322740422,
+            "end": 1790322741756
+          }
+        ]
+      }
+    },
+    {
+      "taskId": "qwen-search-two-step",
+      "rep": 0,
+      "warmup": true,
+      "completed": false,
+      "outcome": "INCOMPLETE",
+      "stopReason": "timeout",
+      "totalMs": 23434,
+      "planningMs": 23003,
+      "highlightMs": 83,
+      "userActionMs": 148,
+      "verificationMs": 200,
+      "otherMs": 0,
+      "systemMs": 23286,
+      "cycles": 2,
+      "mechanisms": [
+        "qwen"
+      ],
+      "actions": [
+        {
+          "action": "fill",
+          "target": "search-input"
+        }
+      ],
+      "qwenLatencyMs": [
+        22897
+      ],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        22929,
+        4,
+        2,
+        2
+      ],
+      "screenshotMs": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "postActionVerifyMs": [
+        181
+      ],
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790322742830,
+        "end": 1790322922845
+      },
+      "inferenceWindows": {
+        "qwen": [
+          {
+            "start": 1790322742888,
+            "end": 1790322765789
+          }
+        ],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "qwen-search-two-step",
+      "rep": 1,
+      "warmup": false,
+      "completed": false,
+      "outcome": "INCOMPLETE",
+      "stopReason": "timeout",
+      "totalMs": 5566,
+      "planningMs": 5339,
+      "highlightMs": 20,
+      "userActionMs": 41,
+      "verificationMs": 166,
+      "otherMs": 0,
+      "systemMs": 5525,
+      "cycles": 2,
+      "mechanisms": [
+        "qwen"
+      ],
+      "actions": [
+        {
+          "action": "fill",
+          "target": "search-input"
+        }
+      ],
+      "qwenLatencyMs": [
+        5288
+      ],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        5316,
+        1,
+        2,
+        2
+      ],
+      "screenshotMs": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "postActionVerifyMs": [
+        154
+      ],
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "taskWindow": {
+        "start": 1790322923064,
+        "end": 1790323103119
+      },
+      "inferenceWindows": {
+        "qwen": [
+          {
+            "start": 1790322923106,
+            "end": 1790322928395
+          }
+        ],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "qwen-search-two-step",
+      "rep": 2,
+      "warmup": false,
+      "completed": false,
+      "outcome": "INCOMPLETE",
+      "stopReason": "timeout",
+      "totalMs": 5432,
+      "planningMs": 5234,
+      "highlightMs": 8,
+      "userActionMs": 13,
+      "verificationMs": 177,
+      "otherMs": 0,
+      "systemMs": 5419,
+      "cycles": 2,
+      "mechanisms": [
+        "qwen"
+      ],
+      "actions": [
+        {
+          "action": "fill",
+          "target": "search-input"
+        }
+      ],
+      "qwenLatencyMs": [
+        5177
+      ],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        5201,
+        0,
+        0,
+        1
+      ],
+      "screenshotMs": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "postActionVerifyMs": [
+        172
+      ],
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790323103458,
+        "end": 1790323283473
+      },
+      "inferenceWindows": {
+        "qwen": [
+          {
+            "start": 1790323103518,
+            "end": 1790323108696
+          }
+        ],
+        "moondream": []
+      }
+    },
+    {
+      "taskId": "qwen-search-two-step",
+      "rep": 3,
+      "warmup": false,
+      "completed": false,
+      "outcome": "INCOMPLETE",
+      "stopReason": "timeout",
+      "totalMs": 5516,
+      "planningMs": 5286,
+      "highlightMs": 19,
+      "userActionMs": 30,
+      "verificationMs": 181,
+      "otherMs": 0,
+      "systemMs": 5486,
+      "cycles": 2,
+      "mechanisms": [
+        "qwen"
+      ],
+      "actions": [
+        {
+          "action": "fill",
+          "target": "search-input"
+        }
+      ],
+      "qwenLatencyMs": [
+        5216
+      ],
+      "visionLatencyMs": [],
+      "totalPlanningMsPerCycle": [
+        5237,
+        1,
+        2,
+        1
+      ],
+      "screenshotMs": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "postActionVerifyMs": [
+        163
+      ],
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b"
+      ],
+      "taskWindow": {
+        "start": 1790323283868,
+        "end": 1790323463897
+      },
+      "inferenceWindows": {
+        "qwen": [
+          {
+            "start": 1790323283901,
+            "end": 1790323289117
+          }
+        ],
+        "moondream": []
+      }
+    }
+  ]
+}

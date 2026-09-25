@@ -8,6 +8,11 @@ export const ScreenshotService = (() => {
   const MAX_WIDTH             = 1024;   // resize larger screens down (1024px)
   const JPEG_QUALITY          = 0.70;   // good fidelity, optimized payload size
 
+  // TEMPORARY DEMO/DEBUG FLAG — remove after the SIH recording. When true, the
+  // final redacted JPEG from each capture is kept in chrome.storage.local for
+  // viewing via debug/redacted-preview.html. Set to false (or delete) to disable.
+  const DEBUG_SAVE_REDACTED_PREVIEW = true;
+
   // @param {object[]} [sensitiveRegions] - CSS-pixel bboxes ({x,y,width,height})
   //   of sensitive DOM elements (see PrivacySanitizer.getSensitiveRegions),
   //   supplied by the caller from the same-cycle page state. Defaults to none,
@@ -41,6 +46,25 @@ export const ScreenshotService = (() => {
         const t1 = Date.now();
         const compressed = await compressImage(dataUrl, sensitiveRegions, devicePixelRatio);
         console.log(`[Perf] Screenshot compress: ${Date.now() - t1}ms (${Math.round(compressed.image.length / 1024)}KB)`);
+
+        // TEMPORARY DEMO/DEBUG CODE — remove after the SIH recording (see
+        // debug/redacted-preview.html). Stores ONLY the final, already-redacted
+        // JPEG (compressed.image) so it can be viewed; the raw pre-redaction
+        // PNG (dataUrl) is never stored or exposed. Fire-and-forget: never
+        // affects or delays the normal capture result.
+        if (DEBUG_SAVE_REDACTED_PREVIEW) {
+          try {
+            Promise.resolve(chrome?.storage?.local?.set?.({
+              sp_debug_redacted_preview: {
+                image: compressed.image,
+                mimeType: 'image/jpeg',
+                capturedAt: Date.now(),
+                redactedRegionCount: Array.isArray(sensitiveRegions) ? sensitiveRegions.length : 0,
+              },
+            })).catch(() => {});
+          } catch { /* debug only — ignore */ }
+        }
+        // END TEMPORARY DEMO/DEBUG CODE
 
         return {
           success:   true,

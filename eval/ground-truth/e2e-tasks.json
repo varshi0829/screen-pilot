@@ -1,0 +1,27 @@
+{
+  "description": "End-to-end latency tasks: goal submitted → ScreenPilot plans, highlights, the simulated user acts on the highlighted element, ScreenPilot verifies and declares the goal complete. One task per routing path that exists in the product. 'userInputs' is what the SIMULATED USER types when ScreenPilot highlights a text field (by element id); every other highlighted element is clicked. Pages are served at neutral paths.",
+  "tasks": [
+    {
+      "id": "deterministic-click",
+      "path": "L1/L2 deterministic grounding (no model)",
+      "goal": "Click Submit Profile",
+      "page": { "htmlFile": "node_modules/privacy-demo.html" },
+      "userInputs": {}
+    },
+    {
+      "id": "vision-icon-click",
+      "path": "Layer 3 local vision (Moondream) on an icon-only control",
+      "goal": "Click the button with the warning icon",
+      "page": { "htmlFile": "node_modules/privacy-demo.html" },
+      "userInputs": {}
+    },
+    {
+      "id": "qwen-search-two-step",
+      "path": "Layer 3 local Qwen, two steps (fill, then submit) with navigation",
+      "goal": "Search for artificial intelligence",
+      "page": { "html": "<header class='row'><strong>Encyclopedia</strong><form id='search-form' action='/results' method='get' class='row'><input id='search-input' name='q' type='search' placeholder='Search the encyclopedia'><button id='search-btn' type='submit'>Search</button></form><a id='lang-link' href='#lang'>English</a></header><main><h1>Main page</h1><p>Featured article of the day.</p></main>" },
+      "extraPages": { "/results": "<h1>Results</h1><p>Showing matching articles.</p><a id='result-1' href='#r1'>First article</a>" },
+      "userInputs": { "search-input": "artificial intelligence" }
+    }
+  ]
+}

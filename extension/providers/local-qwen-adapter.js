@@ -9,6 +9,12 @@ import { BackendAdapter } from './interface.js';
 const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 const DEFAULT_MODEL      = 'qwen2.5-coder:7b';
 const DEFAULT_KEEP_ALIVE = '5m';
+// Numeric mirror of DEFAULT_KEEP_ALIVE, used only for this adapter's own
+// warm-tracking bookkeeping (see _warmModelIfNeeded) — never sent to Ollama,
+// which always receives the string form via keep_alive. A custom `keepAlive`
+// passed to the constructor still uses this same bookkeeping window; parsing
+// arbitrary Ollama keep_alive duration strings isn't needed for this.
+const DEFAULT_KEEP_ALIVE_MS = 5 * 60 * 1000;
 
 // Qwen is now an opt-in L3 backend that falls back to Cloud on failure, so it
 // must release control well before that becomes a stuck-planner problem.
@@ -17,14 +23,25 @@ const DEFAULT_KEEP_ALIVE = '5m';
 // ~11.4s warm (steady-state, keep_alive keeps it warm for 5m between calls),
 // ~22.9s cold (first call after the model has unloaded). Earlier docs/memory
 // citing "~1.8s" were a stale/lighter benchmark — do not trust that figure.
-// 15s leaves only ~3.6s margin over the measured warm baseline on this
-// hardware and will essentially always miss a cold load — the first Qwen call
-// of an idle session should be expected to fall back to Cloud, then
-// subsequent calls in that session hit the warm path. If warm calls start
-// timing out in practice (slower CPUs, larger prompts, system load), this is
-// the first constant to revisit — re-benchmark before raising it. Must match
-// ollama-proxy.js's OLLAMA_GENERATE_TIMEOUT_MS.
-const QWEN_GENERATE_TIMEOUT_MS      = 15_000;
+//
+// Re-benchmarked against the REAL prompt this adapter builds (goal + page +
+// the instruction block + N candidates), model already resident:
+//     7 candidates / 1110 prompt chars -> 17.2s
+//    15 candidates / 1553 prompt chars -> 21.2s
+//    25 candidates / 2116 prompt chars -> 25.3s   (QWEN_CANDIDATE_LIMIT)
+// Every one of those exceeds the old 15s cap, so the local call could never
+// complete on a real page no matter how warm the model was: it aborted, the
+// router fell through to Cloud, and the Cloud provider's own error text was
+// what the user actually saw. Earlier spot-checks looked healthy only because
+// they timed a hand-trimmed prompt without the instruction block (2.9s warm),
+// which is not what is ever sent.
+//
+// 45s covers the measured worst case (25.3s) with margin for a slower machine
+// or heavier page. It is a ceiling, not a target — the deterministic L1/L2
+// path resolves the common case in well under a millisecond without reaching
+// this adapter at all, and this only bounds the cases that genuinely need
+// semantic reasoning. Must match ollama-proxy.js's OLLAMA_GENERATE_TIMEOUT_MS.
+const QWEN_GENERATE_TIMEOUT_MS      = 45_000;
 // Cheap /api/tags liveness probe before attempting a full generate call, so an
 // unreachable Ollama fails fast instead of waiting out the generate timeout.
 const QWEN_AVAILABILITY_TIMEOUT_MS  = 2_500;
@@ -41,6 +58,10 @@ export class LocalQwenAdapter extends BackendAdapter {
     this._ollamaUrl = ollamaUrl.replace(/\/$/, '');
     this._model     = model;
     this._keepAlive = keepAlive;
+    // 0 = "not known to be warm". Set after any successful load (preload or
+    // real generate) to Date.now() + keep-alive window; _warmModelIfNeeded
+    // skips its preload entirely while still within that window.
+    this._warmUntilMs = 0;
   }
 
   get name() { return 'LocalQwenAdapter'; }
@@ -65,6 +86,13 @@ export class LocalQwenAdapter extends BackendAdapter {
       console.log(`[SP:V2:DEBUG] LocalQwenAdapter callerSignal already aborted reqId=${reqId} reason=${callerSignal.reason}`);
       return this._networkFailure('Request aborted', 'ABORTED');
     }
+
+    // Warm ONLY this adapter's own model, and only if we don't already
+    // believe it's resident — never a second real generation, never both
+    // local models (L3 routing already guarantees only one adapter's plan()
+    // is ever called per cycle; this just avoids re-paying a cold load on
+    // every single call within that adapter).
+    await this._warmModelIfNeeded(callerSignal, reqId);
 
     const prompt = this._buildQwenPrompt(request);
     const targetUrl = `${this._ollamaUrl}/api/generate`;
@@ -112,7 +140,8 @@ export class LocalQwenAdapter extends BackendAdapter {
             type: 'OLLAMA_GENERATE',
             reqId,
             url: targetUrl,
-            body: requestBody
+            body: requestBody,
+            timeoutMs: QWEN_GENERATE_TIMEOUT_MS
           }, (response) => {
             if (callerSignal && abortHandler) {
               callerSignal.removeEventListener('abort', abortHandler);
@@ -189,6 +218,10 @@ export class LocalQwenAdapter extends BackendAdapter {
 
       data = await upstream.json().catch(() => null);
     }
+
+    // A successful call — like the preload below — refreshes Ollama's own
+    // keep_alive for this model, so extend our own warm-tracking window too.
+    this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS;
 
     const rawResponse = data?.response ?? '';
     const latencyMs   = Date.now() - t0;
@@ -280,6 +313,73 @@ export class LocalQwenAdapter extends BackendAdapter {
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Preload this adapter's own model into Ollama's memory before the real
+   * generate call, so that call itself doesn't pay the cold-load cost.
+   * Reuses the exact same OLLAMA_GENERATE proxy path plan() uses — no second
+   * client/architecture — but the request body carries no `prompt`, which is
+   * Ollama's own documented mechanism for loading (and keep_alive-refreshing)
+   * a model without running any generation: not a second inference task.
+   *
+   * No-ops entirely when we already believe the model is warm (bookkeeping
+   * only — see _warmUntilMs), when the caller already aborted, or outside a
+   * real chrome-extension context (the rare direct-fetch-fallback path just
+   * skips warming and pays whatever cold-load cost the real call hits, same
+   * as before this feature existed). Never throws — a failed/timed-out
+   * preload just means the real call below proceeds exactly as it already
+   * would have.
+   */
+  async _warmModelIfNeeded(callerSignal, reqId) {
+    if (Date.now() < this._warmUntilMs) {
+      console.log(`[SP:V2:DEBUG] LocalQwenAdapter model already warm reqId=${reqId} warmUntilMs=${this._warmUntilMs} — skipping preload`);
+      return;
+    }
+    if (callerSignal?.aborted) return;
+
+    const hasChromeRuntime = typeof chrome !== 'undefined' && chrome?.runtime?.sendMessage;
+    if (!hasChromeRuntime) return;
+
+    const warmReqId = `${reqId}_warmup`;
+    const targetUrl = `${this._ollamaUrl}/api/generate`;
+    const warmBody  = { model: this._model, keep_alive: this._keepAlive, stream: false };
+
+    console.log(`[SP:V2:DEBUG] LocalQwenAdapter warming model=${this._model} reqId=${warmReqId}`);
+    try {
+      const resp = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({
+          type: 'OLLAMA_GENERATE',
+          reqId: warmReqId,
+          url: targetUrl,
+          body: warmBody,
+          timeoutMs: QWEN_GENERATE_TIMEOUT_MS
+        }, (response) => {
+          if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+          else resolve(response || { success: false, error: 'No response from background script' });
+        });
+      });
+
+      if (resp?.success) {
+        this._warmUntilMs = Date.now() + DEFAULT_KEEP_ALIVE_MS;
+        console.log(`[SP:V2:DEBUG] LocalQwenAdapter model warm reqId=${warmReqId} warmUntilMs=${this._warmUntilMs}`);
+      } else {
+        console.log(`[SP:V2:DEBUG] LocalQwenAdapter warm-up failed reqId=${warmReqId} error=${resp?.error} — proceeding to real generate anyway`);
+      }
+    } catch (err) {
+      console.log(`[SP:V2:DEBUG] LocalQwenAdapter warm-up threw reqId=${warmReqId} message=${err?.message} — proceeding to real generate anyway`);
+    }
+  }
+
+  /**
+   * Explicitly separates two different things Qwen must reason about:
+   * - the TARGET element (an id from the given list — its own label/
+   *   placeholder/text is metadata describing that control, not user input);
+   * - the VALUE (the actual content the user wants entered, extracted from
+   *   the goal's own meaning — never the target's own label, never the goal
+   *   sentence itself, empty for any action that isn't "type").
+   * This is a semantic-reasoning instruction for the LLM, not a sentence
+   * template/regex — Qwen is the tier meant to do this kind of extraction
+   * generically, for any phrasing or site.
+   */
   _buildQwenPrompt(request) {
     const page      = request.page ?? {};
     const history   = request.executionHistory?.completedSteps ?? [];
@@ -298,14 +398,23 @@ ${history.length ? `History: ${history.map(h => h.description).join(' -> ')}` : 
 Elements:
 ${JSON.stringify(compactElements)}
 
-Select single action.
+Select the single next action.
+
+Distinguish two different things:
+- TARGET: which element (by id, from the list above) to act on. An
+  element's own text/placeholder/label is metadata describing that control —
+  it is never something the user typed.
+- VALUE: only when the action is "type" — the actual content the user wants
+  entered, understood from the goal's own meaning. It is never the target
+  element's own label, and never the goal sentence itself. For any other
+  action (click/select/navigate/finish), value must be an empty string.
+
 Return JSON ONLY:
-{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","text":"label","confidence":0.95}`;
+{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","value":"","confidence":0.95}`;
   }
 
   _formatPlanResponse(request, qwenOutput, latencyMs) {
     const action    = qwenOutput.action ?? 'click';
-    const text      = qwenOutput.text || request.goal;
     const isFinish  = action === 'finish';
     const elementId = qwenOutput.elementId;
 
@@ -321,16 +430,39 @@ Return JSON ONLY:
       };
     }
 
+    // The target element's OWN label — resolved from the actual page-state
+    // elements Qwen was given, never trusted from the model's own free-form
+    // prose. This is what DOMMatcher uses to relocate the element in the
+    // live DOM, so it must be real element metadata, not anything derived
+    // from the goal or guessed by the model.
+    const resolvedElement = (request.elements || []).find((e) => e.id === elementId);
+    const elementLabel = resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || 'the target';
+
+    // The user-provided payload — kept fully separate from elementLabel.
+    // Only meaningful for a "type" action; empty for everything else, per
+    // the prompt's own instruction, defensively re-enforced here too (never
+    // falls back to the goal string or the element's own label).
+    const isFillAction = action === 'type';
+    const value = isFillAction && typeof qwenOutput.value === 'string' ? qwenOutput.value.trim() : '';
+
+    // The user-facing instruction — built from the target's real label and
+    // the extracted value, never the raw goal and never the overloaded
+    // single field the old schema used for both purposes at once.
+    const description = value
+      ? `Type '${value}' into '${elementLabel}'`
+      : `${isFillAction ? 'Fill' : 'Click'} '${elementLabel}'`;
+
     const step = {
       id: 1,
-      description: text,
-      intent: text,
-      phase: action === 'type' ? 'fill_form' : 'navigate',
+      description,
+      intent: description,
+      phase: isFillAction ? 'fill_form' : 'navigate',
       completionCondition: 'dom_change',
       targetElement: {
-        text: text,
-        type: action === 'type' ? 'input' : 'button',
-        intent: qwenOutput.value ?? text,
+        text: elementLabel,
+        type: isFillAction ? 'input' : 'button',
+        intent: elementLabel,
+        value,
         elementId
       },
       // Provisional — Qwen's own action verb is an unreliable signal for whether a
@@ -344,7 +476,7 @@ Return JSON ONLY:
       schemaVersion: '1',
       result: 'OK',
       state: 'planned',
-      plannerSummary: `Action: ${action} on ${elementId ?? text}`,
+      plannerSummary: `Action: ${action} on ${elementId ?? elementLabel}`,
       confidence: qwenOutput.confidence ?? 0.85,
       plan: {
         goalType: 'action',

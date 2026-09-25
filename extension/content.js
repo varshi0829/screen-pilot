@@ -56,6 +56,30 @@
     /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/,             // phone
   ];
 
+  // Text of every label associated with a form control, via the two standard
+  // DOM/ARIA relationships a real page uses to name a field without putting
+  // the name on the field itself:
+  //   - el.labels — the native HTMLInputElement/HTMLTextAreaElement property,
+  //     which already covers BOTH <label for="id"> AND an ancestor <label>
+  //     wrapping the control;
+  //   - aria-labelledby — space-separated id references.
+  // No site knowledge: these are the same relationships PageStateService's
+  // resolveAccessibleName reads for the task path.
+  function spAssociatedLabelText(el) {
+    const parts = [];
+    try {
+      for (const label of el.labels || []) parts.push(label.innerText || label.textContent || '');
+      const ids = (el.getAttribute('aria-labelledby') || '').trim();
+      if (ids && typeof document.getElementById === 'function') {
+        for (const id of ids.split(/\s+/)) {
+          const ref = document.getElementById(id);
+          if (ref) parts.push(ref.innerText || ref.textContent || '');
+        }
+      }
+    } catch { /* best-effort — never block a request on this */ }
+    return parts.join(' ');
+  }
+
   function isSpSensitiveField(el, type, autocomplete) {
     if (SP_SENSITIVE_INPUT_TYPES.has(type)) return true;
     if (SP_SENSITIVE_AUTOCOMPLETE.has(autocomplete)) return true;
@@ -63,6 +87,15 @@
     const placeholder = el.getAttribute('placeholder') || '';
     const ariaLabel    = el.getAttribute('aria-label') || '';
     if (SP_SENSITIVE_LABEL_PATTERN.test(placeholder) || SP_SENSITIVE_LABEL_PATTERN.test(ariaLabel)) return true;
+
+    // A field is very often named only by an associated <label> rather than by
+    // any attribute on the input itself. Reading just placeholder/aria-label
+    // missed exactly the case value patterns can't catch either: a short
+    // secret — a CVV, PIN, one-time code or account number — typed into a
+    // plain text box. Those went into Explain/Ask/Analyze screenshots
+    // unmasked, while the task path (which already resolves labels) masked
+    // the very same field.
+    if (SP_SENSITIVE_LABEL_PATTERN.test(spAssociatedLabelText(el))) return true;
 
     const value = typeof el.value === 'string' ? el.value : '';
     if (value && SP_PII_PATTERNS.some((re) => re.test(value))) return true;

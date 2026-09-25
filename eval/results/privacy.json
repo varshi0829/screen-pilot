@@ -1,0 +1,1084 @@
+{
+  "generatedAt": "2026-09-25T07:41:33.770Z",
+  "machine": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13620H",
+    "logicalCores": 16,
+    "totalRamGB": 15.7,
+    "platform": "win32 10.0.26200",
+    "node": "v25.2.1"
+  },
+  "groundTruth": {
+    "file": "eval/ground-truth/privacy-fields.json",
+    "definition": "sensitive = the element's content is personal data identifying/contacting a person (name, email, phone, address, date of birth, national ID) or a secret/credential/payment datum (password, PIN, OTP, card number, CVV, API key). Non-sensitive = ordinary form content (search terms, quantities, dates of travel, order/tracking references, free-text feedback without PII).",
+    "sensitive": 19,
+    "nonSensitive": 10,
+    "allInViewport": true
+  },
+  "viewport": {
+    "width": 1266,
+    "height": 643,
+    "dpr": 1.5
+  },
+  "definitions": {
+    "pii": "per ground-truth element: predicted = flagged by detector; precision=TP/(TP+FP), recall=TP/(TP+FN)",
+    "redactionPrecisionPixel": "|painted ∩ sensitive| / |painted|, painted = black in redacted capture and not black in a no-region reference capture (real pipeline, max channel ≤ 40)",
+    "sensitiveCoveragePixel": "|black(redacted) ∩ sensitive| / |sensitive|, over ALL ground-truth sensitive element boxes (so detection misses count)",
+    "iou": "IoU of ground-truth sensitive box vs production redaction rect (ScreenshotService.computeRedactionRects), image px"
+  },
+  "pii": {
+    "v2_agent_path": {
+      "counts": {
+        "tp": 15,
+        "fp": 1,
+        "tn": 9,
+        "fn": 4,
+        "precision": 0.9375,
+        "recall": 0.7894736842105263,
+        "f1": 0.8571428571428572,
+        "accuracy": 0.8275862068965517
+      },
+      "byCategory": {
+        "email_display_text": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": null,
+          "recall": 0,
+          "f1": null,
+          "accuracy": 0
+        },
+        "name": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": null,
+          "recall": 0,
+          "f1": null,
+          "accuracy": 0
+        },
+        "email": {
+          "tp": 3,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "phone": {
+          "tp": 2,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "password": {
+          "tp": 2,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "card": {
+          "tp": 3,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "secret_code": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": 1,
+          "recall": 0.5,
+          "f1": 0.6666666666666666,
+          "accuracy": 0.5
+        },
+        "national_id": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": 1,
+          "recall": 0.5,
+          "f1": 0.6666666666666666,
+          "accuracy": 0.5
+        },
+        "credential": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "date_of_birth": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "address": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "normal": {
+          "tp": 0,
+          "fp": 1,
+          "tn": 9,
+          "fn": 0,
+          "precision": 0,
+          "recall": null,
+          "f1": null,
+          "accuracy": 0.9
+        }
+      },
+      "falseNegatives": [
+        "display-email",
+        "f-fullname",
+        "f-aadhaar",
+        "f-pin"
+      ],
+      "falsePositives": [
+        "f-tracking"
+      ],
+      "flaggedOutsideGroundTruth": [],
+      "rows": [
+        {
+          "id": "display-email",
+          "category": "email_display_text",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": false,
+          "note": "PII rendered as plain page text, not in a form control"
+        },
+        {
+          "id": "f-fullname",
+          "category": "name",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-email",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-contact",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-mobile",
+          "category": "phone",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-phone",
+          "category": "phone",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-password",
+          "category": "password",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-confirm",
+          "category": "password",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-cc",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": "empty card field; sensitive by purpose"
+        },
+        {
+          "id": "f-payment",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-cvv",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-otp",
+          "category": "secret_code",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-ssn",
+          "category": "national_id",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-apikey",
+          "category": "credential",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-aadhaar",
+          "category": "national_id",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": "Indian national ID, 12 digits"
+        },
+        {
+          "id": "f-pin",
+          "category": "secret_code",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": "labelled only 'PIN'"
+        },
+        {
+          "id": "f-dob",
+          "category": "date_of_birth",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-street",
+          "category": "address",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-notes",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": "free text that contains an email"
+        },
+        {
+          "id": "f-city",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-search",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-qty",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-coupon",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": "label contains 'code'"
+        },
+        {
+          "id": "f-username",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": "public handle, not a secret"
+        },
+        {
+          "id": "f-order",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": "reference number with digits"
+        },
+        {
+          "id": "f-tracking",
+          "category": "normal",
+          "truth": false,
+          "predicted": true,
+          "inDetectorScope": true,
+          "note": "14-digit courier reference (card-length digit run)"
+        },
+        {
+          "id": "f-amount",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-travel",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        },
+        {
+          "id": "f-feedback",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": true,
+          "note": null
+        }
+      ]
+    },
+    "v1_content_script_path": {
+      "counts": {
+        "tp": 15,
+        "fp": 1,
+        "tn": 9,
+        "fn": 4,
+        "precision": 0.9375,
+        "recall": 0.7894736842105263,
+        "f1": 0.8571428571428572,
+        "accuracy": 0.8275862068965517
+      },
+      "byCategory": {
+        "email_display_text": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": null,
+          "recall": 0,
+          "f1": null,
+          "accuracy": 0
+        },
+        "name": {
+          "tp": 0,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": null,
+          "recall": 0,
+          "f1": null,
+          "accuracy": 0
+        },
+        "email": {
+          "tp": 3,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "phone": {
+          "tp": 2,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "password": {
+          "tp": 2,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "card": {
+          "tp": 3,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "secret_code": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": 1,
+          "recall": 0.5,
+          "f1": 0.6666666666666666,
+          "accuracy": 0.5
+        },
+        "national_id": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 1,
+          "precision": 1,
+          "recall": 0.5,
+          "f1": 0.6666666666666666,
+          "accuracy": 0.5
+        },
+        "credential": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "date_of_birth": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "address": {
+          "tp": 1,
+          "fp": 0,
+          "tn": 0,
+          "fn": 0,
+          "precision": 1,
+          "recall": 1,
+          "f1": 1,
+          "accuracy": 1
+        },
+        "normal": {
+          "tp": 0,
+          "fp": 1,
+          "tn": 9,
+          "fn": 0,
+          "precision": 0,
+          "recall": null,
+          "f1": null,
+          "accuracy": 0.9
+        }
+      },
+      "falseNegatives": [
+        "display-email",
+        "f-fullname",
+        "f-aadhaar",
+        "f-pin"
+      ],
+      "falsePositives": [
+        "f-tracking"
+      ],
+      "flaggedOutsideGroundTruth": [],
+      "rows": [
+        {
+          "id": "display-email",
+          "category": "email_display_text",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "PII rendered as plain page text, not in a form control"
+        },
+        {
+          "id": "f-fullname",
+          "category": "name",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-email",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-contact",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-mobile",
+          "category": "phone",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-phone",
+          "category": "phone",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-password",
+          "category": "password",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-confirm",
+          "category": "password",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-cc",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": "empty card field; sensitive by purpose"
+        },
+        {
+          "id": "f-payment",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-cvv",
+          "category": "card",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-otp",
+          "category": "secret_code",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-ssn",
+          "category": "national_id",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-apikey",
+          "category": "credential",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-aadhaar",
+          "category": "national_id",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "Indian national ID, 12 digits"
+        },
+        {
+          "id": "f-pin",
+          "category": "secret_code",
+          "truth": true,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "labelled only 'PIN'"
+        },
+        {
+          "id": "f-dob",
+          "category": "date_of_birth",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-street",
+          "category": "address",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-notes",
+          "category": "email",
+          "truth": true,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": "free text that contains an email"
+        },
+        {
+          "id": "f-city",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-search",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-qty",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-coupon",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "label contains 'code'"
+        },
+        {
+          "id": "f-username",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "public handle, not a secret"
+        },
+        {
+          "id": "f-order",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": "reference number with digits"
+        },
+        {
+          "id": "f-tracking",
+          "category": "normal",
+          "truth": false,
+          "predicted": true,
+          "inDetectorScope": null,
+          "note": "14-digit courier reference (card-length digit run)"
+        },
+        {
+          "id": "f-amount",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-travel",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        },
+        {
+          "id": "f-feedback",
+          "category": "normal",
+          "truth": false,
+          "predicted": false,
+          "inDetectorScope": null,
+          "note": null
+        }
+      ]
+    }
+  },
+  "redaction": {
+    "v2_agent_path": {
+      "redactionPrecisionPixel": 0.9297081329992551,
+      "sensitiveCoveragePixel": 0.8049955417626828,
+      "falseRedactionPixels": 5190,
+      "falseRedactionPctOfNonSensitiveArea": 1.1647138820878675,
+      "productionRedactionRects": 16,
+      "iouDetectedRegions": {
+        "n": 15,
+        "mean": 0.967478501370268,
+        "median": 0.9729599894023634,
+        "min": 0.9252365477132911,
+        "max": 0.9756384153988094
+      },
+      "shareDetectedRegionsIouAtLeast50": 1,
+      "shareDetectedRegionsIouAtLeast90": 1,
+      "shareAllSensitiveRegionsIouAtLeast50": 0.7894736842105263,
+      "image": {
+        "width": 1023,
+        "height": 520,
+        "sameSizeAsReference": true,
+        "trueCssToImageScale": 0.8080568720379147,
+        "productionCssToImageScale": 0.8088467614533965,
+        "productionMappingConsistent": true
+      },
+      "pixelCounts": {
+        "painted": 73835,
+        "paintedOnSensitive": 68645,
+        "sensitive": 86357,
+        "blackOnSensitive": 69517,
+        "total": 531960
+      },
+      "perRegion": [
+        {
+          "id": "display-email",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.008316008316008316
+        },
+        {
+          "id": "f-fullname",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.00879073756432247
+        },
+        {
+          "id": "f-email",
+          "detected": true,
+          "iou": 0.9756384153988094,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-contact",
+          "detected": true,
+          "iou": 0.9720113250417115,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-mobile",
+          "detected": true,
+          "iou": 0.9729599894023645,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-phone",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-password",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-confirm",
+          "detected": true,
+          "iou": 0.9720113250417104,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-cc",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-payment",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-cvv",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-otp",
+          "detected": true,
+          "iou": 0.9720113250417104,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-ssn",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-apikey",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-aadhaar",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.014150943396226415
+        },
+        {
+          "id": "f-pin",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.0017152658662092624
+        },
+        {
+          "id": "f-dob",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-street",
+          "detected": true,
+          "iou": 0.9252365477132911,
+          "pixelCoverage": 0.9545454545454546
+        },
+        {
+          "id": "f-notes",
+          "detected": true,
+          "iou": 0.9252365477132911,
+          "pixelCoverage": 0.9545454545454546
+        }
+      ]
+    },
+    "v1_content_script_path": {
+      "redactionPrecisionPixel": 0.9297081329992551,
+      "sensitiveCoveragePixel": 0.8049955417626828,
+      "falseRedactionPixels": 5190,
+      "falseRedactionPctOfNonSensitiveArea": 1.1647138820878675,
+      "productionRedactionRects": 16,
+      "iouDetectedRegions": {
+        "n": 15,
+        "mean": 0.967478501370268,
+        "median": 0.9729599894023634,
+        "min": 0.9252365477132911,
+        "max": 0.9756384153988094
+      },
+      "shareDetectedRegionsIouAtLeast50": 1,
+      "shareDetectedRegionsIouAtLeast90": 1,
+      "shareAllSensitiveRegionsIouAtLeast50": 0.7894736842105263,
+      "image": {
+        "width": 1023,
+        "height": 520,
+        "sameSizeAsReference": true,
+        "trueCssToImageScale": 0.8080568720379147,
+        "productionCssToImageScale": 0.8088467614533965,
+        "productionMappingConsistent": true
+      },
+      "pixelCounts": {
+        "painted": 73835,
+        "paintedOnSensitive": 68645,
+        "sensitive": 86357,
+        "blackOnSensitive": 69517,
+        "total": 531960
+      },
+      "perRegion": [
+        {
+          "id": "display-email",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.008316008316008316
+        },
+        {
+          "id": "f-fullname",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.00879073756432247
+        },
+        {
+          "id": "f-email",
+          "detected": true,
+          "iou": 0.9756384153988094,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-contact",
+          "detected": true,
+          "iou": 0.9720113250417115,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-mobile",
+          "detected": true,
+          "iou": 0.9729599894023645,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-phone",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-password",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-confirm",
+          "detected": true,
+          "iou": 0.9720113250417104,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-cc",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-payment",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-cvv",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-otp",
+          "detected": true,
+          "iou": 0.9720113250417104,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-ssn",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-apikey",
+          "detected": true,
+          "iou": 0.9756384153988081,
+          "pixelCoverage": 1
+        },
+        {
+          "id": "f-aadhaar",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.014150943396226415
+        },
+        {
+          "id": "f-pin",
+          "detected": false,
+          "iou": 0,
+          "pixelCoverage": 0.0017152658662092624
+        },
+        {
+          "id": "f-dob",
+          "detected": true,
+          "iou": 0.9729599894023634,
+          "pixelCoverage": 0.9952830188679245
+        },
+        {
+          "id": "f-street",
+          "detected": true,
+          "iou": 0.9252365477132911,
+          "pixelCoverage": 0.9545454545454546
+        },
+        {
+          "id": "f-notes",
+          "detected": true,
+          "iou": 0.9252365477132911,
+          "pixelCoverage": 0.9545454545454546
+        }
+      ]
+    }
+  }
+}

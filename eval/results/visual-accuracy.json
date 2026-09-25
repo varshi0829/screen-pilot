@@ -1,0 +1,989 @@
+{
+  "generatedAt": "2026-09-25T07:51:47.811Z",
+  "machine": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13620H",
+    "logicalCores": 16,
+    "totalRamGB": 15.7,
+    "platform": "win32 10.0.26200",
+    "node": "v25.2.1"
+  },
+  "config": {
+    "reps": 2,
+    "timeoutMs": 90000,
+    "executionMode": "local-qwen",
+    "cases": [
+      "labelled-submit",
+      "labelled-nav-link",
+      "labelled-search-input",
+      "labelled-sidebar-paraphrase",
+      "icon-warning-demo-page",
+      "icon-single-svg-gear",
+      "icon-two-svg-trash",
+      "visual-color-swatch",
+      "visual-big-blue-button",
+      "visual-duplicate-label-by-colour",
+      "negative-missing-control",
+      "negative-missing-colour",
+      "negative-unrelated-goal"
+    ]
+  },
+  "summary": {
+    "metric": "visual_context_accuracy",
+    "definition": "correct first-target identifications / total evaluated runs; negative cases are correct when nothing is highlighted",
+    "overall": {
+      "correct": 20,
+      "total": 26,
+      "accuracy": 0.7692307692307693
+    },
+    "localOnly": {
+      "correct": 16,
+      "total": 26,
+      "accuracy": 0.6153846153846154
+    },
+    "byCategory": {
+      "labelled": {
+        "correct": 8,
+        "total": 8,
+        "accuracy": 1
+      },
+      "icon_only": {
+        "correct": 6,
+        "total": 6,
+        "accuracy": 1
+      },
+      "visual": {
+        "correct": 2,
+        "total": 6,
+        "accuracy": 0.3333333333333333
+      },
+      "negative": {
+        "correct": 4,
+        "total": 6,
+        "accuracy": 0.6666666666666666
+      }
+    },
+    "byMechanism": {
+      "L1_deterministic": {
+        "correct": 2,
+        "total": 2,
+        "accuracy": 1
+      },
+      "L2_grounding": {
+        "correct": 4,
+        "total": 4,
+        "accuracy": 1
+      },
+      "qwen": {
+        "correct": 2,
+        "total": 4,
+        "accuracy": 0.5
+      },
+      "structural_fallback": {
+        "correct": 4,
+        "total": 4,
+        "accuracy": 1
+      },
+      "cloud": {
+        "correct": 8,
+        "total": 12,
+        "accuracy": 0.6666666666666666
+      }
+    },
+    "timeToFirstHighlightMs": {
+      "n": 20,
+      "mean": 8194.8,
+      "median": 4758.5,
+      "min": 25,
+      "max": 34405
+    },
+    "moondreamLatencyMs": {
+      "n": 18,
+      "mean": 5536.5,
+      "median": 1088.5,
+      "min": 906,
+      "max": 23326
+    },
+    "qwenLatencyMs": {
+      "n": 4,
+      "mean": 15873,
+      "median": 12558.5,
+      "min": 4067,
+      "max": 34308
+    }
+  },
+  "runs": [
+    {
+      "caseId": "labelled-submit",
+      "category": "labelled",
+      "rep": 1,
+      "goal": "Click Submit Profile",
+      "expectedTargetId": "submit-profile",
+      "actualTargetId": "submit-profile",
+      "executorLoggedTargetId": "submit-profile",
+      "highlightRingIou": 0.8612943339614381,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L1_deterministic",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L1_deterministic"
+      ],
+      "timeToFirstHighlightMs": 30,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        0
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest"
+      ],
+      "wallMs": 68
+    },
+    {
+      "caseId": "labelled-submit",
+      "category": "labelled",
+      "rep": 2,
+      "goal": "Click Submit Profile",
+      "expectedTargetId": "submit-profile",
+      "actualTargetId": "submit-profile",
+      "executorLoggedTargetId": "submit-profile",
+      "highlightRingIou": 0.8612943339614381,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L1_deterministic",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L1_deterministic"
+      ],
+      "timeToFirstHighlightMs": 29,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest"
+      ],
+      "wallMs": 70
+    },
+    {
+      "caseId": "labelled-nav-link",
+      "category": "labelled",
+      "rep": 1,
+      "goal": "Open the settings page",
+      "expectedTargetId": "nav-settings",
+      "actualTargetId": "nav-settings",
+      "executorLoggedTargetId": "nav-settings",
+      "highlightRingIou": 0.7702373256214416,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L2_grounding",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L2_grounding"
+      ],
+      "timeToFirstHighlightMs": 30,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        2
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest"
+      ],
+      "wallMs": 67
+    },
+    {
+      "caseId": "labelled-nav-link",
+      "category": "labelled",
+      "rep": 2,
+      "goal": "Open the settings page",
+      "expectedTargetId": "nav-settings",
+      "actualTargetId": "nav-settings",
+      "executorLoggedTargetId": "nav-settings",
+      "highlightRingIou": 0.7702373256214416,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L2_grounding",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L2_grounding"
+      ],
+      "timeToFirstHighlightMs": 25,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        2
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest"
+      ],
+      "wallMs": 72
+    },
+    {
+      "caseId": "labelled-search-input",
+      "category": "labelled",
+      "rep": 1,
+      "goal": "Search for artificial intelligence",
+      "expectedTargetId": "search-input",
+      "actualTargetId": "search-input",
+      "executorLoggedTargetId": "search-input",
+      "highlightRingIou": 0.8799102169800115,
+      "highlightedTag": "input",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "qwen",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "qwen"
+      ],
+      "timeToFirstHighlightMs": 34405,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [
+        34308
+      ],
+      "totalPlanningMs": [
+        34331
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest"
+      ],
+      "wallMs": 34480
+    },
+    {
+      "caseId": "labelled-search-input",
+      "category": "labelled",
+      "rep": 2,
+      "goal": "Search for artificial intelligence",
+      "expectedTargetId": "search-input",
+      "actualTargetId": "search-input",
+      "executorLoggedTargetId": "search-input",
+      "highlightRingIou": 0.8799102169800115,
+      "highlightedTag": "input",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "qwen",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "qwen"
+      ],
+      "timeToFirstHighlightMs": 5237,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [
+        5114
+      ],
+      "totalPlanningMs": [
+        5162
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 5317
+    },
+    {
+      "caseId": "labelled-sidebar-paraphrase",
+      "category": "labelled",
+      "rep": 1,
+      "goal": "I want to download my latest invoice",
+      "expectedTargetId": "nav-billing",
+      "actualTargetId": "nav-billing",
+      "executorLoggedTargetId": "nav-billing",
+      "highlightRingIou": 0.8088235391347166,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L2_grounding",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L2_grounding"
+      ],
+      "timeToFirstHighlightMs": 39,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 83
+    },
+    {
+      "caseId": "labelled-sidebar-paraphrase",
+      "category": "labelled",
+      "rep": 2,
+      "goal": "I want to download my latest invoice",
+      "expectedTargetId": "nav-billing",
+      "actualTargetId": "nav-billing",
+      "executorLoggedTargetId": "nav-billing",
+      "highlightRingIou": 0.8088235391347166,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "L2_grounding",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "L2_grounding"
+      ],
+      "timeToFirstHighlightMs": 30,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 77
+    },
+    {
+      "caseId": "icon-warning-demo-page",
+      "category": "icon_only",
+      "rep": 1,
+      "goal": "Click the button with the warning icon",
+      "expectedTargetId": "warning-btn",
+      "actualTargetId": "warning-btn",
+      "executorLoggedTargetId": "warning-btn",
+      "highlightRingIou": 0.8264462809917356,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "structural_fallback",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "structural_fallback"
+      ],
+      "timeToFirstHighlightMs": 13971,
+      "visionLatencyMs": [
+        13622
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        13899
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 14051
+    },
+    {
+      "caseId": "icon-warning-demo-page",
+      "category": "icon_only",
+      "rep": 2,
+      "goal": "Click the button with the warning icon",
+      "expectedTargetId": "warning-btn",
+      "actualTargetId": "warning-btn",
+      "executorLoggedTargetId": "warning-btn",
+      "highlightRingIou": 0.8264462809917356,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "structural_fallback",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "structural_fallback"
+      ],
+      "timeToFirstHighlightMs": 1240,
+      "visionLatencyMs": [
+        958
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1209
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 1307
+    },
+    {
+      "caseId": "icon-single-svg-gear",
+      "category": "icon_only",
+      "rep": 1,
+      "goal": "Click the settings gear icon",
+      "expectedTargetId": "gear-btn",
+      "actualTargetId": "gear-btn",
+      "executorLoggedTargetId": null,
+      "highlightRingIou": 0.7159763313609467,
+      "highlightedTag": "svg",
+      "highlightRelation": "descendant",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "structural_fallback",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "structural_fallback"
+      ],
+      "timeToFirstHighlightMs": 7809,
+      "visionLatencyMs": [
+        7495
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        7735
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 7899
+    },
+    {
+      "caseId": "icon-single-svg-gear",
+      "category": "icon_only",
+      "rep": 2,
+      "goal": "Click the settings gear icon",
+      "expectedTargetId": "gear-btn",
+      "actualTargetId": "gear-btn",
+      "executorLoggedTargetId": null,
+      "highlightRingIou": 0.7159763313609467,
+      "highlightedTag": "svg",
+      "highlightRelation": "descendant",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "structural_fallback",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "structural_fallback"
+      ],
+      "timeToFirstHighlightMs": 1678,
+      "visionLatencyMs": [
+        1142
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1557
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 1752
+    },
+    {
+      "caseId": "icon-two-svg-trash",
+      "category": "icon_only",
+      "rep": 1,
+      "goal": "Click the trash can icon",
+      "expectedTargetId": "trash-btn",
+      "actualTargetId": "trash-btn",
+      "executorLoggedTargetId": "trash-btn",
+      "highlightRingIou": 0.8264462809917356,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 12780,
+      "visionLatencyMs": [
+        8454
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        12715
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 12828
+    },
+    {
+      "caseId": "icon-two-svg-trash",
+      "category": "icon_only",
+      "rep": 2,
+      "goal": "Click the trash can icon",
+      "expectedTargetId": "trash-btn",
+      "actualTargetId": "trash-btn",
+      "executorLoggedTargetId": "trash-btn",
+      "highlightRingIou": 0.8264462809917356,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 4957,
+      "visionLatencyMs": [
+        996
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        4895
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 4998
+    },
+    {
+      "caseId": "visual-color-swatch",
+      "category": "visual",
+      "rep": 1,
+      "goal": "Click the green square",
+      "expectedTargetId": "swatch-green",
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": false,
+      "outcome": "ended_COMPLETE",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        9088
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        12734
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 15553
+    },
+    {
+      "caseId": "visual-color-swatch",
+      "category": "visual",
+      "rep": 2,
+      "goal": "Click the green square",
+      "expectedTargetId": "swatch-green",
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": false,
+      "outcome": "ended_COMPLETE",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        1018
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        4690
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 7523
+    },
+    {
+      "caseId": "visual-big-blue-button",
+      "category": "visual",
+      "rep": 1,
+      "goal": "Click the big blue button",
+      "expectedTargetId": "continue-btn",
+      "actualTargetId": "continue-btn",
+      "executorLoggedTargetId": "continue-btn",
+      "highlightRingIou": 0.9188093100348296,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 27585,
+      "visionLatencyMs": [
+        23326
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        27543
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 27653
+    },
+    {
+      "caseId": "visual-big-blue-button",
+      "category": "visual",
+      "rep": 2,
+      "goal": "Click the big blue button",
+      "expectedTargetId": "continue-btn",
+      "actualTargetId": "continue-btn",
+      "executorLoggedTargetId": "continue-btn",
+      "highlightRingIou": 0.9188093100348296,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": true,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 4560,
+      "visionLatencyMs": [
+        969
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        4500
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 4606
+    },
+    {
+      "caseId": "visual-duplicate-label-by-colour",
+      "category": "visual",
+      "rep": 1,
+      "goal": "Click the red Delete button",
+      "expectedTargetId": "delete-danger",
+      "actualTargetId": "delete-draft",
+      "executorLoggedTargetId": "delete-draft",
+      "highlightRingIou": 0.8439418936541193,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": false,
+      "outcome": "highlighted",
+      "mechanism": "qwen",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "qwen"
+      ],
+      "timeToFirstHighlightMs": 20072,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [
+        20003
+      ],
+      "totalPlanningMs": [
+        20018
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 20128
+    },
+    {
+      "caseId": "visual-duplicate-label-by-colour",
+      "category": "visual",
+      "rep": 2,
+      "goal": "Click the red Delete button",
+      "expectedTargetId": "delete-danger",
+      "actualTargetId": "delete-draft",
+      "executorLoggedTargetId": "delete-draft",
+      "highlightRingIou": 0.8439418936541193,
+      "highlightedTag": "button",
+      "highlightRelation": "self",
+      "correct": false,
+      "outcome": "highlighted",
+      "mechanism": "qwen",
+      "mechanismIsLocal": true,
+      "decisions": [
+        "qwen"
+      ],
+      "timeToFirstHighlightMs": 4155,
+      "visionLatencyMs": [],
+      "qwenLatencyMs": [
+        4067
+      ],
+      "totalPlanningMs": [
+        4087
+      ],
+      "visionFailures": 0,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 4225
+    },
+    {
+      "caseId": "negative-missing-control",
+      "category": "negative",
+      "rep": 1,
+      "goal": "Click the logout button",
+      "expectedTargetId": null,
+      "actualTargetId": "nav-settings",
+      "executorLoggedTargetId": "nav-settings",
+      "highlightRingIou": 0.7702373256214416,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": false,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 15940,
+      "visionLatencyMs": [
+        11043
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        15884
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "qwen2.5-coder:7b",
+        "moondream:latest"
+      ],
+      "wallMs": 15969
+    },
+    {
+      "caseId": "negative-missing-control",
+      "category": "negative",
+      "rep": 2,
+      "goal": "Click the logout button",
+      "expectedTargetId": null,
+      "actualTargetId": "nav-settings",
+      "executorLoggedTargetId": "nav-settings",
+      "highlightRingIou": 0.7702373256214416,
+      "highlightedTag": "a",
+      "highlightRelation": "self",
+      "correct": false,
+      "outcome": "highlighted",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": 9324,
+      "visionLatencyMs": [
+        994
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        9287
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 9354
+    },
+    {
+      "caseId": "negative-missing-colour",
+      "category": "negative",
+      "rep": 1,
+      "goal": "Click the yellow square",
+      "expectedTargetId": null,
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": true,
+      "outcome": "ended_PAUSED",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud",
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        7955,
+        930
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        12036,
+        3467
+      ],
+      "visionFailures": 2,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 18344
+    },
+    {
+      "caseId": "negative-missing-colour",
+      "category": "negative",
+      "rep": 2,
+      "goal": "Click the yellow square",
+      "expectedTargetId": null,
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": true,
+      "outcome": "ended_PAUSED",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud",
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        1002,
+        906
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        4424,
+        3326
+      ],
+      "visionFailures": 2,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 10535
+    },
+    {
+      "caseId": "negative-unrelated-goal",
+      "category": "negative",
+      "rep": 1,
+      "goal": "Book a flight to Delhi",
+      "expectedTargetId": null,
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": true,
+      "outcome": "ended_ERROR",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        8724
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        9608
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 9696
+    },
+    {
+      "caseId": "negative-unrelated-goal",
+      "category": "negative",
+      "rep": 2,
+      "goal": "Book a flight to Delhi",
+      "expectedTargetId": null,
+      "actualTargetId": null,
+      "executorLoggedTargetId": null,
+      "highlightRingIou": null,
+      "highlightedTag": null,
+      "highlightRelation": null,
+      "correct": true,
+      "outcome": "ended_ERROR",
+      "mechanism": "cloud",
+      "mechanismIsLocal": false,
+      "decisions": [
+        "cloud"
+      ],
+      "timeToFirstHighlightMs": null,
+      "visionLatencyMs": [
+        1035
+      ],
+      "qwenLatencyMs": [],
+      "totalPlanningMs": [
+        1659
+      ],
+      "visionFailures": 1,
+      "qwenFailures": 0,
+      "modelsLoadedBeforeRun": [
+        "moondream:latest",
+        "qwen2.5-coder:7b"
+      ],
+      "wallMs": 1731
+    }
+  ]
+}

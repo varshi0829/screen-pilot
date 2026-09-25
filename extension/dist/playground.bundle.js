@@ -131,6 +131,13 @@
   });
 
   // extension/services/executor-engine.js
+  var FILL_IDLE_MS = 600;
+  function valueSatisfies(actual, requested) {
+    const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const want = norm(requested);
+    if (!want) return norm(actual).length > 0;
+    return norm(actual).includes(want);
+  }
   var ExecutorEngine = class {
     /**
      * @param {object} deps
@@ -147,7 +154,10 @@
       // the real 2s one. Defaults mirror the existing post-click URL-poll
       // precedent elsewhere in this file (100ms interval, 2s budget).
       elementResolvePollIntervalMs = 100,
-      elementResolveMaxWaitMs = 2e3
+      elementResolveMaxWaitMs = 2e3,
+      // Quiet period before a fill with no requested value counts as finished —
+      // injectable so tests need not wait out the real budget.
+      fillIdleMs = FILL_IDLE_MS
     } = {}) {
       if (!domMatcher) throw new TypeError("ExecutorEngine: domMatcher is required");
       if (!highlighter) throw new TypeError("ExecutorEngine: highlighter is required");
@@ -156,6 +166,7 @@
       this._captureSnapshot = captureSnapshot;
       this._elementResolvePollIntervalMs = elementResolvePollIntervalMs;
       this._elementResolveMaxWaitMs = elementResolveMaxWaitMs;
+      this._fillIdleMs = fillIdleMs;
       this._plan = null;
       this._stepIndex = 0;
       this._status = "idle";
@@ -420,8 +431,14 @@
         text: step.targetElement?.text,
         type: step.targetElement?.type,
         region: step.targetElement?.region,
-        alternatives: step.targetElement?.alternatives
+        alternatives: step.targetElement?.alternatives,
+        elementId: step.targetElement?.elementId,
+        bbox: step.targetElement?.bbox
       });
+      if (!step.targetElement.text?.trim() && step.targetElement.elementId && step.targetElement.bbox) {
+        const positional = this._resolveElementByPosition(step.targetElement);
+        if (positional) return positional;
+      }
       const primary = this._domMatcher.matchElement(step.targetElement);
       if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
         this._logCandidates(step.targetElement.text, primary.candidates);
@@ -436,6 +453,45 @@
         }
       }
       return best;
+    }
+    /**
+     * Resolve a target directly by its already-known on-page position, for a
+     * step whose element has no accessible name to search the live DOM by
+     * (see the caller in _resolveElement). Uses `elementFromPoint` — a
+     * standard DOM API, not a new targeting system — at the center of the
+     * element's own `bbox`, exactly as PageStateService already captured it
+     * via getBoundingClientRect() (the same bbox already used for vision
+     * candidate markers). Entirely generic: this has no knowledge of what the
+     * element is, what site it's on, or what the goal was — only where it is.
+     *
+     * `elementId` is not itself used to look anything up here — pageState ids
+     * are per-extraction-cycle labels with no live DOM binding of their own —
+     * its presence just confirms the step really does carry a page-state-
+     * resolved target before this bypasses text matching at all.
+     *
+     * Returns null (never throws, never guesses) whenever there's nothing
+     * live at that position, that position is disabled, or the runtime
+     * doesn't support `elementFromPoint` (e.g. these unit tests) — every one
+     * of those cases falls back to the caller's existing failure path.
+     *
+     * @param {object} targetElement
+     * @returns {{element:Element, score:number, alternatives:object[], candidates:object[]}|null}
+     */
+    _resolveElementByPosition(targetElement) {
+      const bbox = targetElement?.bbox;
+      if (!bbox || !(bbox.width > 0) || !(bbox.height > 0)) return null;
+      if (typeof document === "undefined" || typeof document.elementFromPoint !== "function") return null;
+      let element;
+      try {
+        element = document.elementFromPoint(bbox.x + bbox.width / 2, bbox.y + bbox.height / 2);
+      } catch {
+        return null;
+      }
+      if (!element) return null;
+      if (this._domMatcher.isDisabled?.(element)) return null;
+      if (typeof this._domMatcher.isVisible === "function" && !this._domMatcher.isVisible(element)) return null;
+      console.log(`[SP:Exec] Resolved by position (no accessible text on target) elementId=${targetElement.elementId} bbox=${JSON.stringify(bbox)} <${element.tagName?.toLowerCase?.() ?? "?"}>`);
+      return { element, score: 100, alternatives: [], candidates: [] };
     }
     /**
      * Verify the element is still safe to highlight.
@@ -484,13 +540,13 @@ ${lines.join("\n")}`);
      */
     _watchForUserAction(step) {
       let fired = false;
-      const onUserAction = (trigger) => {
+      const onUserAction = (trigger, observedValue = null) => {
         if (fired) return;
         fired = true;
         this._teardownListeners();
         this._highlighter.clear();
         this._activeElement = null;
-        this._emit("user:acted", { step, trigger, timestamp: Date.now() });
+        this._emit("user:acted", { step, trigger, observedValue, timestamp: Date.now() });
       };
       const isFillStep = step.phase === "fill_form" || step.completionCondition === "input_filled";
       const clickHandler = (e) => {
@@ -517,7 +573,8 @@ ${lines.join("\n")}`);
           return false;
         };
         const fieldValue = (el) => el.isContentEditable === true ? el.textContent ?? "" : el.value ?? "";
-        const inputHandler = (e) => {
+        let fillIdleTimer = null;
+        const handleFieldEvent = (e, eventKind) => {
           console.log("[SP:FILL] activeElement", {
             tag: this._activeElement?.tagName,
             id: this._activeElement?.id,
@@ -542,14 +599,31 @@ ${lines.join("\n")}`);
           if (!this._activeElement.contains(field)) return;
           if (!isTextLikeField(field)) return;
           if (fieldValue(field).trim().length === 0) return;
-          console.log("[SP:FILL] USER_ACTION_EMITTED");
-          onUserAction("input");
+          const requested = (step.targetElement?.value ?? "").trim();
+          const settle = (reason) => {
+            clearTimeout(fillIdleTimer);
+            console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} value="${fieldValue(field)}"`);
+            onUserAction("input", fieldValue(field));
+          };
+          if (requested) {
+            if (valueSatisfies(fieldValue(field), requested)) settle("requested_value_present");
+            return;
+          }
+          if (eventKind === "change") {
+            settle("change_committed");
+            return;
+          }
+          clearTimeout(fillIdleTimer);
+          fillIdleTimer = setTimeout(() => settle("typing_idle"), this._fillIdleMs);
         };
+        const inputHandler = (e) => handleFieldEvent(e, "input");
+        const changeHandler = (e) => handleFieldEvent(e, "change");
         document.addEventListener("input", inputHandler, { capture: true });
-        document.addEventListener("change", inputHandler, { capture: true });
+        document.addEventListener("change", changeHandler, { capture: true });
         this._cleanups.push(() => {
+          clearTimeout(fillIdleTimer);
           document.removeEventListener("input", inputHandler, { capture: true });
-          document.removeEventListener("change", inputHandler, { capture: true });
+          document.removeEventListener("change", changeHandler, { capture: true });
         });
       }
       const getHref = () => {
@@ -1058,6 +1132,53 @@ ${lines.join("\n")}`);
       }
       return true;
     }
+    function resolveAriaLabelledBy(el, doc) {
+      const idList = (el.getAttribute?.("aria-labelledby") || "").trim();
+      if (!idList || typeof doc?.getElementById !== "function") return "";
+      return idList.split(/\s+/).map((id) => {
+        const ref = doc.getElementById(id);
+        return ref ? ref.innerText || ref.textContent || "" : "";
+      }).filter(Boolean).join(" ");
+    }
+    function buildLabelForMap(doc) {
+      const map = /* @__PURE__ */ new Map();
+      if (typeof doc?.querySelectorAll !== "function") return map;
+      for (const label of doc.querySelectorAll("label[for]")) {
+        const forId = label.getAttribute?.("for");
+        if (!forId || map.has(forId)) continue;
+        map.set(forId, label.innerText || label.textContent || "");
+      }
+      return map;
+    }
+    function resolveLabelFor(el, labelForMap) {
+      const id = el.id || el.getAttribute?.("id") || "";
+      if (!id || !labelForMap) return "";
+      return labelForMap.get(id) || "";
+    }
+    function resolveAncestorLabel(el) {
+      const label = typeof el.closest === "function" ? el.closest("label") : null;
+      if (!label || label === el) return "";
+      return label.innerText || label.textContent || "";
+    }
+    function resolveAccessibleName(el, doc, labelForMap = null) {
+      const direct = clean(el.getAttribute?.("aria-label") || "");
+      if (direct) return direct;
+      const labelledBy = clean(resolveAriaLabelledBy(el, doc));
+      if (labelledBy) return labelledBy;
+      const labelFor = clean(resolveLabelFor(el, labelForMap ?? buildLabelForMap(doc)));
+      if (labelFor) return labelFor;
+      const ancestorLabel = clean(resolveAncestorLabel(el));
+      if (ancestorLabel) return ancestorLabel;
+      const title = clean(el.getAttribute?.("title") || "");
+      if (title) return title;
+      return clean(el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
+    }
+    function resolveFormId(el, formMap) {
+      const form = el.form ?? (typeof el.closest === "function" ? el.closest("form") : null);
+      if (!form) return null;
+      if (!formMap.map.has(form)) formMap.map.set(form, `form_${formMap.count++}`);
+      return formMap.map.get(form);
+    }
     function getRegion(el) {
       if (!el || typeof el.closest !== "function") return "main_content";
       if (el.closest('nav, header, [role="banner"], [role="navigation"]')) return "top_navigation";
@@ -1073,26 +1194,32 @@ ${lines.join("\n")}`);
       const title = doc?.title ?? "";
       const selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"], summary';
       const rawEls = doc && typeof doc.querySelectorAll === "function" ? Array.from(doc.querySelectorAll(selector)) : [];
+      const SP_SEL = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
       const elements = [];
       let count = 0;
       const seen = /* @__PURE__ */ new Set();
+      const formMap = { map: /* @__PURE__ */ new WeakMap(), count: 0 };
+      const labelForMap = buildLabelForMap(doc);
       for (const el of rawEls) {
         if (seen.has(el)) continue;
         seen.add(el);
+        if (el.closest?.(SP_SEL)) continue;
         const visible = isVisible(el);
         if (!visible) continue;
         const tag = el.tagName ? el.tagName.toLowerCase() : "div";
         const role = getRole(el);
         const text = clean(el.innerText || el.textContent || "");
         const placeholder = clean(el.getAttribute?.("placeholder") || "");
-        const ariaLabel = clean(el.getAttribute?.("aria-label") || el.getAttribute?.("title") || el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
+        const ariaLabel = resolveAccessibleName(el, doc, labelForMap);
         const value = typeof el.value === "string" ? clean(el.value) : "";
         const href = clean(el.getAttribute?.("href") || "", 120);
         const enabled = !el.disabled;
         const region = getRegion(el);
         const type = tag === "input" ? clean(el.getAttribute?.("type") || el.type || "", 20) : "";
         const autocomplete = clean(el.getAttribute?.("autocomplete") || "", 30);
-        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox") continue;
+        const formId = resolveFormId(el, formMap);
+        const required = Boolean(el.required) || el.getAttribute?.("required") != null;
+        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox" && role !== "button") continue;
         let bbox = null;
         if (typeof el.getBoundingClientRect === "function") {
           const r = el.getBoundingClientRect();
@@ -1114,7 +1241,9 @@ ${lines.join("\n")}`);
           region,
           bbox,
           type,
-          autocomplete
+          autocomplete,
+          formId,
+          required
         });
         if (count >= 300) break;
       }
@@ -1128,7 +1257,7 @@ ${lines.join("\n")}`);
         timestamp: Date.now()
       };
     }
-    return { extractPageState, clean, getRole };
+    return { extractPageState, clean, getRole, resolveAccessibleName };
   })();
   if (typeof globalThis !== "undefined" && globalThis.module) {
     globalThis.module.exports = PageStateService;

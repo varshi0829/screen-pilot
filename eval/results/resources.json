@@ -1,0 +1,487 @@
+{
+  "generatedAt": "2026-09-25T08:04:24.405Z",
+  "machine": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-13620H",
+    "logicalCores": 16,
+    "totalRamGB": 15.7,
+    "platform": "win32 10.0.26200",
+    "node": "v25.2.1"
+  },
+  "config": {
+    "reps": 3,
+    "timeoutMs": 180000,
+    "executionMode": "local-qwen",
+    "idleBaselineMs": 10000,
+    "tasks": [
+      "deterministic-click",
+      "vision-icon-click",
+      "qwen-search-two-step"
+    ]
+  },
+  "resources": {
+    "samplingIntervalMs": {
+      "n": 509,
+      "mean": 1479.4440078585462,
+      "median": 1451,
+      "min": 1284,
+      "max": 3459
+    },
+    "ollamaReportedModels": [
+      {
+        "name": "moondream:latest",
+        "sizeMB": 1242,
+        "sizeVramMB": 0
+      },
+      {
+        "name": "qwen2.5-coder:7b",
+        "sizeMB": 4828,
+        "sizeVramMB": 0
+      }
+    ],
+    "inferenceDevice": "CPU only (Ollama reports size_vram = 0 for every loaded model)",
+    "windows": {
+      "idleBaseline": {
+        "intervals": 7,
+        "systemCpuPct": {
+          "avg": 21.142857142857142,
+          "peak": 48,
+          "n": 7
+        },
+        "systemRamUsedMB": {
+          "avg": 15290.186941964286,
+          "peak": 15628.15234375,
+          "n": 7
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0,
+              "peak": 0,
+              "n": 7
+            },
+            "ramMB": {
+              "avg": 21.8828125,
+              "peak": 21.8828125,
+              "n": 7
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 0.020087678699989713,
+              "peak": 0.140613750899928,
+              "n": 7
+            },
+            "ramMB": {
+              "avg": 2739.184151785714,
+              "peak": 2768.16796875,
+              "n": 7
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 0.04043498397106497,
+              "peak": 0.210920626349892,
+              "n": 7
+            },
+            "ramMB": {
+              "avg": 4357.71484375,
+              "peak": 4357.71484375,
+              "n": 7
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 2.0773502853143504,
+              "peak": 10.248781859070464,
+              "n": 7
+            },
+            "ramMB": {
+              "avg": 476.14955357142856,
+              "peak": 623.84375,
+              "n": 7
+            }
+          }
+        }
+      },
+      "allTaskActivity": {
+        "intervals": 380,
+        "systemCpuPct": {
+          "avg": 21.19736842105263,
+          "peak": 68,
+          "n": 380
+        },
+        "systemRamUsedMB": {
+          "avg": 13381.32163856908,
+          "peak": 15609.89453125,
+          "n": 380
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.0017130279400611784,
+              "peak": 0.15411296685954762,
+              "n": 380
+            },
+            "ramMB": {
+              "avg": 19.465686677631577,
+              "peak": 22.4375,
+              "n": 380
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 0.24332311764486866,
+              "peak": 27.688963045765387,
+              "n": 380
+            },
+            "ramMB": {
+              "avg": 1368.2374730603449,
+              "peak": 1832.10546875,
+              "n": 87
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 1.5204915867023512,
+              "peak": 52.67764522821577,
+              "n": 380
+            },
+            "ramMB": {
+              "avg": 4294.355355674342,
+              "peak": 4357.71484375,
+              "n": 380
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 0.21055530028792363,
+              "peak": 6.720807151406343,
+              "n": 380
+            },
+            "ramMB": {
+              "avg": 601.0085526315789,
+              "peak": 739.8671875,
+              "n": 380
+            }
+          }
+        }
+      },
+      "qwenInference": {
+        "intervals": 13,
+        "systemCpuPct": {
+          "avg": 48.07692307692308,
+          "peak": 68,
+          "n": 13
+        },
+        "systemRamUsedMB": {
+          "avg": 13271.84735576923,
+          "peak": 13892.55859375,
+          "n": 13
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.005004676369599754,
+              "peak": 0.0650607928047968,
+              "n": 13
+            },
+            "ramMB": {
+              "avg": 19.543870192307693,
+              "peak": 19.8359375,
+              "n": 13
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 0.005004676369599754,
+              "peak": 0.0650607928047968,
+              "n": 13
+            },
+            "ramMB": {
+              "avg": 1362.87109375,
+              "peak": 1362.87109375,
+              "n": 4
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 39.262304627883246,
+              "peak": 52.67764522821577,
+              "n": 13
+            },
+            "ramMB": {
+              "avg": 4293.9026442307695,
+              "peak": 4294.0703125,
+              "n": 13
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 1.2616699825787856,
+              "peak": 5.306655786873677,
+              "n": 13
+            },
+            "ramMB": {
+              "avg": 616.1974158653846,
+              "peak": 631.734375,
+              "n": 13
+            }
+          }
+        }
+      },
+      "moondreamInference": {
+        "intervals": 4,
+        "systemCpuPct": {
+          "avg": 46.25,
+          "peak": 56,
+          "n": 4
+        },
+        "systemRamUsedMB": {
+          "avg": 13856.65234375,
+          "peak": 13891.171875,
+          "n": 4
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.07818288220467684,
+              "peak": 0.15411296685954762,
+              "n": 4
+            },
+            "ramMB": {
+              "avg": 22.1142578125,
+              "peak": 22.4375,
+              "n": 4
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 22.27311967212479,
+              "peak": 27.688963045765387,
+              "n": 4
+            },
+            "ramMB": {
+              "avg": 1362.4716796875,
+              "peak": 1363.71875,
+              "n": 4
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 1.7386435891681626,
+              "peak": 6.954574356672651,
+              "n": 4
+            },
+            "ramMB": {
+              "avg": 4327.6484375,
+              "peak": 4338.4296875,
+              "n": 4
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 5.194375030310539,
+              "peak": 6.720807151406343,
+              "n": 4
+            },
+            "ramMB": {
+              "avg": 709.462890625,
+              "peak": 739.8671875,
+              "n": 4
+            }
+          }
+        }
+      },
+      "task:deterministic-click": {
+        "intervals": 1,
+        "systemCpuPct": {
+          "avg": 29,
+          "peak": 29,
+          "n": 1
+        },
+        "systemRamUsedMB": {
+          "avg": 15609.89453125,
+          "peak": 15609.89453125,
+          "n": 1
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.139608649035025,
+              "peak": 0.139608649035025,
+              "n": 1
+            },
+            "ramMB": {
+              "avg": 22.07421875,
+              "peak": 22.07421875,
+              "n": 1
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 1.5356951393852751,
+              "peak": 1.5356951393852751,
+              "n": 1
+            },
+            "ramMB": {
+              "avg": 1832.10546875,
+              "peak": 1832.10546875,
+              "n": 1
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 0,
+              "peak": 0,
+              "n": 1
+            },
+            "ramMB": {
+              "avg": 4357.71484375,
+              "peak": 4357.71484375,
+              "n": 1
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 6.142780557541101,
+              "peak": 6.142780557541101,
+              "n": 1
+            },
+            "ramMB": {
+              "avg": 651.52734375,
+              "peak": 651.52734375,
+              "n": 1
+            }
+          }
+        }
+      },
+      "task:vision-icon-click": {
+        "intervals": 5,
+        "systemCpuPct": {
+          "avg": 48.4,
+          "peak": 57,
+          "n": 5
+        },
+        "systemRamUsedMB": {
+          "avg": 13870.51328125,
+          "peak": 13925.95703125,
+          "n": 5
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.06254630576374147,
+              "peak": 0.15411296685954762,
+              "n": 5
+            },
+            "ramMB": {
+              "avg": 22.003125,
+              "peak": 22.4375,
+              "n": 5
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 17.81849573769983,
+              "peak": 27.688963045765387,
+              "n": 5
+            },
+            "ramMB": {
+              "avg": 1362.39921875,
+              "peak": 1363.71875,
+              "n": 5
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 9.977848342008306,
+              "peak": 42.93466735336888,
+              "n": 5
+            },
+            "ramMB": {
+              "avg": 4329.8046875,
+              "peak": 4338.4296875,
+              "n": 5
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 4.278576248194141,
+              "peak": 6.720807151406343,
+              "n": 5
+            },
+            "ramMB": {
+              "avg": 715.31015625,
+              "peak": 739.8671875,
+              "n": 5
+            }
+          }
+        }
+      },
+      "task:qwen-search-two-step": {
+        "intervals": 374,
+        "systemCpuPct": {
+          "avg": 20.81283422459893,
+          "peak": 68,
+          "n": 374
+        },
+        "systemRamUsedMB": {
+          "avg": 13368.822892296123,
+          "peak": 14052.79296875,
+          "n": 374
+        },
+        "perGroup": {
+          "ollama-server": {
+            "cpuPct": {
+              "avg": 0.0005310439555334634,
+              "peak": 0.06707160027472528,
+              "n": 374
+            },
+            "ramMB": {
+              "avg": 19.424789020721924,
+              "peak": 19.8359375,
+              "n": 374
+            }
+          },
+          "model:moondream:latest": {
+            "cpuPct": {
+              "avg": 0.004905376676913578,
+              "peak": 0.2778271692745377,
+              "n": 374
+            },
+            "ramMB": {
+              "avg": 1362.87109375,
+              "peak": 1362.87109375,
+              "n": 81
+            }
+          },
+          "model:qwen2.5-coder:7b": {
+            "cpuPct": {
+              "avg": 1.411490805446128,
+              "peak": 52.67764522821577,
+              "n": 374
+            },
+            "ramMB": {
+              "avg": 4293.712023729947,
+              "peak": 4294.0703125,
+              "n": 374
+            }
+          },
+          "benchmark-chromium": {
+            "cpuPct": {
+              "avg": 0.14030842863876783,
+              "peak": 5.306655786873677,
+              "n": 374
+            },
+            "ramMB": {
+              "avg": 599.3453793449198,
+              "peak": 631.734375,
+              "n": 374
+            }
+          }
+        }
+      }
+    }
+  },
+  "rawSampleCount": 510
+}

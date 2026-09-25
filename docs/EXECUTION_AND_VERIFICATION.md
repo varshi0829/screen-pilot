@@ -1,5 +1,7 @@
 # Execution and Verification Engine Specification
 
+> **Current state (final implementation):** a target with no accessible text (icon-only control) is resolved by its known on-page position (`_resolveElementByPosition`, `elementFromPoint` at the bbox centre) instead of a text search; completion is also recognised when the goal is consumed (`isGoalConsumed` in v2-task.js). See **docs/SCREENPILOT_FINAL_DOCUMENTATION.md**.
+
 ## 1. Overview
 The **Execution and Verification Engine** ensures that actions selected by the decision router are executed safely and validated against actual live browser state transitions.
 

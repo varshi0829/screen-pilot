@@ -5,7 +5,7 @@
 // Zero dependencies beyond Node.js built-ins. All browser APIs are shimmed below.
 
 import assert from 'assert/strict';
-import { ExecutorEngine } from '../services/executor-engine.js';
+import { ExecutorEngine, valueSatisfies } from '../services/executor-engine.js';
 import { ElementResolutionThreshold } from '../shared/types/index.js';
 
 // ── Browser API shims ─────────────────────────────────────────────────────────
@@ -120,6 +120,10 @@ function makeExecutor(matcherOpts, highlighterOpts) {
     // budget, isolated from these.
     elementResolvePollIntervalMs: 1,
     elementResolveMaxWaitMs:      0,
+    // A fill with no requested value settles once typing goes quiet; the real
+    // budget is 600ms, shortened here so these tests stay deterministic and do
+    // not race nextEvent's own 500ms timeout.
+    fillIdleMs:                   1,
   });
 }
 
@@ -498,7 +502,7 @@ const silent = (ex) => Promise.race([
   new Promise(r => setTimeout(() => r('silent'), 100)),
 ]);
 
-await test('fill_form: non-empty text input emits user:acted with trigger=input', async () => {
+await test('fill_form: a text input settles once typing goes quiet, with trigger=input', async () => {
   const ex = makeExecutor();
   ex.start(makePlan([fillStep()]));
   await nextEvent(ex, 'element:ready');
@@ -1232,6 +1236,208 @@ await test('alternative at/above RECOVERY is still used normally (score floor is
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────
+
+// ── Fill completion is tied to the REQUESTED VALUE, not to "something changed" ──
+//
+// A partially typed value changes the DOM exactly like a complete one. Settling
+// on the first non-empty keystroke recorded a half-entered value as done, and
+// every later keystroke arrived after the step was already closed. These cover
+// the generic contract with synthetic fields only — no site, no selector.
+
+await test('fill_form: a partially entered value does NOT settle the step', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep({ targetElement: { text: 'Query', type: 'input', value: 'artificial intelligence' } })]));
+  await nextEvent(ex, 'element:ready');
+
+  // The user has typed only the first few characters so far.
+  const outcome = await Promise.race([
+    nextEvent(ex, 'user:acted').then(() => 'fired'),
+    new Promise(r => setTimeout(() => r('silent'), 80)),
+  ]);
+  mockDocument.dispatch('input', { target: textField('arti') });
+
+  assert.equal(await outcome, 'silent', 'a partial value must not be reported as a completed fill');
+  ex.abort();
+});
+
+await test('fill_form: the step settles once the field satisfies the requested value', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep({ targetElement: { text: 'Query', type: 'input', value: 'artificial intelligence' } })]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('input', { target: textField('arti') });                    // still typing
+  mockDocument.dispatch('input', { target: textField('artificial intell') });       // still typing
+  mockDocument.dispatch('input', { target: textField('artificial intelligence') }); // complete
+  const payload = await acted;
+
+  assert.equal(payload.trigger, 'input');
+  assert.equal(payload.observedValue, 'artificial intelligence',
+    'the observed value must be reported so the orchestrator can verify it');
+  ex.abort();
+});
+
+await test('fill_form: a field holding MORE than the requested value still settles', async () => {
+  // Autocomplete completing a query, a formatter reshaping input, a combobox
+  // echoing a selection — all legitimate successes.
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep({ targetElement: { text: 'Query', type: 'input', value: 'artificial intelligence' } })]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('input', { target: textField('Artificial Intelligence (disambiguation)') });
+
+  assert.equal((await acted).trigger, 'input');
+  ex.abort();
+});
+
+await test('fill_form: with no requested value, existing quiet-period behavior is preserved', async () => {
+  // L1/L2 cannot extract a value, so their fill steps carry none. Those must
+  // keep completing on typing alone rather than waiting for a value forever.
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep()]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('input', { target: textField('anything at all') });
+
+  assert.equal((await acted).trigger, 'input');
+  ex.abort();
+});
+
+await test('valueSatisfies: generic value comparison, no site or control knowledge', () => {
+  assert.equal(valueSatisfies('arti', 'artificial intelligence'), false, 'partial value must fail');
+  assert.equal(valueSatisfies('artificial intelligence', 'artificial intelligence'), true);
+  assert.equal(valueSatisfies('Artificial   Intelligence', 'artificial intelligence'), true, 'case/whitespace normalized');
+  assert.equal(valueSatisfies('artificial intelligence (disambiguation)', 'artificial intelligence'), true, 'superset accepted');
+  assert.equal(valueSatisfies('', 'artificial intelligence'), false);
+  assert.equal(valueSatisfies('anything', ''), true, 'no requested value falls back to non-empty');
+  assert.equal(valueSatisfies('', ''), false);
+});
+
+await test('a trigger that never reads the field reports observedValue=null, not a wrong value', async () => {
+  // Only the input path observes a control. The click and url_change triggers
+  // carry null because they never read one, so the orchestrator must be able
+  // to tell "not observed" from "observed something wrong" — conflating the
+  // two turned an unobserved completion into a verification failure and burned
+  // the step-attempt budget while the field plainly held the requested value.
+  const ex = makeExecutor();
+  ex.start(makePlan([makeStep({ phase: 'navigate', completionCondition: 'dom_change' })]));
+  await nextEvent(ex, 'element:ready');
+
+  const acted = nextEvent(ex, 'user:acted');
+  mockDocument.dispatch('click', { target: { closest: () => null } });
+  const payload = await acted;
+
+  assert.equal(payload.trigger, 'click');
+  assert.equal(payload.observedValue, null, 'a click observes no field value');
+  ex.abort();
+});
+
+// ── Position-based resolution: a target with no accessible text (see ───────
+// ── decision-router.js's _buildPlanFromElement) is resolved by its already- ─
+// ── known bbox instead of a text search that can never succeed ─────────────
+//
+// A resolved element with an empty targetElement.text — a purely visual
+// control with no text/placeholder/ariaLabel at all — previously reached
+// DOMMatcher.matchElement() anyway, which bails out immediately on empty
+// text (see dom-matcher.js) and so always failed with "No element matched
+// ...". targetElement.elementId + bbox (already produced upstream, nothing
+// new computed here) let the executor resolve directly by known on-page
+// position instead, via the standard elementFromPoint API.
+
+const POSITIONAL_MOCK_ELEMENT = {
+  getAttribute:  () => null,
+  tagName:       'BUTTON',
+  innerText:     '',
+  closest:       () => null,
+  contains:      () => true,
+};
+
+function unlabeledStep(overrides = {}) {
+  return makeStep({
+    targetElement: {
+      text: '', type: 'button', region: null, intent: 'Click the button with the icon',
+      elementId: 'el_7', bbox: { x: 100, y: 200, width: 40, height: 40 }, alternatives: [],
+    },
+    ...overrides,
+  });
+}
+
+await test('an unlabeled target (empty text, elementId + bbox) resolves via its known position, not a text search', async () => {
+  const domMatcher = makeMatcher(); // its matchElement would return MOCK_ELEMENT if ever called
+  let elementFromPointCalls = [];
+  mockDocument.elementFromPoint = (x, y) => { elementFromPointCalls.push([x, y]); return POSITIONAL_MOCK_ELEMENT; };
+
+  try {
+    const ex = new ExecutorEngine({
+      domMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+      elementResolvePollIntervalMs: 1, elementResolveMaxWaitMs: 0, fillIdleMs: 1,
+    });
+    ex.start(makePlan([unlabeledStep()]));
+    const payload = await nextEvent(ex, 'element:ready');
+
+    assert.equal(payload.element, POSITIONAL_MOCK_ELEMENT, 'the executor must target the element actually found at the known position');
+    assert.notEqual(payload.element, MOCK_ELEMENT, 'must not fall back to whatever a text matcher happens to return');
+    // bbox is { x:100, y:200, width:40, height:40 } -> center (120, 220).
+    assert.deepEqual(elementFromPointCalls, [[120, 220]], 'must query the CENTER of the element\'s own known bbox');
+    ex.abort();
+  } finally {
+    delete mockDocument.elementFromPoint;
+  }
+});
+
+await test('no textual re-grounding occurs when a valid elementId + bbox is already present: matchElement is never called', async () => {
+  let matchElementCalls = 0;
+  const spyMatcher = { matchElement: (...args) => { matchElementCalls++; return makeMatcher().matchElement(...args); } };
+  mockDocument.elementFromPoint = () => POSITIONAL_MOCK_ELEMENT;
+
+  try {
+    const ex = new ExecutorEngine({
+      domMatcher: spyMatcher, highlighter: makeHighlighter(), captureSnapshot: () => MOCK_SNAPSHOT,
+      elementResolvePollIntervalMs: 1, elementResolveMaxWaitMs: 0, fillIdleMs: 1,
+    });
+    ex.start(makePlan([unlabeledStep()]));
+    await nextEvent(ex, 'element:ready');
+
+    assert.equal(matchElementCalls, 0, 'a resolvable position-based target must never fall through to a text search');
+    ex.abort();
+  } finally {
+    delete mockDocument.elementFromPoint;
+  }
+});
+
+await test('a resolved LABELED target is completely unaffected: still resolved by matchElement, elementFromPoint is never consulted', async () => {
+  let elementFromPointCalls = 0;
+  mockDocument.elementFromPoint = () => { elementFromPointCalls++; return POSITIONAL_MOCK_ELEMENT; };
+
+  try {
+    const ex = makeExecutor(); // default matcher resolves MOCK_ELEMENT by text, as before
+    // A normal labeled step — non-empty text, exactly the existing shape.
+    ex.start(makePlan([makeStep({ targetElement: { text: 'Submit', type: 'button', region: 'form', intent: 'submit', elementId: 'el_1', bbox: { x: 1, y: 1, width: 10, height: 10 }, alternatives: [] } })]));
+    const payload = await nextEvent(ex, 'element:ready');
+
+    assert.equal(payload.element, MOCK_ELEMENT, 'a labeled target must still resolve via the ordinary text-matching path');
+    assert.equal(elementFromPointCalls, 0, 'position-based resolution must never even be attempted when real text is present');
+    ex.abort();
+  } finally {
+    delete mockDocument.elementFromPoint;
+  }
+});
+
+await test('position-based resolution falls back to the existing not-found failure when nothing lives at that position', async () => {
+  mockDocument.elementFromPoint = () => null; // nothing there — e.g. the page changed
+
+  try {
+    const ex = makeExecutor({ found: false }); // text-matcher path (the fallback) also finds nothing
+    ex.start(makePlan([unlabeledStep()]));
+    const payload = await nextEvent(ex, 'element:not_found');
+
+    assert.match(payload.reason, /No element matched/, 'must surface the existing generic not-found failure, not a new error shape');
+  } finally {
+    delete mockDocument.elementFromPoint;
+  }
+});
 
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
 process.exit(fail > 0 ? 1 : 0);

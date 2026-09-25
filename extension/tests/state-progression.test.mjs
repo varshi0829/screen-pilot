@@ -1064,7 +1064,14 @@ test('Dedup guard (domHashAfter): sticky same-page effect X→Y, DOM still Y →
   try {
     setDomHash(['Explore', 'Marketplace', 'Pricing']);           // X — before the click
     const domHashBefore = currentDomHash();
-    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']); // Y — menu opened
+    // Y — menu opened. It includes one control that still expresses the goal
+    // ("Create menu layout"), so the task is genuinely NOT finished and the
+    // loop must reach planning — which is where the (mocked) planner re-proposes
+    // the completed step and the dedup guard has to block it. Without such a
+    // control, nothing left on the page matches the goal and the verifier gate
+    // correctly completes the task before planning at all (pinned separately
+    // below), so this test would never reach the guard it exists to protect.
+    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist', 'Create menu layout']);
     const domHashAfter = currentDomHash();
 
     await SessionStore.create(TAB, 'open the create menu');
@@ -1092,6 +1099,57 @@ test('Dedup guard (domHashAfter): sticky same-page effect X→Y, DOM still Y →
     DecisionRouter.prototype.route      = origRoute;
     SessionStore.setPhase               = origSetPhase;
     SessionStore.incrementStepAttempt   = origIncrementStepAttempt;
+  }
+});
+
+test('Goal consumed: a completed step that achieved the goal ends the task instead of replanning', async () => {
+  // The same sticky "menu opened" fixture, with nothing left on the page that
+  // still expresses the goal: the only matching action already succeeded and
+  // its effect (the open menu) still holds. The task is finished, so the loop
+  // must complete at the verifier gate — never asking the planner again, never
+  // executing another step, never burning a step attempt.
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  let routeCalls = 0;
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = async function () { routeCalls++; return origRoute.apply(this, arguments); };
+
+  const setPhaseCalls = [];
+  const origSetPhase = SessionStore.setPhase.bind(SessionStore);
+  SessionStore.setPhase = async (tabId, phase) => { setPhaseCalls.push(phase); return origSetPhase(tabId, phase); };
+
+  const incrementCalls = { step: 0 };
+  const origIncrementStepAttempt = SessionStore.incrementStepAttempt.bind(SessionStore);
+  SessionStore.incrementStepAttempt = async (tabId) => { incrementCalls.step++; return origIncrementStepAttempt(tabId); };
+
+  try {
+    setDomHash(['Explore', 'Marketplace', 'Pricing']);
+    const domHashBefore = currentDomHash();
+    setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']);
+    const domHashAfter = currentDomHash();
+
+    await SessionStore.create(TAB, 'open the create menu');
+    await SessionStore.completeStep(TAB, {
+      description: 'Click the + button in the top navigation', intent: 'open_create_menu',
+      completionCondition: 'dom_change',
+      urlBefore: 'https://example.com', domHashBefore,
+      urlAfter:  'https://example.com', domHashAfter,
+      completedAt: Date.now() - 500,
+    });
+
+    const restore = stubLoad(3);
+    await _bootstrapSession(TAB);
+    restore();
+
+    assert.equal(routeCalls, 0, 'a finished task must not be sent back to the planner');
+    assert.ok(!setPhaseCalls.includes('EXECUTING'), `no further step may execute — setPhase calls: ${setPhaseCalls.join(', ')}`);
+    assert.equal(incrementCalls.step, 0, 'completion is not a retry — no step attempt may be spent');
+  } finally {
+    DecisionRouter.prototype.route    = origRoute;
+    SessionStore.setPhase             = origSetPhase;
+    SessionStore.incrementStepAttempt = origIncrementStepAttempt;
   }
 });
 

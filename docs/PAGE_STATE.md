@@ -1,5 +1,7 @@
 # Page State Representation Specification
 
+> **Current state (final implementation):** extraction now also resolves accessible names (aria-labelledby / label[for] / ancestor label), records `formId`/`required`, excludes ScreenPilot's own UI, retains unnamed buttons (icon-only controls) as candidates, and runs every element through `PrivacySanitizer` before returning; `sensitiveRegions` (bboxes of sensitive fields) is returned for screenshot redaction. See **docs/SCREENPILOT_FINAL_DOCUMENTATION.md**.
+
 ## 1. Overview
 ScreenPilot V2 extracts a **website-agnostic, normalized JSON representation** of the active web page. 
 

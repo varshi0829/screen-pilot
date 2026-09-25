@@ -139,13 +139,18 @@ test('Runtime Task 6 fixture: warm up the local Qwen model before Ambiguous Task
 test('Runtime Task 6 (Ambiguous Qwen): "Enable notifications preference"', async () => {
   const adapter = new LocalQwenAdapter();
   const router  = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: adapter });
+  // P0 #1: genuine (not floor-inflated) partial lexical overlap, split across
+  // two elements so neither alone fully covers the goal's page-relatable
+  // vocabulary — top L2 score stays below 0.70 (correctly misses) while
+  // ranked.length > 0 (correctly routes to Qwen, not vision, per the L3
+  // router). See ui-grounding-service.js's scoreElement() doc comment.
   const pageState = {
     url: 'https://settings.example.com/notifications',
     title: 'User Settings',
     elements: [
-      { id: 'el_1', role: 'generic', tag: 'div', text: 'System Preferences', visible: true, enabled: true },
-      { id: 'el_2', role: 'generic', tag: 'span', text: 'Receive Email Digest', visible: true, enabled: true },
-      { id: 'el_3', role: 'button', tag: 'button', text: 'Toggle Alert Channel 2', visible: true, enabled: true }
+      { id: 'el_1', role: 'generic', tag: 'div', text: 'System Preference Center', visible: true, enabled: true },
+      { id: 'el_2', role: 'generic', tag: 'span', text: 'Receive Email Notifications Digest', visible: true, enabled: true },
+      { id: 'el_3', role: 'button', tag: 'button', text: 'Toggle Alert Channel', visible: true, enabled: true }
     ]
   };
 
@@ -163,11 +168,15 @@ test('Runtime Task 6 (Ambiguous Qwen): "Enable notifications preference"', async
 test('Runtime Task 7 (Ambiguous Qwen): "Configure complex workspace settings"', async () => {
   const adapter = new LocalQwenAdapter();
   const router  = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: adapter });
+  // P0 #1: a single element sharing its only overlapping token would score
+  // 1.0 coverage (resolved by L2 alone) — a second element splits the
+  // goal's page-relatable vocabulary so neither fully covers it.
   const pageState = {
     url: 'https://workspace.example.org/admin',
     title: 'Admin Console',
     elements: [
-      { id: 'el_1', role: 'button', tag: 'button', text: 'Advanced Settings', visible: true, enabled: true }
+      { id: 'el_1', role: 'button', tag: 'button', text: 'Advanced Settings', visible: true, enabled: true },
+      { id: 'el_2', role: 'generic', tag: 'div', text: 'Complex Workflow Options', visible: true, enabled: true }
     ]
   };
 
@@ -184,12 +193,16 @@ test('Runtime Task 7 (Ambiguous Qwen): "Configure complex workspace settings"', 
 test('Runtime Task 8 (Ambiguous Qwen): "Select preferred payment strategy"', async () => {
   const adapter = new LocalQwenAdapter();
   const router  = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: adapter });
+  // P0 #1: the original labels shared zero vocabulary with the goal at all
+  // (ranked.length === 0 -> the L3 router would pick vision, not Qwen).
+  // Adding "Payment"/"Strategy" gives each element one genuine, partial,
+  // goal-relatable token — still ambiguous (neither is an exact match).
   const pageState = {
     url: 'https://checkout.example.com/payment',
     title: 'Payment Gateway',
     elements: [
-      { id: 'el_1', role: 'generic', tag: 'div', text: 'Option A: Digital Wallet', visible: true, enabled: true },
-      { id: 'el_2', role: 'button', tag: 'button', text: 'Proceed Option B', visible: true, enabled: true }
+      { id: 'el_1', role: 'generic', tag: 'div', text: 'Option A: Digital Wallet Payment', visible: true, enabled: true },
+      { id: 'el_2', role: 'button', tag: 'button', text: 'Proceed Option B Strategy', visible: true, enabled: true }
     ]
   };
 
@@ -206,11 +219,14 @@ test('Runtime Task 8 (Ambiguous Qwen): "Select preferred payment strategy"', asy
 test('Runtime Task 9 (Ambiguous Qwen): "Authorize multi-factor authentication token"', async () => {
   const adapter = new LocalQwenAdapter();
   const router  = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: adapter });
+  // P0 #1: "Verify Token" alone shares only "token" with the goal — a single
+  // scorable token means full (1.0) coverage, resolved by L2 alone. Adding
+  // "authentication" to the other field splits the overlap across elements.
   const pageState = {
     url: 'https://auth.example.com/mfa',
     title: 'Security Challenge',
     elements: [
-      { id: 'el_1', role: 'textbox', tag: 'input', placeholder: '6-digit code', visible: true, enabled: true },
+      { id: 'el_1', role: 'textbox', tag: 'input', placeholder: '6-digit authentication code', visible: true, enabled: true },
       { id: 'el_2', role: 'button', tag: 'button', text: 'Verify Token', visible: true, enabled: true }
     ]
   };
@@ -228,11 +244,16 @@ test('Runtime Task 9 (Ambiguous Qwen): "Authorize multi-factor authentication to
 test('Runtime Task 10 (Ambiguous Qwen): "Resolve merge conflicts across branches"', async () => {
   const adapter = new LocalQwenAdapter();
   const router  = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: adapter });
+  // P0 #1: a single element covering both of its own overlapping tokens
+  // ("resolve", "conflicts") would score 1.0 coverage (resolved by L2
+  // alone) — a second element splits the goal's vocabulary ("merge",
+  // "branches") so neither element fully covers it.
   const pageState = {
     url: 'https://dev.example.org/pull/42',
     title: 'Pull Request Review',
     elements: [
-      { id: 'el_1', role: 'button', tag: 'button', text: 'Resolve Conflicts Editor', visible: true, enabled: true }
+      { id: 'el_1', role: 'button', tag: 'button', text: 'Resolve Conflicts Editor', visible: true, enabled: true },
+      { id: 'el_2', role: 'generic', tag: 'div', text: 'Merge Branches View', visible: true, enabled: true }
     ]
   };
 

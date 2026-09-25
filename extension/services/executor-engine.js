@@ -28,6 +28,36 @@
 import { capturePageSnapshot }      from '../lib/page-snapshot.js';
 import { ElementResolutionThreshold } from '../shared/types/index.js';
 
+// How long typing must be quiet before a fill with no explicitly requested
+// value is treated as finished. Only reached when the step carries no value to
+// check against — with one, the value itself is the completion signal.
+export const FILL_IDLE_MS = 600;
+
+/**
+ * Does a control's current content satisfy the value the step asked for?
+ *
+ * Deliberately generous rather than exact: `includes` after normalizing case
+ * and whitespace. A control legitimately holds more than what was typed —
+ * autocomplete completes a query, a formatter reshapes a number, a combobox
+ * echoes the selected item — and those are successes. What it rejects is the
+ * case that matters: content that does not yet contain the requested value at
+ * all, i.e. a partially entered value.
+ *
+ * Works on anything exposing text content, so plain inputs, search fields,
+ * textareas and contenteditable are all handled the same way, with no
+ * knowledge of the site or the control.
+ *
+ * @param {string} actual
+ * @param {string} requested
+ * @returns {boolean}
+ */
+export function valueSatisfies(actual, requested) {
+  const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(requested);
+  if (!want) return norm(actual).length > 0;
+  return norm(actual).includes(want);
+}
+
 // ── ExecutorStatus values (string union) ──────────────────────────────────────
 // 'idle'      — no plan active; safe to call start()
 // 'resolving' — actively matching a DOM element
@@ -50,6 +80,9 @@ export class ExecutorEngine {
     // precedent elsewhere in this file (100ms interval, 2s budget).
     elementResolvePollIntervalMs = 100,
     elementResolveMaxWaitMs      = 2000,
+    // Quiet period before a fill with no requested value counts as finished —
+    // injectable so tests need not wait out the real budget.
+    fillIdleMs                   = FILL_IDLE_MS,
   } = {}) {
     if (!domMatcher)  throw new TypeError('ExecutorEngine: domMatcher is required');
     if (!highlighter) throw new TypeError('ExecutorEngine: highlighter is required');
@@ -59,6 +92,7 @@ export class ExecutorEngine {
     this._captureSnapshot = captureSnapshot;
     this._elementResolvePollIntervalMs = elementResolvePollIntervalMs;
     this._elementResolveMaxWaitMs      = elementResolveMaxWaitMs;
+    this._fillIdleMs                   = fillIdleMs;
 
     this._plan              = null;
     this._stepIndex         = 0;
@@ -409,8 +443,29 @@ export class ExecutorEngine {
       text: step.targetElement?.text,
       type: step.targetElement?.type,
       region: step.targetElement?.region,
-      alternatives: step.targetElement?.alternatives
+      alternatives: step.targetElement?.alternatives,
+      elementId: step.targetElement?.elementId,
+      bbox: step.targetElement?.bbox
     });
+
+    // A resolved element with no accessible name at all (see
+    // decision-router.js's _buildPlanFromElement) has an intentionally EMPTY
+    // targetElement.text — DOMMatcher's own text-based scoring below can
+    // never succeed for it, since no real page element's text will ever
+    // equal a blank string (matchElement itself bails out immediately on
+    // empty text). When that's the case, resolve directly by the element's
+    // own already-known on-page position instead of attempting a text
+    // search that cannot succeed. Narrowly scoped to exactly this case — a
+    // labeled element (the ordinary/existing case) always has non-empty
+    // text and is completely unaffected; this never runs for it.
+    if (!step.targetElement.text?.trim() && step.targetElement.elementId && step.targetElement.bbox) {
+      const positional = this._resolveElementByPosition(step.targetElement);
+      if (positional) return positional;
+      // No live element found at that position (e.g. the page changed) —
+      // fall through to the normal path below, which will also fail
+      // (matchElement bails out on empty text) and surface the existing
+      // "No element matched" failure exactly as it already does.
+    }
 
     const primary = this._domMatcher.matchElement(step.targetElement);
 
@@ -446,6 +501,53 @@ export class ExecutorEngine {
     }
 
     return best;
+  }
+
+  /**
+   * Resolve a target directly by its already-known on-page position, for a
+   * step whose element has no accessible name to search the live DOM by
+   * (see the caller in _resolveElement). Uses `elementFromPoint` — a
+   * standard DOM API, not a new targeting system — at the center of the
+   * element's own `bbox`, exactly as PageStateService already captured it
+   * via getBoundingClientRect() (the same bbox already used for vision
+   * candidate markers). Entirely generic: this has no knowledge of what the
+   * element is, what site it's on, or what the goal was — only where it is.
+   *
+   * `elementId` is not itself used to look anything up here — pageState ids
+   * are per-extraction-cycle labels with no live DOM binding of their own —
+   * its presence just confirms the step really does carry a page-state-
+   * resolved target before this bypasses text matching at all.
+   *
+   * Returns null (never throws, never guesses) whenever there's nothing
+   * live at that position, that position is disabled, or the runtime
+   * doesn't support `elementFromPoint` (e.g. these unit tests) — every one
+   * of those cases falls back to the caller's existing failure path.
+   *
+   * @param {object} targetElement
+   * @returns {{element:Element, score:number, alternatives:object[], candidates:object[]}|null}
+   */
+  _resolveElementByPosition(targetElement) {
+    const bbox = targetElement?.bbox;
+    if (!bbox || !(bbox.width > 0) || !(bbox.height > 0)) return null;
+    if (typeof document === 'undefined' || typeof document.elementFromPoint !== 'function') return null;
+
+    let element;
+    try {
+      element = document.elementFromPoint(bbox.x + bbox.width / 2, bbox.y + bbox.height / 2);
+    } catch {
+      return null;
+    }
+    if (!element) return null;
+    if (this._domMatcher.isDisabled?.(element)) return null;
+    if (typeof this._domMatcher.isVisible === 'function' && !this._domMatcher.isVisible(element)) return null;
+
+    console.log(`[SP:Exec] Resolved by position (no accessible text on target) elementId=${targetElement.elementId} bbox=${JSON.stringify(bbox)} <${element.tagName?.toLowerCase?.() ?? '?'}>`);
+
+    // Synthetic PRIMARY-tier match, same shape _domMatcher.matchElement()
+    // returns — score is fixed (this isn't a lexical/structural score, there
+    // is nothing to score), set comfortably above ElementResolutionThreshold
+    // .PRIMARY so downstream candidate handling treats it as confident.
+    return { element, score: 100, alternatives: [], candidates: [] };
   }
 
   /**
@@ -501,14 +603,17 @@ export class ExecutorEngine {
   _watchForUserAction(step) {
     let fired = false;
 
-    const onUserAction = (trigger) => {
+    const onUserAction = (trigger, observedValue = null) => {
       if (fired) return;  // prevent double-emission if both click and url_change race
       fired = true;
       this._teardownListeners();
       this._highlighter.clear();
       this._activeElement = null;
       // Status stays 'awaiting' — the orchestrator transitions it after Validation.
-      this._emit('user:acted', { step, trigger, timestamp: Date.now() });
+      // observedValue carries what the control actually held at completion, so
+      // the orchestrator can verify a fill against what was requested rather
+      // than inferring success from a DOM change.
+      this._emit('user:acted', { step, trigger, observedValue, timestamp: Date.now() });
     };
 
     // A "fill" step is completed by typing, not by a click. Detect it from either
@@ -551,8 +656,9 @@ export class ExecutorEngine {
         return false;
       };
       const fieldValue = (el) => (el.isContentEditable === true ? (el.textContent ?? '') : (el.value ?? ''));
+      let fillIdleTimer = null;
 
-      const inputHandler = (e) => {
+      const handleFieldEvent = (e, eventKind) => {
         // [SP:FILL] diagnostic instrumentation — debug-only, no logic change.
         // Logged unconditionally, before any guard below, so every guard's inputs
         // are visible on every input/change dispatch regardless of which guard
@@ -584,14 +690,43 @@ export class ExecutorEngine {
         if (!this._activeElement.contains(field)) return;
         if (!isTextLikeField(field)) return;
         if (fieldValue(field).trim().length === 0) return;
-        console.log("[SP:FILL] USER_ACTION_EMITTED");
-        onUserAction('input');
+
+        // A fill is NOT complete just because the field stopped being empty.
+        // Firing on the first keystroke captured a partial value ("arti" of
+        // "artificial intelligence") and reported the step done, because every
+        // later keystroke arrived after the step had already been settled.
+        //
+        // Two generic completion signals, no site or field knowledge:
+        //   - if the step carries a requested value, the field must actually
+        //     satisfy it (see valueSatisfies);
+        //   - otherwise typing must have come to rest — a 'change' event
+        //     (commit/blur) settles immediately, and a plain 'input' waits out
+        //     a short quiet period that each further keystroke restarts.
+        const requested = (step.targetElement?.value ?? '').trim();
+        const settle = (reason) => {
+          clearTimeout(fillIdleTimer);
+          console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} value="${fieldValue(field)}"`);
+          onUserAction('input', fieldValue(field));
+        };
+
+        if (requested) {
+          if (valueSatisfies(fieldValue(field), requested)) settle('requested_value_present');
+          // Otherwise keep waiting: the user is still typing it.
+          return;
+        }
+
+        if (eventKind === 'change') { settle('change_committed'); return; }
+        clearTimeout(fillIdleTimer);
+        fillIdleTimer = setTimeout(() => settle('typing_idle'), this._fillIdleMs);
       };
-      document.addEventListener('input',  inputHandler, { capture: true });
-      document.addEventListener('change', inputHandler, { capture: true });
+      const inputHandler  = (e) => handleFieldEvent(e, 'input');
+      const changeHandler = (e) => handleFieldEvent(e, 'change');
+      document.addEventListener('input',  inputHandler,  { capture: true });
+      document.addEventListener('change', changeHandler, { capture: true });
       this._cleanups.push(() => {
-        document.removeEventListener('input',  inputHandler, { capture: true });
-        document.removeEventListener('change', inputHandler, { capture: true });
+        clearTimeout(fillIdleTimer);
+        document.removeEventListener('input',  inputHandler,  { capture: true });
+        document.removeEventListener('change', changeHandler, { capture: true });
       });
     }
 

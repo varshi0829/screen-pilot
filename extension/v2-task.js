@@ -3,7 +3,7 @@
 // Restored mechanically from committed bundle e9a3031 (v2-task section lines 1319–2044).
 // Single intentional deviation: BYOK apiKey pass-through in _runPlanLoop().
 
-import { ExecutorEngine }                         from './services/executor-engine.js';
+import { ExecutorEngine, valueSatisfies }         from './services/executor-engine.js';
 import { VercelBackendAdapter }                   from './providers/vercel-backend-adapter.js';
 import { PageStateService }                       from './services/page-state-service.js';
 import { DecisionRouter }                          from './services/decision-router.js';
@@ -12,6 +12,7 @@ import { capturePageSnapshot }                    from './lib/page-snapshot.js';
 import { TaskState, TaskEvent, transition }       from './shared/state-machine/transitions.js';
 import { SessionStore }                           from './services/session-store.js';
 import { GoalVerifier }                           from './services/goal-verifier.js';
+import { UIGroundingService }                     from './services/ui-grounding-service.js';
 import { classifyNavigation, NavClassification }  from './services/navigation-classifier.js';
 import { PrivacySanitizer }                       from './lib/privacy-sanitizer.js';
 
@@ -36,6 +37,12 @@ let _generation = 0;
 let _executor = null;
 let _taskContext = null;
 let _taskStartedAt = null;
+// Perf markers for the user-perceived gap between acting on one step and the
+// next step being pointed at (see the user:acted / element:ready handlers).
+// Module-level because the two events belong to two different ExecutorEngine
+// instances — one per step.
+let _lastUserActedAtMs = null;
+let _lastUserActedIntent = null;
 const MAX_CLARIFICATIONS = 5;
 // B5: transient backend failures that are safe to retry without clearing the session.
 // HTTP_ERROR is the adapter's fallback code for a non-OK HTTP response (5xx surface here);
@@ -436,6 +443,11 @@ function buildPendingStepContext(step) {
     description: step.description,
     intent: step.intent,
     completionCondition: step.completionCondition,
+    // What this step is supposed to ACHIEVE, kept alongside it so a later cycle
+    // can re-check the effect itself rather than only whether the page as a
+    // whole still looks identical. See deriveSettledSteps.
+    targetLabel: (step.targetElement?.text || '').trim(),
+    requestedValue: (step.targetElement?.value || '').trim(),
     expectedUrlPattern: step.expectedPageState?.urlPattern ?? null,
     expectedUrlChanges: step.expectedPageState?.urlChanges ?? false,
     urlBefore: window.location.href,
@@ -455,6 +467,8 @@ function buildStepRecord(pendingStep) {
     description: pendingStep.description,
     intent: pendingStep.intent,
     completionCondition: pendingStep.completionCondition,
+    targetLabel: pendingStep.targetLabel ?? '',
+    requestedValue: pendingStep.requestedValue ?? '',
     urlBefore: pendingStep.urlBefore,
     domHashBefore: pendingStep.domHashBefore ?? null,  // carry through for dedup guard
     urlAfter: window.location.href,
@@ -568,6 +582,91 @@ function matchesCompletedStep(completedSteps, pendingStep, proposedStep, current
   }
   return { matchingCompleted, urlSame, domHashSame };
 }
+// TASK PROGRESS projection: of this task's own completed steps, which ones'
+// effects ARE the state we are about to plan against?
+//
+// Uses the same "is the page still in that step's own post-completion state"
+// test the dedup guard applies (urlAfter/domHashAfter baseline, with the same
+// fallbacks for older records) — the difference is only WHEN it is consulted.
+// The dedup guard asks it after the planner has already chosen an action, so
+// it can reject but not redirect; asking it BEFORE planning lets the router
+// withhold those already-actioned targets and pick the next action instead.
+//
+// Derived fresh from the session and the live snapshot on every cycle and
+// never persisted, so it cannot go stale: once the page moves on from a
+// step's recorded after-state, that step stops being reported as settled and
+// its target becomes an ordinary candidate again.
+function stepEffectStillHolds(step, pageState, currentSnap = null) {
+  // Action-appropriate evidence that the step's own effect survives, checked
+  // against the CURRENT state rather than against a remembered page hash.
+  // Each action type is asked the question that actually decides whether it is
+  // still done; a step with no such evidence falls back to the fingerprint
+  // test in deriveSettledSteps, exactly as before.
+
+  // FILL — the control it targeted should still hold the value it entered.
+  const want  = (step.requestedValue || '').trim();
+  const label = (step.targetLabel || '').trim().toLowerCase();
+  if (want && label && Array.isArray(pageState?.elements)) {
+    const satisfied = pageState.elements.some((el) => {
+      const elLabel = (el.text || el.placeholder || el.ariaLabel || '').trim().toLowerCase();
+      return elLabel === label && valueSatisfies(el.value || '', want);
+    });
+    if (satisfied) return true;
+  }
+
+  // NAVIGATION — the step moved the page somewhere, and we are still there.
+  //
+  // A navigating step finishes on a document that no longer exists: the fresh
+  // page's content script records it, capturing domHashAfter the moment it
+  // boots. A real destination keeps rendering after that (deferred form
+  // fields, async widgets), so by the next planning cycle the fingerprint has
+  // already moved and the completed navigation stopped counting as done. The
+  // control that caused it is typically global chrome still present on the new
+  // page, so the planner re-grounded the unchanged goal, found it again, and
+  // pointed back at the action it had just successfully completed.
+  //
+  // The transition itself is the durable evidence: this step took the page
+  // from urlBefore to urlAfter, and that is still true for as long as we
+  // remain at urlAfter. Nothing about any particular site is involved — only
+  // the step's own recorded before/after location.
+  const from = step.urlBefore;
+  const to   = step.urlAfter;
+  if (from && to && from !== to && currentSnap?.url === to) return true;
+
+  return false;
+}
+
+function deriveSettledSteps(completedSteps, currentSnap, pageState = null) {
+  if (!currentSnap) return [];
+  return (completedSteps || []).slice(-3).filter((step) => {
+    // A completed action's effect can outlive the exact page fingerprint it
+    // finished under. Typing into a field opens an autocomplete list, a live
+    // region ticks, an image swaps its label — any of that changes domHash
+    // while the action itself remains just as done. Keying progress solely to
+    // fingerprint equality therefore un-settled genuinely finished steps, and
+    // the planner rediscovered them: the same fill was proposed again against
+    // a field that already held the value, which is what "stuck on same step"
+    // looked like from outside. Effect evidence is checked first because it is
+    // the stronger statement — it asks whether the thing the step was for is
+    // still true, not whether the page has been quiet since.
+    if (stepEffectStillHolds(step, pageState, currentSnap)) return true;
+
+    const urlBaseline = step.urlAfter ?? step.urlBefore;
+    if (urlBaseline != null && currentSnap.url !== urlBaseline) return false;
+    if (step.domHashAfter  != null) return currentSnap.domHash === step.domHashAfter;
+    if (step.domHashBefore != null) return currentSnap.domHash === step.domHashBefore;
+    return false;
+  });
+}
+// See the "Goal consumed" comment at its call site in the verifier gate.
+function isGoalConsumed(session, pageState, settledSteps, router) {
+  if (!settledSteps?.length || !Array.isArray(pageState?.elements)) return false;
+  const intent = [session?.goal, ...(session?.clarifications ?? []).map((c) => c.text)]
+    .filter(Boolean).join(' ');
+  const unsettled = pageState.elements.filter((el) => !router._isSettledTarget(el, settledSteps));
+  if (UIGroundingService.rankElements(intent, unsettled).length) return false;
+  return !router._resolveActionContinuation(pageState.elements, settledSteps);
+}
 function makeSingleStepPlan(step, goal) {
   return {
     planId: crypto.randomUUID(),
@@ -659,10 +758,16 @@ async function _runPlanLoopInternal(tabId, myGen) {
     if (_generation !== myGen) return;
     console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${session.goal}"`);
 
-    // Diagnostic: log full session state at each plan loop entry
+    // This cycle's task-progress projection (see deriveSettledSteps). Computed
+    // from the same snapshot the entry diagnostic logs, so the cycle costs no
+    // extra DOM work for it.
+    let settledSteps = [];
+    let entrySnap = null;
     try {
       const lastStep = session.completedSteps[session.completedSteps.length - 1];
       const currentSnap = capturePageSnapshot('');
+      entrySnap = currentSnap;
+      settledSteps = deriveSettledSteps(session.completedSteps, currentSnap);
       console.log(`[SP:V2:DIAG] Plan loop entry — completedSteps=${session.completedSteps.length} stepAttemptCount=${session.stepAttemptCount} phase=${session.phase}`, {
         pendingStep:       session.pendingStep ? { intent: session.pendingStep.intent, domHashBefore: session.pendingStep.domHashBefore } : null,
         lastCompletedStep: lastStep ? { intent: lastStep.intent, domHashBefore: lastStep.domHashBefore, urlBefore: lastStep.urlBefore } : null,
@@ -671,14 +776,36 @@ async function _runPlanLoopInternal(tabId, myGen) {
       });
     } catch { /* non-browser environment — skip diagnostic snapshot */ }
     
-    // Verifier-driven early completion check (requiresEffect OR generic goal satisfaction)
+    // Verifier-driven early completion check (requiresEffect OR generic goal satisfaction).
+    //
+    // This cycle's ONE page-state extraction and ONE generic goal check happen
+    // here and are reused by the planner below (cycleExtractMs/cyclePageState/
+    // cycleGenericCheck) — extracting again a few milliseconds later re-walked
+    // the whole DOM and re-ran the identical live-document scan for the same
+    // answer. Deliberately scoped to this single cycle only: both are rebuilt
+    // from scratch on every iteration, so there is no cross-cycle caching and
+    // the stale-plan check below still compares real before/after snapshots.
+    let cyclePageState    = null;
+    let cycleExtractMs    = 0;
+    let cycleGenericCheck = null;
     {
       console.log("[SP:V2:TRACE] verify START");
       const tGoalStart = Date.now();
+      const tExtractStart = Date.now();
       const pageState  = PageStateService.extractPageState();
+      cycleExtractMs   = Date.now() - tExtractStart;
+      cyclePageState   = pageState;
+      // Re-derived now that this cycle's page state exists, so a completed
+      // step can be settled on its own surviving effect (see
+      // stepEffectStillHolds) and not only on page-wide fingerprint equality.
+      // Same snapshot, same cycle — no extra DOM work.
+      settledSteps     = deriveSettledSteps(session.completedSteps, entrySnap, pageState);
+      console.log(`[SP:V2:PERF] stage=task_progress settledActions=${settledSteps.length} of ${session.completedSteps.length} completed`);
       const gate       = GoalVerifier.shouldComplete(session.goalCompletionCriteria, {}, session.goal, pageState);
+      cycleGenericCheck = gate.genericCheck ?? null;
       const goalVerifyMs = Date.now() - tGoalStart;
       console.log(`[SP:V2:TRACE] verify END complete=${gate.complete} reason=${gate.reason}`);
+      console.log(`[SP:V2:PERF] stage=verifier_gate extractMs=${cycleExtractMs} goalVerifyMs=${goalVerifyMs} elements=${pageState.elements.length}`);
 
       if (gate.complete) {
         console.log("[SP:GoalCompletion]", {
@@ -690,6 +817,36 @@ async function _runPlanLoopInternal(tabId, myGen) {
         applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
         await _showGoalCompleteCard(tabId, session.goal);
         return;
+      }
+
+      // Goal consumed: the task has made verified progress, and once the
+      // targets of those completed actions are withheld, nothing left on the
+      // page expresses the goal at all — no candidate for L2 to rank and no
+      // structural continuation. Every control that matched the goal has
+      // already been successfully acted on and its effect still holds.
+      //
+      // isGoalSatisfied cannot see this on its own: it needs the goal's words
+      // to reappear in the URL/page after the action, and a successful submit
+      // rarely echoes all of them (measured: "#submitted" satisfies "submit"
+      // but never "profile"). Without this, the loop replanned a finished task,
+      // found zero text candidates, and escalated to visual perception and then
+      // the cloud to rediscover an action it had already completed.
+      //
+      // Mirrors the router's own deterministic tiers exactly — the same
+      // withholding (_isSettledTarget), the same L2 ranking, the same
+      // continuation check, over the same intent (goal + clarifications) — so
+      // this fires precisely when routing would have had nothing deterministic
+      // left to offer. Requires at least one settled step, so a first cycle
+      // (e.g. a purely visual question with no page target) is unaffected and
+      // still reaches visual perception.
+      {
+        if (isGoalConsumed(session, pageState, settledSteps, decisionRouter)) {
+          console.log("[SP:GoalCompletion]", { source: "verifier", satisfied: true, reason: "goal_consumed", settledActions: settledSteps.length });
+          console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_consumed`);
+          applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
+          await _showGoalCompleteCard(tabId, session.goal);
+          return;
+        }
       }
     }
     const { isStuck: budgetExhausted, reason: budgetReason } = await SessionStore.incrementPlannerAttemptOnly(tabId);
@@ -709,7 +866,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
     }
     if (_generation !== myGen) return;
     const nClarifications = freshSession.clarifications?.length ?? 0;
+    const tPageControlsStart = Date.now();
     const pageControls    = collectPageControls();
+    const pageControlsMs  = Date.now() - tPageControlsStart;
     const reqId           = `req_v2_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const planController  = new AbortController();
 
@@ -738,14 +897,19 @@ async function _runPlanLoopInternal(tabId, myGen) {
 
     let planResp;
     try {
+      // This cycle's single extraction, taken moments ago by the verifier gate
+      // above (see its comment). Falls back to extracting here if the gate
+      // somehow produced none, so this path never depends on the gate running.
       const tDomStart = Date.now();
-      const pageState = PageStateService.extractPageState();
+      const pageState = cyclePageState ?? PageStateService.extractPageState();
       localPageState  = pageState;
-      const domMs     = Date.now() - tDomStart;
+      const domMs     = cyclePageState ? cycleExtractMs : Date.now() - tDomStart;
 
       // Pre-L3 goal satisfaction check — applies regardless of executionMode,
       // so cloud users also skip a paid LLM call when the goal is already met.
-      const preL3Check = GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
+      // Reuses the gate's own result when it computed one this cycle: same
+      // goal, same page state, same live document, microseconds apart.
+      const preL3Check = cycleGenericCheck ?? GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
       if (preL3Check.satisfied) {
         window.removeEventListener('popstate', onNavCheck);
         console.log(`[SP:V2:TRACE] plan END reqId=${reqId} outcome=goal_already_satisfied`);
@@ -779,7 +943,12 @@ async function _runPlanLoopInternal(tabId, myGen) {
         ...pageControls.length && { pageControls }
       };
 
-      const routed = await decisionRouter.route(freshSession.goal, pageState, { signal: planController.signal, cloudContext });
+      const routed = await decisionRouter.route(freshSession.goal, pageState, {
+        signal: planController.signal,
+        cloudContext,
+        completedSteps: freshSession.completedSteps,
+        settledSteps
+      });
 
       planResp     = routed.planResponse;
       const layer1Ms    = routed.layer1Ms ?? 0;
@@ -790,6 +959,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
 
       console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? 'n/a'}`);
       console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
+      console.log(`[SP:V2:PERF] stage=routing routeMs=${layer1Ms + layer2Ms + qwenMs + cloudMs} pageControlsMs=${pageControlsMs} domReused=${cyclePageState ? 'yes' : 'no'} goalCheckReused=${cycleGenericCheck ? 'yes' : 'no'}`);
     } catch (err) {
       window.removeEventListener('popstate', onNavCheck);
       console.log(`[SP:V2:TRACE] plan ERROR reqId=${reqId} name=${err?.name} message=${err?.message}`);
@@ -1114,6 +1284,9 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
     console.error("[SP:V2] DOMMatcher not available — cannot execute step");
     return "element_not_found";
   }
+  // Covers element resolution + self-check + highlighter (including the
+  // highlighter's own scroll wait, which is unchanged).
+  const tExecuteStart = Date.now();
   return new Promise((resolve) => {
     if (_generation !== myGen) {
       resolve("aborted");
@@ -1139,6 +1312,14 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
     }
     executor.on("element:ready", async ({ step, element }) => {
       applyEvent(TaskEvent.ELEMENT_READY, { intent: plannerStep.intent });
+      // Closes the user-perceived window opened in the PREVIOUS step's
+      // user:acted: everything between acting and the next target being
+      // pointed at — verification, replanning, resolution and highlighting.
+      if (_lastUserActedAtMs !== null) {
+        console.log(`[SP:V2:PERF] stage=action_to_next_highlight fillToHighlightMs=${Date.now() - _lastUserActedAtMs} fromIntent="${_lastUserActedIntent ?? ''}" toIntent="${plannerStep.intent ?? ''}"`);
+        _lastUserActedAtMs = null;
+        _lastUserActedIntent = null;
+      }
       // Ground-truth correction from the ACTUAL resolved DOM element — see
       // computeExpectedNavigationFromElement. Runs here because the live node
       // is only known once the executor has resolved a candidate; only
@@ -1155,15 +1336,63 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       } else {
         showStatus(step.description, "info");
       }
+      const tMarkStart = Date.now();
       await SessionStore.markPendingStep(tabId, buildPendingStepContext(step));
+      console.log(`[SP:V2:PERF] stage=executor executorMs=${Date.now() - tExecuteStart} markPendingStepMs=${Date.now() - tMarkStart} intent="${plannerStep.intent ?? ''}"`);
     });
     executor.on("element:not_found", ({ reason, isOptional }) => {
       if (isOptional) return;
       applyEvent(TaskEvent.ELEMENT_NOT_FOUND, { reason });
       done("element_not_found");
     });
-    executor.on("user:acted", async ({ step, trigger }) => {
+    executor.on("user:acted", async ({ step, trigger, observedValue }) => {
       applyEvent(TaskEvent.USER_ACTED, { trigger });
+
+      // ── Action-specific verification ───────────────────────────────────────
+      // A DOM change means SOMETHING happened, not that what was asked for
+      // happened. For a fill that distinction is the whole point: a partially
+      // typed value changes the DOM exactly like a complete one, so settling
+      // on "the page changed" recorded a half-entered value as done. When the
+      // step names a value, the control must actually hold it. Clicks and
+      // every other action keep the existing snapshot-based verification —
+      // there is nothing requested to compare them against.
+      // Only meaningful for a fill, and only when the field was actually
+      // OBSERVED. `observedValue` is populated by the input path alone — the
+      // click and url_change triggers carry null because they never read a
+      // field. Treating that absence as a failed value check turned an
+      // unobserved completion into a verification failure, burned the step
+      // attempts, and reported "stuck on same step" while the control on
+      // screen plainly held the requested value. Absence of an observation is
+      // not evidence of a wrong value: those triggers fall through to the
+      // existing snapshot verification below, exactly as before. The real
+      // guard against a partial value lives in the executor, which will not
+      // settle a valued fill until the control satisfies it.
+      const isFillStep = plannerStep.phase === 'fill_form' || plannerStep.completionCondition === 'input_filled';
+      const requestedValue = (plannerStep.targetElement?.value ?? '').trim();
+      if (isFillStep && requestedValue && observedValue !== null && observedValue !== undefined
+          && !valueSatisfies(observedValue, requestedValue)) {
+        console.warn(`[SP:V2] Fill verification FAILED — requested="${requestedValue}" observed="${observedValue ?? ''}" — step NOT settled, replanning`);
+        console.log(`[SP:V2:PERF] stage=post_action_verify verdict=FAILED reason=requested_value_not_present`);
+        // Deliberately NOT recorded as a completed step: leaving it unsettled
+        // is what lets the next cycle plan the same field again instead of
+        // treating a partial value as progress. The attempt counter still
+        // bounds this, so an unsatisfiable fill cannot loop forever.
+        const { isStuck, reason } = await SessionStore.incrementStepAttempt(tabId);
+        if (isStuck) {
+          applyEvent(TaskEvent.PLAN_FAILED, { reason });
+          showStatus(`ScreenPilot: ${reason}`, "error");
+          await SessionStore.clear(tabId);
+          done("aborted");
+          return;
+        }
+        applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "fill_value_not_satisfied" });
+        done("completed");
+        return;
+      }
+      // Start of the window the user actually perceives: "I acted — when does
+      // it point at the next thing?" — closed in element:ready.
+      _lastUserActedAtMs = Date.now();
+      _lastUserActedIntent = plannerStep.intent ?? null;
       if (expectsNavigation) {
         if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
         done("navigated");
@@ -1173,14 +1402,17 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       const pre = executor.getPreActionSnapshot();
       let post = capturePageSnapshot("");
       const tVerifyStart = Date.now();
+      // Poll for a real change, up to the 150ms budget. The loop exits the
+      // moment the DOM/URL actually changes; there is deliberately no pad back
+      // up to the full budget afterwards — waiting out the remainder once the
+      // change has already been observed (or once the loop has run its course)
+      // adds latency without changing the verdict, which is computed from the
+      // snapshots below exactly as before.
       while (Date.now() - tVerifyStart < 150 && pre?.domHash === post.domHash && pre?.url === post.url) {
         await new Promise((r) => setTimeout(r, 25));
         post = capturePageSnapshot("");
       }
-      if (Date.now() - tVerifyStart < 150) {
-        const rem = 150 - (Date.now() - tVerifyStart);
-        if (rem > 0) await new Promise((r) => setTimeout(r, rem));
-      }
+      const verifyMs = Date.now() - tVerifyStart;
       if (_generation !== myGen) {
         done("aborted");
         return;
@@ -1188,10 +1420,13 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       post = capturePageSnapshot("");
       const verdict = validateStep(pre, post);
       console.log(`[SP:V2] user:acted verdict=${verdict} domHashBefore=${pre?.domHash} domHashAfter=${post.domHash} urlBefore=${pre?.url} urlAfter=${post.url}`);
+      console.log(`[SP:V2:PERF] stage=post_action_verify postActionVerifyMs=${verifyMs} verdict=${verdict} trigger=${trigger}`);
       await SessionStore.completeStep(tabId, {
         description: step.description,
         intent: plannerStep.intent,
         completionCondition: step.completionCondition,
+        targetLabel: (plannerStep.targetElement?.text || '').trim(),
+        requestedValue: (plannerStep.targetElement?.value || '').trim(),
         urlBefore: pre?.url ?? window.location.href,
         domHashBefore: pre?.domHash ?? null,   // stored so dedup guard works post-completion
         urlAfter: post.url,
@@ -1537,6 +1772,8 @@ export function __setTabId(id) {
   _tabId = id;
 }
 export { computeExpectedNavigationFromElement as __computeExpectedNavigationFromElement };
+export { deriveSettledSteps as __deriveSettledSteps, stepEffectStillHolds as __stepEffectStillHolds };
+export { isGoalConsumed as __isGoalConsumed };
 export {
   _handleClarification as __handleClarification,
   _handleResume as __handleResume,

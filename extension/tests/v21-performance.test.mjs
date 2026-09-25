@@ -163,11 +163,16 @@ test('J. Complex ambiguous task can still reach Qwen when executionMode=local-qw
     }
   };
   const router = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: mockQwen });
+  // P0 #1: "Option Alpha"/"Option Beta" share zero vocabulary with the goal
+  // below, so L2's ranked list would be empty and the L3 router would pick
+  // vision, not Qwen (see decision-router.js's router). Genuine (still
+  // partial/insufficient) overlap split across elements is what correctly
+  // routes an ambiguous-but-textually-groundable task to Qwen.
   const pageState = {
     url: 'https://example.com/complex',
     elements: [
-      { id: 'el_1', text: 'Option Alpha', visible: true, enabled: true },
-      { id: 'el_2', text: 'Option Beta', visible: true, enabled: true }
+      { id: 'el_1', text: 'Arrays', visible: true, enabled: true },
+      { id: 'el_2', text: 'Recent Problem Filter', visible: true, enabled: true }
     ]
   };
 

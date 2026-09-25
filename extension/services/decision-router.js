@@ -4,19 +4,42 @@
 // 1. Fast Local Path (Deterministic DOMMatcher / exact match, threshold >= 0.85)
 // 2. Small ML Model (UI Element Grounding & Ranking, threshold >= 0.70)
 // 3. Reasoning fallback — Cloud LLM by default; when executionMode ===
-//    'local-qwen' (the existing local-first opt-in):
-//      a. Local Moondream VISUAL PERCEPTION is tried first (privacy-vision
-//         Phase 2, corrected) — it only ever points at an element from the
-//         current page state's own element list; it is not a planner, and it
-//         runs even when Qwen would have succeeded. A validated pick is
-//         wrapped into a plan via _buildPlanFromElement, the exact same
-//         helper L1/L2 use.
-//      b. If vision is unavailable, fails, or names an elementId that
-//         doesn't actually exist in the current page state, local Qwen
-//         (text) is tried next — unchanged from before.
-//      c. Cloud is the final fallback.
-//    Each provider gets exactly one attempt, never bounced back and forth.
+//    'local-qwen' (the existing local-first opt-in), L3 is a ROUTER that
+//    picks exactly ONE local provider for the cycle — Moondream and Qwen are
+//    never both invoked in the same cycle:
+//      a. If L2's own ranking (`ranked`, already computed above) found ANY
+//         candidate element at all (even below the 0.70 threshold), there is
+//         a viable textual/DOM candidate — the local TEXT reasoner (Qwen) is
+//         used.
+//      b. Only when `ranked` is empty — the DOM/text representation
+//         genuinely offers nothing to reason over — is local Moondream
+//         VISUAL PERCEPTION used. It only ever points at an element from the
+//         current page state's own element list; it is not a planner. A
+//         validated pick is wrapped into a plan via _buildPlanFromElement,
+//         the exact same helper L1/L2 use.
+//      c. Whichever ONE of (a)/(b) was chosen, if it's unavailable, fails, or
+//         (vision only) names an elementId that doesn't actually exist in
+//         the current page state, the router falls straight through to
+//         Cloud — it does NOT then try the other local provider.
 //    executionMode === 'cloud' never contacts Ollama at all.
+//
+// TASK PROGRESS
+// -------------
+// Every layer here grounds the ORIGINAL goal, and the goal text never changes
+// between replans. Grounding is therefore a pure function of (goal, elements):
+// given the same candidates it necessarily returns the same element, including
+// one that was just acted on successfully. Progress across cycles comes from
+// the other input — the candidate set — which route() narrows using
+// `settledSteps`: this task's own completed actions whose effect IS the state
+// now being routed against. Their targets are, by definition, not the next
+// action, so they are withheld before any scoring happens.
+//
+// Nothing here knows which site it is looking at: the projection is computed
+// from the task's own action history plus the page's own before/after state
+// fingerprints, both of which already existed for the dedup guard. The dedup
+// guard still runs downstream, unchanged, as the safety net — the difference
+// is that the planner no longer needs it to notice the repeat, because the
+// repeat is no longer proposed.
 
 import { UIGroundingService }     from './ui-grounding-service.js';
 import { LocalQwenAdapter }       from '../providers/local-qwen-adapter.js';
@@ -31,6 +54,107 @@ export const ML_GROUNDING_THRESHOLD  = 0.70;
 // Moondream (see _runLayer3) — smaller prompt, faster local-vision inference,
 // without changing L1/L2's own matching/thresholds at all.
 export const VISION_CANDIDATE_LIMIT  = 10;
+// Cap on how many L2-ranked candidates get sent to Qwen (see _runLayer3).
+// Previously Qwen received `elements.slice(0, 25)` in raw DOM order, which
+// could silently exclude the actually-relevant element on a real page with
+// many candidates ahead of it in DOM order (e.g. a language-link grid before
+// a page's search box), forcing Qwen to choose among irrelevant leftovers.
+// Sending the top-N by L2's own relevance ranking instead fixes that
+// generically — no site/phrase-specific logic, just reusing the ranking L2
+// already computed.
+export const QWEN_CANDIDATE_LIMIT    = 25;
+// Minimum lead the top candidate must hold over the runner-up for L2 to commit
+// on its own. Below it, several candidates are covering the goal's vocabulary
+// equally well and the winner is decided by sort order — measured at exactly
+// 0.000 across three sibling controls whose labels differed only in a word the
+// goal never mentioned. Kept deliberately small: this criterion exists to catch
+// near-ties, NOT to second-guess a clear lead (measured clear cases: 0.480,
+// 0.690, 0.760, 0.880, 0.960 — all well above it and all still deterministic).
+export const AMBIGUITY_MARGIN        = 0.05;
+// How much of the winner's score the runner-up must hold to count as genuinely
+// in contention. Used only together with unmatched goal vocabulary — see
+// _assessAmbiguity. Measured: 0.34 where the lexical winner was the wrong
+// element, 0.22 and below where it was right.
+export const RIVAL_SHARE             = 0.30;
+// Margin at which the ranking is treated as having genuinely discriminated.
+// Above it, an absent goal word is not evidence of a contest — there is a
+// clear winner regardless. Measured separation is wide: the cases that must
+// still escalate sit at 0.030 and 0.000, the ones that must run deterministically
+// at 0.330 and above.
+export const DECISIVE_MARGIN         = 0.15;
+// Confidence reported when a sole unlabeled interactive candidate is resolved
+// structurally (see _findSoleUnlabeledInteractiveCandidate) after visual
+// perception named no usable element. This is not a model score — nothing
+// scored or perceived this pick — so it is kept below LocalVisionAdapter's
+// own default (0.75) rather than implying equivalent certainty; it exists
+// only so the resulting plan carries a plausible, ordinary confidence value.
+export const SOLE_UNLABELED_CANDIDATE_CONFIDENCE = 0.6;
+// Same interactive roles/tags PageStateService's own extraction selector
+// already treats as "an interactive control" (see its querySelectorAll
+// selector) — reused here rather than inventing a second taxonomy, so
+// "structurally actionable" means exactly what it already means everywhere
+// else in this pipeline.
+const INTERACTIVE_ROLES = new Set(['button', 'link', 'menuitem', 'tab', 'textbox', 'combobox']);
+const INTERACTIVE_TAGS  = new Set(['button', 'a', 'input', 'select', 'textarea', 'summary']);
+
+// Function words that mark where a goal stops describing the ACTION and starts
+// stating the VALUE. These are English grammar, not vocabulary: they carry no
+// meaning of their own, name no site, and map to no synonym. The same words are
+// already treated as structural elsewhere — every one of them is in
+// ui-grounding-service's stopWords list, i.e. the tokens L2 refuses to score on
+// precisely because they describe relationships rather than things.
+//
+// Two shapes, distinguished by which side of the marker the value sits on:
+//   "... for X" / "... to X" / "... with X"   -> the value TRAILS the marker
+//   "<verb> X into <target>"                  -> the value PRECEDES the marker
+const VALUE_TRAILS_MARKERS   = ['for', 'to', 'with'];
+const VALUE_PRECEDES_MARKERS = ['into'];
+
+/**
+ * Extract the value a goal is asking to be entered, if it states one.
+ *
+ * Deterministic and structural: it reads where the goal's own function words
+ * put the payload, never what the payload means. A goal that states no value
+ * yields '' — this guesses nothing, so "create a new repo" stays valueless and
+ * the workflow is free to stop at the form and ask, rather than inventing one.
+ *
+ * Callers must only apply this to a target that RECEIVES a value. That gate is
+ * what keeps ordinary navigation safe: "go to settings" trails a marker too,
+ * but resolves to a link, so no value is ever taken from it.
+ *
+ * @param {string} goal
+ * @param {string} [targetLabel] - The control's own accessible name. A payload
+ *   identical to it is rejected: that is the label/value conflation this
+ *   exists to prevent, not a value the user asked for.
+ * @returns {string}
+ */
+export function extractRequestedValue(goal, targetLabel = '') {
+  const words = String(goal ?? '').trim().split(/\s+/).filter(Boolean);
+  if (words.length < 2) return '';
+
+  const bare = words.map(w => w.toLowerCase().replace(/[.,!?;:]+$/, ''));
+  let payload = '';
+
+  const precedesAt = bare.findIndex(w => VALUE_PRECEDES_MARKERS.includes(w));
+  if (precedesAt > 1) {
+    // "<verb> <value> into <target>" — drop the leading action verb.
+    payload = words.slice(1, precedesAt).join(' ');
+  } else {
+    let trailsAt = -1;
+    for (let i = 0; i < bare.length - 1; i++) {
+      if (VALUE_TRAILS_MARKERS.includes(bare[i])) trailsAt = i;
+    }
+    if (trailsAt >= 0) payload = words.slice(trailsAt + 1).join(' ');
+  }
+
+  payload = payload.replace(/^(the|a|an)\s+/i, '').trim();
+  if (!payload) return '';
+
+  const norm = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+  if (norm(payload) === norm(targetLabel)) return '';
+
+  return payload;
+}
 
 export class DecisionRouter {
   /**
@@ -71,19 +195,75 @@ export class DecisionRouter {
    * @param {string[]} [options.cloudContext.clarifications]
    * @param {object[]} [options.cloudContext.pageControls]
    * @param {string} [options.cloudContext.requestId]
+   * @param {object[]} [options.completedSteps] - This task's own completed-step
+   *   history (session order, oldest first).
+   * @param {object[]} [options.settledSteps] - The subset of completedSteps whose
+   *   own post-action state IS the state being routed against right now (see
+   *   the TASK PROGRESS note on the class above). Supplied by the caller, which
+   *   owns the session and the page snapshot; derived fresh every cycle and
+   *   never persisted, so it cannot go stale.
    * @returns {Promise<{ layer: 'deterministic'|'ml_grounding'|'local_qwen'|'cloud', planResponse: object, layer1Ms: number, layer2Ms: number, qwenMs: number, cloudMs: number, qwenFailureReason: string|null }>}
    */
   async route(goal, pageState, options = {}) {
     const elements = Array.isArray(pageState?.elements) ? pageState.elements : [];
+    const completedSteps = Array.isArray(options.completedSteps) ? options.completedSteps : [];
+    const settledSteps   = Array.isArray(options.settledSteps) ? options.settledSteps : [];
+
+    // A clarification is the user answering "which one did you mean?" — it is
+    // the most direct statement of intent available, and until now only the
+    // cloud tier ever saw it. Locally the same tie was re-derived from the
+    // unchanged goal, so answering changed nothing and the question could be
+    // asked again. Folding the answer into the text being grounded is all the
+    // local path needs: the user's own words, used as words.
+    //
+    // Grounding only. The original goal still drives value extraction, so a
+    // clarification naming a control can never be mistaken for a payload.
+    const clarifications = Array.isArray(options.cloudContext?.clarifications)
+      ? options.cloudContext.clarifications.filter(Boolean)
+      : [];
+    const groundingIntent = clarifications.length
+      ? `${goal} ${clarifications.join(' ')}`
+      : goal;
+    if (clarifications.length) {
+      console.log(`[SP:DecisionRouter] Grounding with ${clarifications.length} clarification(s) folded into the intent`);
+    }
+
+    // ── Task progress projection ───────────────────────────────────────────────
+    // The goal text is immutable across replans, so grounding it against an
+    // unchanged candidate set is a pure function — it necessarily re-selects
+    // the element that was just acted on. What changes between cycles is not
+    // the goal but how much of it is already DONE, and that is exactly what
+    // `settledSteps` expresses: actions whose effect is the state we are
+    // looking at. Those targets are, by definition, not the NEXT action, so
+    // they are withheld from the candidate set here — before any scoring.
+    //
+    // This changes only WHICH candidates the layers see, never how any layer
+    // scores them: L1/L2 semantics, thresholds and the routing order are
+    // untouched. It is also self-correcting rather than sticky — the caller
+    // only reports a step as settled while the page still matches that step's
+    // own recorded post-action state, so a control that legitimately needs
+    // acting on again (its effect having been superseded) reappears as a
+    // candidate automatically.
+    const candidates = settledSteps.length
+      ? elements.filter((el) => !this._isSettledTarget(el, settledSteps))
+      : elements;
+    if (settledSteps.length) {
+      console.log(`[SP:DecisionRouter] Task progress: ${settledSteps.length} settled action(s) — ${elements.length - candidates.length} target(s) withheld, ${candidates.length} candidate(s) remain`);
+    }
 
     // ── Layer 1: Fast Local Path (Deterministic Heuristic / Exact Label Match) ──
     const tL1Start = Date.now();
-    const fastMatch = this._evalFastPath(goal, elements);
+    const fastMatch = this._evalFastPath(groundingIntent, candidates);
     const layer1Ms = Date.now() - tL1Start;
 
     if (fastMatch && fastMatch.score >= this.deterministicThreshold) {
+      const requiredGate = this._resolveRequiredFieldGate(goal, elements, fastMatch.element);
+      if (requiredGate) {
+        console.log(`[SP:DecisionRouter] Layer 1 target's form has an unmet required field — redirecting to elementId=${requiredGate.plan.steps[0].targetElement.elementId}`);
+        return { layer: 'ml_grounding', planResponse: requiredGate, layer1Ms, layer2Ms: 0, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+      }
       console.log(`[SP:DecisionRouter] Layer 1 FAST PATH matched (score=${fastMatch.score}):`, fastMatch.element.text || fastMatch.element.placeholder);
-      console.log(`[SP:V2:DEBUG] layer=deterministic reason=exact_label_match candidateCount=${elements.length} confidence=${fastMatch.score}`);
+      console.log(`[SP:V2:DEBUG] layer=deterministic reason=exact_label_match candidateCount=${candidates.length} confidence=${fastMatch.score}`);
       return {
         layer: 'deterministic',
         planResponse: this._buildPlanFromElement(goal, fastMatch.element, fastMatch.score, 'deterministic'),
@@ -97,13 +277,32 @@ export class DecisionRouter {
 
     // ── Layer 2: Small ML Grounding & Ranking Model ────────────────────────────
     const tL2Start = Date.now();
-    const ranked = UIGroundingService.rankElements(goal, elements);
+    const assessment = UIGroundingService.assessGrounding(groundingIntent, candidates);
+    const ranked = assessment.ranked;
     const layer2Ms = Date.now() - tL2Start;
 
-    if (ranked.length > 0 && ranked[0].score >= this.mlGroundingThreshold) {
+    // Clearing the score threshold says the winner matched well. It does NOT
+    // say the evidence was good enough to commit on — see assessGrounding.
+    // When it isn't, L2 hands the decision to the semantic tier below instead
+    // of acting on a confident guess. Thresholds and scoring are unchanged;
+    // this only decides whether L2 is entitled to STOP here.
+    // Only meaningful when L2 actually had a qualifying answer. Below the
+    // threshold it was never going to commit, so the cycle is an ordinary
+    // below-confidence escalation and keeps the ordinary L3 failure semantics
+    // — "could not choose between qualifying candidates" and "had no
+    // qualifying candidate" are different situations and must not be conflated.
+    const clearsThreshold = ranked.length > 0 && ranked[0].score >= this.mlGroundingThreshold;
+    const insufficientEvidence = clearsThreshold ? this._assessAmbiguity(assessment) : null;
+
+    if (clearsThreshold && !insufficientEvidence) {
       const top = ranked[0];
+      const requiredGate = this._resolveRequiredFieldGate(goal, elements, top.element);
+      if (requiredGate) {
+        console.log(`[SP:DecisionRouter] Layer 2 target's form has an unmet required field — redirecting to elementId=${requiredGate.plan.steps[0].targetElement.elementId}`);
+        return { layer: 'ml_grounding', planResponse: requiredGate, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+      }
       console.log(`[SP:DecisionRouter] Layer 2 ML GROUNDING matched (score=${top.score}):`, top.element.text || top.element.placeholder);
-      console.log(`[SP:V2:DEBUG] layer=ml_grounding reason=feature_vector_score candidateCount=${elements.length} confidence=${top.score}`);
+      console.log(`[SP:V2:DEBUG] layer=ml_grounding reason=feature_vector_score candidateCount=${candidates.length} confidence=${top.score}`);
       return {
         layer: 'ml_grounding',
         planResponse: this._buildPlanFromElement(goal, top.element, top.score, 'ml_grounding'),
@@ -115,21 +314,75 @@ export class DecisionRouter {
       };
     }
 
+    // ── Structural continuation of the settled action ──────────────────────────
+    // Lexical grounding has now failed to find the next action. Before paying
+    // for a reasoning model, check whether the state itself already determines
+    // it: an interaction that a settled action STARTED but did not finish has
+    // a continuation control defined by standard HTML, reachable without
+    // understanding the page's wording at all (see _resolveActionContinuation).
+    // Placed after L2 deliberately — a confident lexical match is still the
+    // better answer when one exists, and this must never pre-empt it.
+    const continuation = this._resolveActionContinuation(elements, settledSteps);
+    if (continuation) {
+      console.log(`[SP:DecisionRouter] Structural continuation of settled action -> elementId=${continuation.plan.steps[0].targetElement.elementId} (no model invoked)`);
+      return { layer: 'ml_grounding', planResponse: continuation, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
+    }
+
     // ── Layer 3: reasoning fallback (Cloud default, Local Qwen opt-in) ─────────
-    console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode}`);
-    console.log(`[SP:V2:DEBUG] layer=L3 reason=confidence_below_threshold candidateCount=${elements.length} executionMode=${this.executionMode}`);
-    const l3 = await this._runLayer3(goal, pageState, elements, options, ranked);
+    const l3Reason = insufficientEvidence
+      ? `lexical_evidence_insufficient(${insufficientEvidence})`
+      : 'confidence_below_threshold';
+    console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode} reason=${l3Reason}`);
+    console.log(`[SP:V2:DEBUG] layer=L3 reason=${l3Reason} candidateCount=${candidates.length} topScore=${assessment.topScore} margin=${assessment.margin.toFixed(3)} executionMode=${this.executionMode}`);
+    const l3 = await this._runLayer3(groundingIntent, pageState, candidates, options, ranked);
+
+    // Escalation on EVIDENCE means L2 could not tell its candidates apart — the
+    // tie is real, not a scoring artifact. If the reasoning tier then fails,
+    // there is no basis to choose, and picking the highest-sorted of several
+    // equally-scoring controls is a coin flip wearing a confidence score: on a
+    // menu of sibling actions it is as likely to trigger the wrong irreversible
+    // one as the right one. Unresolved ambiguity is reported as such, which
+    // routes into the clarification flow this app already has, instead of being
+    // laundered into a deterministic-looking answer.
+    //
+    // Only for this escalation reason. A genuine below-threshold miss has no
+    // tied candidates to be unsafe about and is unchanged.
+    if (insufficientEvidence && l3?.planResponse?.result !== 'OK') {
+      const options = ranked.slice(0, 5)
+        .map((r) => r.element.text || r.element.ariaLabel || r.element.placeholder || r.element.id)
+        .filter(Boolean);
+      console.log(`[SP:DecisionRouter] Reasoning tier failed after an evidence escalation (${insufficientEvidence}) — reporting unresolved ambiguity rather than guessing among ${options.length} candidate(s)`);
+      return {
+        layer: l3.layer,
+        planResponse: {
+          schemaVersion: '1',
+          result: 'NEEDS_USER',
+          state: 'ambiguous',
+          confidence: 0,
+          plannerSummary: options.length
+            ? `Several controls match this goal equally well: ${options.join(', ')}. Which one did you mean?`
+            : 'Could not determine the next action from this page.',
+          providerMetadata: { provider: l3.layer, model: 'none', latencyMs: 0 }
+        },
+        layer1Ms, layer2Ms,
+        qwenMs: l3.qwenMs ?? 0, cloudMs: l3.cloudMs ?? 0,
+        qwenFailureReason: l3.qwenFailureReason ?? null
+      };
+    }
 
     return { ...l3, layer1Ms, layer2Ms };
   }
 
   /**
-   * L3: exactly one Moondream VISUAL PERCEPTION attempt (only when
-   * executionMode === 'local-qwen', before Qwen — so it runs even when Qwen
-   * would have succeeded), then exactly one Qwen (text) attempt if vision
-   * didn't yield a usable, validated element, then exactly one Cloud attempt
-   * as final fallback/default. Never retries a provider and never bounces
-   * back and forth between them.
+   * L3 router: picks exactly ONE local provider per cycle — Moondream and
+   * Qwen are never both invoked in the same cycle. `ranked` (L2's own
+   * scoring, already computed by the caller) decides which: any candidate
+   * at all (even below L2's own threshold) means Qwen (text) is used; zero
+   * candidates means the DOM/text representation has nothing to reason
+   * over, so Moondream (visual perception) is used instead. Whichever one
+   * is chosen, on failure/unavailability the router falls straight through
+   * to Cloud — it does not then try the other local provider. Never retries
+   * a provider.
    */
   async _runLayer3(goal, pageState, elements, options, ranked = []) {
     const { signal, cloudContext = {} } = options;
@@ -147,17 +400,29 @@ export class DecisionRouter {
       return screenshot;
     };
 
-    // Local visual PERCEPTION (Moondream, privacy-vision Phase 2, corrected):
-    // tried first in local-qwen (local-first) mode, before Qwen, right after
-    // an L1/L2 miss — so it runs even when Qwen would have succeeded.
-    // LocalVisionAdapter.plan() returns a minimal perception result
-    // ({elementId, action, confidence, reason}), never a plan — it is not a
-    // second planner. The elementId is only ever trusted after being
-    // validated here against the CURRENT page-state element list; an
-    // elementId that isn't a real, currently-known element is treated
-    // exactly like a failure and falls through to Qwen/cloud, the same as
-    // any other unusable L3 result.
-    if (this.executionMode === 'local-qwen') {
+    // Router decision: a viable textual/DOM candidate exists whenever L2's
+    // own ranking found ANY element at all (score > 0.05, L2's own filter
+    // floor) — even if none cleared L2's 0.70 confidence threshold. That is
+    // the signal that text-based reasoning (Qwen) has something to work
+    // with; its absence is the signal that only visual perception
+    // (Moondream) could possibly help.
+    const hasViableTextCandidates = ranked.length > 0;
+    if (hasViableTextCandidates) {
+      const topCandidates = ranked.slice(0, 5)
+        .map((r) => `${r.element.id}(${(r.element.text || r.element.ariaLabel || r.element.placeholder || '').slice(0, 40)}):${r.score.toFixed(3)}`)
+        .join(', ');
+      console.log(`[SP:DecisionRouter] Layer 3 top candidates: ${topCandidates}`);
+    }
+
+    if (this.executionMode === 'local-qwen' && !hasViableTextCandidates) {
+      // Local visual PERCEPTION (Moondream): chosen only when the DOM/text
+      // representation offered zero candidates. LocalVisionAdapter.plan()
+      // returns a minimal perception result ({elementId, action, confidence,
+      // reason}), never a plan — it is not a second planner. The elementId
+      // is only ever trusted after being validated here against the CURRENT
+      // page-state element list; an elementId that isn't a real,
+      // currently-known element is treated exactly like a failure and falls
+      // through to Cloud (NOT to Qwen — see class-level router comment).
       const tVisionAvailStart = Date.now();
       let visionAvail;
       try {
@@ -165,33 +430,23 @@ export class DecisionRouter {
       } catch (err) {
         visionAvail = { available: false, reason: err?.message || 'availability_check_failed' };
       }
-      console.log(`[SP:DecisionRouter] Layer 3 Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
+      console.log(`[SP:DecisionRouter] Layer 3 router=vision (no text candidates) Moondream availability=${visionAvail.available} (${Date.now() - tVisionAvailStart}ms)`);
 
       if (visionAvail.available) {
         const tVisionStart = Date.now();
         try {
           const shot = await getScreenshotOnce();
-          // SIH 2026 demo latency fix: send Moondream only the most
-          // goal-relevant candidates (reusing the SAME ranking L2 already
-          // computed a moment ago — no extra scoring pass) instead of every
-          // element, shrinking its prompt/inference time. Validation below
-          // still checks the returned elementId against the FULL `elements`
-          // list, so this can only narrow what Moondream is offered, never
-          // what a valid response is allowed to reference.
-          const visionElements = ranked.length
-            ? ranked.slice(0, VISION_CANDIDATE_LIMIT).map((r) => r.element)
-            : elements;
           const perception = await this.localVisionAdapter.plan({
             schemaVersion: '1',
             goal,
             page: { url: pageState.url, title: pageState.title, screenshot: shot },
-            elements: visionElements
+            elements
           }, { signal });
           visionMs = Date.now() - tVisionStart;
 
           if (perception?.result === 'FAILED') {
             visionFailureReason = perception.error || perception.errorCode || 'vision_failed';
-            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) — falling back to Qwen/cloud`);
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION resolved FAILED (${visionFailureReason}, ${visionMs}ms) — falling back to cloud`);
           } else {
             // Grounding/safety gate: Moondream may only ever point at an
             // element PageStateService actually extracted this cycle. Any
@@ -200,9 +455,30 @@ export class DecisionRouter {
             const resolvedElement = elements.find((el) => el.id === perception.elementId);
             if (!resolvedElement) {
               visionFailureReason = 'invalid_element_id';
-              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" — rejected, falling back to Qwen/cloud`);
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION named an unknown/missing elementId="${perception.elementId}" — rejected, checking for a sole unlabeled interactive candidate before falling back to cloud`);
+              // Perception ran and named nothing usable — before paying for
+              // Cloud, check whether the page state itself already resolves
+              // this deterministically: if exactly one candidate is an
+              // unlabeled interactive control (the same generic shape a
+              // visually-only element has), that is almost certainly what
+              // perception was trying and failing to name. Two or more such
+              // candidates is genuine ambiguity — unchanged, still Cloud.
+              const soleCandidate = this._findSoleUnlabeledInteractiveCandidate(elements);
+              if (soleCandidate) {
+                console.log(`[SP:DecisionRouter] Layer 3 sole unlabeled interactive candidate resolved structurally -> elementId=${soleCandidate.id} (no model invoked)`);
+                return {
+                  layer: 'local_vision',
+                  planResponse: this._buildPlanFromElement(goal, soleCandidate, SOLE_UNLABELED_CANDIDATE_CONFIDENCE, 'local_vision'),
+                  qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason: null
+                };
+              }
             } else {
               console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION succeeded (${visionMs}ms) elementId=${perception.elementId}`);
+              // TEMPORARY DEBUG — remove after the SIH demo recording. Fires
+              // only on this exact success path: the local vision provider
+              // (Moondream) was actually invoked, returned a result, and that
+              // result resolved to a real element — not a guess/inference.
+              console.log(`SP LOCAL VISION → Moondream (${visionMs}ms) elementId=${perception.elementId} confidence=${perception.confidence ?? 'n/a'}`);
               return {
                 layer: 'local_vision',
                 planResponse: this._buildPlanFromElement(goal, resolvedElement, perception.confidence ?? 0.75, 'local_vision'),
@@ -213,18 +489,16 @@ export class DecisionRouter {
         } catch (err) {
           visionMs = Date.now() - tVisionStart;
           visionFailureReason = err?.message || 'vision_error';
-          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) — falling back to Qwen/cloud`);
+          console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION threw (${visionFailureReason}, ${visionMs}ms) — falling back to cloud`);
         }
       } else {
         visionFailureReason = visionAvail.reason || 'moondream_unavailable';
-        console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) — falling back to Qwen/cloud`);
+        console.log(`[SP:DecisionRouter] Layer 3 LOCAL VISION unavailable (${visionFailureReason}) — falling back to cloud`);
       }
-    }
-
-    // Local Qwen (text planner) — unchanged, now the second local attempt,
-    // tried whenever vision didn't already resolve the step (unavailable,
-    // failed, or an unusable elementId).
-    if (this.executionMode === 'local-qwen') {
+    } else if (this.executionMode === 'local-qwen' && hasViableTextCandidates) {
+      // Local Qwen (text planner): chosen whenever L2 found at least one
+      // candidate to reason over. On failure/unavailability, falls straight
+      // to Cloud — NOT to Moondream (see class-level router comment).
       const tAvailStart = Date.now();
       let avail;
       try {
@@ -232,16 +506,30 @@ export class DecisionRouter {
       } catch (err) {
         avail = { available: false, reason: err?.message || 'availability_check_failed' };
       }
-      console.log(`[SP:DecisionRouter] Layer 3 Qwen availability=${avail.available} (${Date.now() - tAvailStart}ms)`);
+      console.log(`[SP:DecisionRouter] Layer 3 router=qwen (${ranked.length} text candidate(s)) Qwen availability=${avail.available} (${Date.now() - tAvailStart}ms)`);
 
       if (avail.available) {
         const tQwenStart = Date.now();
         try {
+          // Reuse the SAME ranking L2 already computed a moment ago (no
+          // extra scoring pass) instead of Qwen's own raw DOM-order slice —
+          // the actually-relevant element must not be excluded from Qwen's
+          // candidate window just because it appears late in the DOM.
+          const qwenElements = ranked.length
+            ? ranked.slice(0, QWEN_CANDIDATE_LIMIT).map((r) => r.element)
+            : elements;
           const planResponse = await this.localQwenAdapter.plan({
             schemaVersion: '1',
             goal,
             page: { url: pageState.url, title: pageState.title },
-            elements
+            elements: qwenElements,
+            // What this task has already done. _buildQwenPrompt has always
+            // rendered a History line from this field, but nothing ever
+            // supplied it locally — so the one tier whose whole job is
+            // semantic reasoning was reasoning about a multi-step task with
+            // no idea which steps were already done, and could only re-derive
+            // the same first action. Same structure the cloud tier receives.
+            ...(cloudContext.executionHistory && { executionHistory: cloudContext.executionHistory })
           }, { signal });
           qwenMs = Date.now() - tQwenStart;
           // LocalQwenAdapter never throws on failure (timeout, unreachable, bad
@@ -253,7 +541,9 @@ export class DecisionRouter {
             qwenFailureReason = planResponse.error || planResponse.errorCode || 'qwen_failed';
             console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) — falling back to cloud once`);
           } else {
-            console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms)`);
+            const step = planResponse?.plan?.steps?.[0];
+            const t = step?.targetElement || {};
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? 'n/a'} phase=${step?.phase ?? 'n/a'} value=${JSON.stringify(t.value ?? '')}`);
             return { layer: 'local_qwen', planResponse, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
           }
         } catch (err) {
@@ -270,9 +560,10 @@ export class DecisionRouter {
     }
 
     // Cloud: the default L3 (executionMode==='cloud'), or the fallback after
-    // vision and Qwen have both failed/been unavailable. Screenshot is
-    // fetched here, lazily — only paid for when a cloud call is actually
-    // about to happen (or reused from the local-vision attempt above).
+    // whichever single local provider the router chose has failed/been
+    // unavailable. Screenshot is fetched here, lazily — only paid for when a
+    // cloud call is actually about to happen (or reused from the
+    // local-vision attempt above).
     const tCloudStart = Date.now();
     const shotForCloud = await getScreenshotOnce();
     const cloudRequest = {
@@ -296,6 +587,241 @@ export class DecisionRouter {
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Does this element correspond to the target of one of the given steps?
+   *
+   * Matches an element's own accessible label against the step's recorded
+   * intent/description using the exact string-containment convention the
+   * dedup guard in v2-task.js already uses, so "which element did that step
+   * act on" means the same thing everywhere. Element ids are deliberately NOT
+   * used: they are positional (`el_N`) and recomputed per extraction, so they
+   * are not stable across cycles — the label is.
+   *
+   * @param {object} el
+   * @param {object[]} steps
+   * @returns {boolean}
+   */
+  /**
+   * Is L2's ranking resting on evidence strong enough to ACT on?
+   *
+   * Returns a reason string when it is not (so the caller escalates to the
+   * semantic tier), or null when L2 may commit. Both criteria come from
+   * assessGrounding and are measured properties of the current candidate set,
+   * never a site, phrase or synonym rule. A single viable candidate is never
+   * treated as ambiguous — with no rival there is nothing to confuse it with.
+   *
+   * @param {{topScore:number, margin:number, rivals:number, unmatchedIntentTokens:string[]}} a
+   * @returns {string|null}
+   */
+  _assessAmbiguity(a) {
+    if (a.rivals <= 1) return null;
+
+    if (a.margin < AMBIGUITY_MARGIN) {
+      return `insufficient_margin:${a.margin.toFixed(3)}`;
+    }
+
+    // Words of the goal that appear nowhere on the page mean something is
+    // missing from the evidence ONLY when the winner is a control the user
+    // acts on. When the winner is a control that RECEIVES a value — a textbox,
+    // textarea or combobox — those words are not missing evidence at all: they
+    // are the value itself, and a value is not expected to be written on the
+    // page. scoreElement already says exactly this ("a typed value meant for a
+    // field rather than a label, e.g. a search query"), and treating that
+    // expected absence as a gap put a strongly grounded, clearly actionable
+    // field (measured 0.960) through the semantic tier and its timeout instead
+    // of acting on it. Structural test only — a control's own role/tag, the
+    // same distinction _buildPlanFromElement already draws. No site, phrase or
+    // synonym is consulted.
+    const top = a.ranked?.[0]?.element;
+    const receivesValue = !!top && (
+      ['textbox', 'combobox', 'searchbox', 'search'].includes(top.role) ||
+      ['input', 'textarea'].includes(top.tag)
+    );
+
+    // Unmatched goal vocabulary also only matters when something else is
+    // actually in contention. On its own it fires far too readily — a goal's
+    // verb is very often absent from the page's own words ("add ..." on a page
+    // that never says "add") — so a genuine rival is required too. Measured:
+    // the runner-up held 0.34 of the winner's score where the lexical pick was
+    // wrong, and 0.22 or less where it was right.
+    // ...and only while the ranking has not already discriminated. A goal's
+    // VERB is very often absent from a page's own words ("create ..." on a
+    // menu that only says "New ..."), so on its own this fires constantly. If
+    // the winner leads by a decisive margin there is no contest for the absent
+    // word to create, and escalating costs a model round-trip — measured at
+    // several seconds, and the single largest contributor to the delay a user
+    // actually feels — to re-derive an answer the ranking already had.
+    const contention = a.topScore > 0 ? (a.runnerUpScore / a.topScore) : 0;
+    if (!receivesValue && a.unmatchedIntentTokens.length > 0 &&
+        contention >= RIVAL_SHARE && a.margin < DECISIVE_MARGIN) {
+      return `unmatched_intent_vocabulary:${a.unmatchedIntentTokens.join(',')}@contention=${contention.toFixed(2)}`;
+    }
+    return null;
+  }
+
+  /**
+   * Structural, single-candidate fallback for when visual perception ran but
+   * named no usable element (null, or an id that doesn't match anything in
+   * the current page state). Not a second perception attempt and not a
+   * guess: it looks for exactly ONE candidate that is already, on its own
+   * metadata, an "unlabeled interactive control" — the same generic shape a
+   * visually-only icon button has — and only resolves when there is no
+   * ambiguity about which one that is.
+   *
+   * "Unlabeled interactive candidate" is determined ENTIRELY from existing
+   * pageState metadata, never from what the element is or looks like:
+   *   - an interactive role/tag (the same set PageStateService's own
+   *     extraction selector already recognizes as a control worth
+   *     extracting at all — see INTERACTIVE_ROLES/INTERACTIVE_TAGS above)
+   *   - no text, no ariaLabel, no placeholder, no value — nothing lexical
+   *     for L1/L2 to have matched it on, which is exactly why grounding and
+   *     visual perception both had nothing to name it with
+   *   - a valid element id and an existing, non-zero-area bbox — the two
+   *     concrete pieces of evidence that this is a real, located control on
+   *     the current page, not a phantom
+   *
+   * Returns the sole eligible element, or null when there are zero or two-or-
+   * more equally eligible candidates — ambiguity is left to the existing
+   * cloud fallback, never resolved by guessing between them.
+   *
+   * @param {object[]} elements - This cycle's full pageState.elements.
+   * @returns {object|null}
+   */
+  _findSoleUnlabeledInteractiveCandidate(elements) {
+    const eligible = (elements || []).filter((el) => {
+      if (!el || el.visible === false || el.enabled === false) return false;
+      if (!(INTERACTIVE_ROLES.has(el.role) || INTERACTIVE_TAGS.has(el.tag))) return false;
+      if ((el.text || '').trim() || (el.ariaLabel || '').trim() ||
+          (el.placeholder || '').trim() || (el.value || '').trim()) return false;
+      if (typeof el.id !== 'string' || !el.id) return false;
+      if (!el.bbox || !(el.bbox.width > 0) || !(el.bbox.height > 0)) return false;
+      return true;
+    });
+    return eligible.length === 1 ? eligible[0] : null;
+  }
+
+  _isSettledTarget(el, steps) {
+    const label = (el.text || el.placeholder || el.ariaLabel || '').trim().toLowerCase();
+    if (!label) return false;
+    return (steps || []).some((step) => {
+      const stepIntent = (step.intent || '').trim().toLowerCase();
+      const stepDesc   = (step.description || '').trim().toLowerCase();
+      return stepDesc.includes(label) || stepIntent.includes(label);
+    });
+  }
+
+  /**
+   * Required-field gate: before treating a resolved CLICK target as the next
+   * action, check whether its own form still has an empty required field.
+   *
+   * L1/L2 ground the goal's words against element labels — that is a lexical
+   * match, not a check of whether the form is actually fillable yet. A
+   * required field whose own label shares none of the goal's vocabulary
+   * (measured: "Repository name" scores 0 against "create a new repo" — no
+   * token in common at all, a limitation no threshold fixes) never becomes a
+   * candidate on lexical grounds, so nothing here stopped a submit control
+   * from winning even though the form it belongs to isn't ready to submit.
+   *
+   * The gate is structural, not lexical: the standard native `element.form`
+   * association (`formId`) plus the standard `required` HTML attribute — the
+   * same two signals a real browser already uses to refuse a premature submit.
+   * No site knowledge, no synonym, no phrase table.
+   *
+   * When a gate fires, the redirect reuses _buildPlanFromElement exactly as
+   * any other fill step: it extracts a value from the goal if one was stated,
+   * or leaves it empty. The guide model does not type on the user's behalf
+   * either way — an empty-value fill step highlights the field and waits for
+   * the user, which is already how ScreenPilot asks for input. No new
+   * clarification path is needed for this case.
+   *
+   * Only ever redirects TO the field, never invents a value FOR it, and only
+   * applies when the resolved target is not itself the field being asked for
+   * (an input target proceeds untouched — it IS the missing field).
+   *
+   * @param {string} goal
+   * @param {object[]} elements - This cycle's full pageState.elements.
+   * @param {object} candidate - L1/L2's own resolved target.
+   * @returns {object|null} A ready plan response redirected to the missing
+   *   field, or null when nothing gates the candidate.
+   */
+  _resolveRequiredFieldGate(goal, elements, candidate) {
+    const candidateIsInput = ['textbox', 'combobox'].includes(candidate.role) || ['input', 'textarea'].includes(candidate.tag);
+    if (candidateIsInput || !candidate.formId) return null;
+
+    const missing = (elements || []).find((el) =>
+      el.formId === candidate.formId &&
+      el.required &&
+      (['textbox', 'combobox'].includes(el.role) || ['input', 'textarea'].includes(el.tag)) &&
+      el.visible && el.enabled !== false &&
+      !(el.value || '').trim()
+    );
+    if (!missing) return null;
+
+    return this._buildPlanFromElement(goal, missing, 0.9, 'ml_grounding');
+  }
+
+  /**
+   * Structural continuation of an interaction a settled action STARTED but
+   * did not finish.
+   *
+   * Withholding settled targets (see route()) is enough whenever the next
+   * action is itself findable by grounding the goal — a newly revealed
+   * control usually shares the goal's own vocabulary. It is NOT enough when
+   * the continuation control's wording is unrelated to what remains of the
+   * goal: measured on a filled search form, the next control scored 0.450,
+   * below L2's threshold, so the cycle would fall through to a reasoning
+   * model for something the page structure already determines.
+   *
+   * HTML defines exactly one such relationship generically: a control that
+   * submits the form its filled field belongs to, via the standard native
+   * `element.form` association (surfaced as `formId` by
+   * page-state-service.js). That is what this resolves — no selector, no
+   * phrase, no site knowledge, and nothing specific to search.
+   *
+   * Requires BOTH:
+   *   (a) the field's live value is currently non-empty, AND
+   *   (b) a settled action of this task targeted that field
+   * — (a) alone is deliberately not enough: a field that merely had unrelated
+   * pre-existing content (a genuine "change the email to..." goal on a
+   * pre-filled field) must stay re-fillable, not be redirected to a submit
+   * control it was never asked to reach.
+   *
+   * @param {object[]} elements - This cycle's full pageState.elements.
+   * @param {object[]} settledSteps - Steps whose effect is the current state.
+   * @returns {object|null} A ready plan response, or null to fall through.
+   */
+  _resolveActionContinuation(elements, settledSteps) {
+    if (!settledSteps?.length) return null;
+
+    // The settled action's own target, located in the CURRENT state.
+    const candidate = (elements || []).find((el) => {
+      const isInput = ['textbox', 'combobox'].includes(el.role) || ['input', 'textarea'].includes(el.tag);
+      return isInput && el.formId && (el.value || '').trim() && this._isSettledTarget(el, settledSteps);
+    });
+    if (!candidate) return null;
+
+    const submitCandidates = elements.filter((el) =>
+      el.formId === candidate.formId &&
+      el.id !== candidate.id &&
+      el.visible && el.enabled !== false &&
+      (el.type === 'submit' || el.tag === 'button' || el.role === 'button')
+    );
+    if (!submitCandidates.length) return null;
+
+    // Prefer an explicit type="submit" control; with no explicit submit type,
+    // only act when there is exactly ONE unambiguous button in the same form
+    // — multiple same-form buttons with no explicit submit type isn't a safe
+    // enough generic signal to pick between them.
+    const target = submitCandidates.find((el) => el.type === 'submit') ||
+      (submitCandidates.length === 1 ? submitCandidates[0] : null);
+    if (!target) return null;
+
+    const candidateLabel = (candidate.text || candidate.placeholder || candidate.ariaLabel || '').trim();
+    const plan = this._buildPlanFromElement(candidateLabel, target, 0.9, 'ml_grounding');
+    plan.plan.steps[0].completionCondition = 'final';
+    return plan;
+  }
 
   _evalFastPath(goal, elements) {
     const normGoal = goal.trim().toLowerCase();
@@ -331,21 +857,55 @@ export class DecisionRouter {
 
   _buildPlanFromElement(goal, element, confidence, layer) {
     const isInput = ['textbox', 'combobox', 'search'].includes(element.role) || ['input', 'textarea'].includes(element.tag);
-    const label   = element.text || element.placeholder || element.ariaLabel || goal;
+    // The element's OWN accessible name ONLY — never falls back to the goal.
+    // This is deliberately kept separate from `displayLabel` below: it is the
+    // exact field the executor's DOMMatcher searches the live DOM by
+    // (targetElement.text), so it must describe what the element on the page
+    // actually IS, never what the user asked for. Previously this fell back
+    // to `goal` when the element had no text/placeholder/ariaLabel at all (a
+    // purely visual control, e.g. an icon-only button) — a fabricated label
+    // that became the literal (unmatchable) search key the executor tried
+    // and failed to find any element's text equal to. An empty string here
+    // is instead an honest, generic signal — element-agnostic, not specific
+    // to any one kind of control — that text-based matching cannot work for
+    // this target; see executor-engine.js's _resolveElement, which falls
+    // back to the element's own already-known `bbox` (below) in that case.
+    const elementOwnLabel = element.text || element.placeholder || element.ariaLabel || '';
+    // Human-readable only — description/intent/UI. Falls back to the goal so
+    // a step is never displayed with a blank name; this fallback is NOT
+    // copied into targetElement.text (see above), which is what keeps a
+    // human-facing label from ever being used as a DOM search key.
+    const displayLabel = elementOwnLabel || goal;
+    // L1/L2/vision are lexical/structural matchers, not semantic reasoners:
+    // they have no reliable, generic way to extract a user-provided value
+    // distinct from the goal (that is Qwen's job — see local-qwen-adapter.js's
+    // _formatPlanResponse, which builds its step the same way but with a real
+    // `value` when one was semantically extracted). `value` stays empty here
+    // by design, not as a special case — it keeps this step shape identical
+    // across every tier.
+    const value   = isInput ? extractRequestedValue(goal, displayLabel) : '';
     const action  = isInput ? 'fill_form' : 'navigate';
 
     const step = {
       id: 1,
-      description: `${isInput ? 'Fill' : 'Click'} '${label}'`,
-      intent: `${isInput ? 'fill' : 'click'}_${label}`,
+      description: value
+        ? `Type '${value}' into '${displayLabel}'`
+        : `${isInput ? 'Fill' : 'Click'} '${displayLabel}'`,
+      intent: `${isInput ? 'fill' : 'click'}_${displayLabel}`,
       phase: action,
       completionCondition: 'dom_change',
       targetElement: {
-        text: label,
+        text: elementOwnLabel,
         type: isInput ? 'input' : 'button',
-        intent: label,
+        intent: displayLabel,
+        value,
         elementId: element.id,
-        region: element.region ?? null
+        region: element.region ?? null,
+        // Already produced by PageStateService (getBoundingClientRect) and
+        // already used for vision candidate markers — forwarded here, not
+        // recomputed, so the executor has the same known on-page position to
+        // fall back to when targetElement.text is empty (see above).
+        bbox: element.bbox ?? null
       },
       // Provisional default — corrected centrally in v2-task.js's plan-loop enrichment
       // step, which looks the resolved element back up in PageStateService's element
@@ -358,7 +918,7 @@ export class DecisionRouter {
       schemaVersion: '1',
       result: 'OK',
       state: 'planned',
-      plannerSummary: `[Layer: ${layer}] Resolved target element '${label}' with confidence ${confidence}`,
+      plannerSummary: `[Layer: ${layer}] Resolved target element '${displayLabel}' with confidence ${confidence}`,
       confidence,
       plan: {
         goalType: 'action',

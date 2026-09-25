@@ -84,7 +84,11 @@ const {
   __getState,
   __getGeneration,
   __resetState,
+  __deriveSettledSteps,
+  __stepEffectStillHolds,
+  __isGoalConsumed,
 } = await import('../v2-task.js');
+const { DecisionRouter } = await import('../services/decision-router.js');
 
 const { SessionStore } = await import('../services/session-store.js');
 const { TaskState }    = await import('../shared/state-machine/transitions.js');
@@ -512,5 +516,214 @@ test('plan loop: budget exhaustion clears session without screenshot', async () 
     await SessionStore.load(TAB),
     null,
     'session must be cleared after budget exhaustion'
+  );
+});
+
+// ── Task progress: settling on the step's own effect ────────────────────────
+//
+// A completed action's effect outlives the exact page fingerprint it finished
+// under. Typing opens a suggestion list, a live region ticks, an image swaps a
+// label — the hash moves while the action stays just as done. Settling on
+// fingerprint equality alone un-settled finished steps, so the planner
+// rediscovered them and re-proposed a fill against a field that already held
+// the value. Synthetic controls only; no site, selector or phrase here.
+
+const FILL_STEP = {
+  description: "Type 'wireless mouse' into 'Search catalog'",
+  intent: 'fill_Search catalog',
+  completionCondition: 'dom_change',
+  targetLabel: 'Search catalog',
+  requestedValue: 'wireless mouse',
+  urlBefore: 'https://example.com/', urlAfter: 'https://example.com/',
+  domHashBefore: 'aaaa1111', domHashAfter: 'bbbb2222',
+};
+
+const FILLED_STATE = {
+  elements: [
+    { id: 'el_1', role: 'textbox', tag: 'input', text: 'Search catalog', value: 'wireless mouse', visible: true, enabled: true },
+    { id: 'el_2', role: 'button',  tag: 'button', text: 'Search', visible: true, enabled: true },
+  ],
+};
+
+test('settling: a completed fill survives unrelated page churn', () => {
+  const churned = { url: 'https://example.com/', domHash: 'cccc3333' };
+  assert.equal(__deriveSettledSteps([FILL_STEP], churned, FILLED_STATE).length, 1,
+    'incidental DOM change must not un-settle a finished action');
+});
+
+test('settling: the fingerprint path still works when the page is quiet', () => {
+  const quiet = { url: 'https://example.com/', domHash: 'bbbb2222' };
+  assert.equal(__deriveSettledSteps([FILL_STEP], quiet, FILLED_STATE).length, 1);
+  assert.equal(__deriveSettledSteps([FILL_STEP], quiet, null).length, 1,
+    'with no page state the original fingerprint behavior is unchanged');
+});
+
+test('settling: a fill whose effect was undone becomes plannable again', () => {
+  const cleared = { elements: [
+    { id: 'el_1', role: 'textbox', tag: 'input', text: 'Search catalog', value: '', visible: true, enabled: true },
+  ] };
+  const churned = { url: 'https://example.com/', domHash: 'cccc3333' };
+  assert.equal(__deriveSettledSteps([FILL_STEP], churned, cleared).length, 0);
+});
+
+test('settling: another control holding the value does not settle the step', () => {
+  const elsewhere = { elements: [
+    { id: 'el_9', role: 'textbox', tag: 'input', text: 'Some other field', value: 'wireless mouse', visible: true, enabled: true },
+  ] };
+  const churned = { url: 'https://example.com/', domHash: 'cccc3333' };
+  assert.equal(__deriveSettledSteps([FILL_STEP], churned, elsewhere).length, 0,
+    'effect evidence is tied to the control the step targeted');
+});
+
+test('settling: navigating away from the step\'s page does not keep it settled', () => {
+  const moved = { url: 'https://example.com/results', domHash: 'dddd4444' };
+  assert.equal(__deriveSettledSteps([FILL_STEP], moved, { elements: [] }).length, 0);
+});
+
+test('settling: steps with no value evidence keep the original fingerprint behavior', () => {
+  const clickStep = {
+    description: "Click 'Add new'", intent: 'click_Add new', completionCondition: 'dom_change',
+    targetLabel: 'Add new', requestedValue: '',
+    urlBefore: 'https://example.com/', urlAfter: 'https://example.com/',
+    domHashBefore: 'aaaa1111', domHashAfter: 'bbbb2222',
+  };
+  const same  = { url: 'https://example.com/', domHash: 'bbbb2222' };
+  const moved = { url: 'https://example.com/', domHash: 'cccc3333' };
+  assert.equal(__deriveSettledSteps([clickStep], same,  FILLED_STATE).length, 1);
+  assert.equal(__deriveSettledSteps([clickStep], moved, FILLED_STATE).length, 0);
+});
+
+test('settling: a control holding more than was typed still counts as done', () => {
+  const autocompleted = { elements: [
+    { id: 'el_1', role: 'textbox', tag: 'input', text: 'Search catalog', value: 'wireless mouse (wireless)', visible: true, enabled: true },
+  ] };
+  assert.equal(__stepEffectStillHolds(FILL_STEP, autocompleted), true);
+});
+
+
+// ── Task progress across navigation ─────────────────────────────────────────
+//
+// A navigating step finishes on a document that no longer exists. The fresh
+// page's content script records it, capturing the fingerprint the moment it
+// boots — but a real destination keeps rendering after that, so by the next
+// planning cycle the fingerprint has moved and the completed navigation
+// stopped counting as done. The control that caused it is usually global
+// chrome still present on the destination, so the planner re-grounded the
+// unchanged goal, found it again, and pointed back at the action it had just
+// completed. The transition itself is the durable evidence.
+//
+// Synthetic origins/labels only; no site, selector or phrase appears here.
+
+const NAV_STEP = {
+  description: "Click 'Open workspace menu'",
+  intent: 'click_Open workspace menu',
+  completionCondition: 'dom_change',
+  targetLabel: 'Open workspace menu',
+  requestedValue: '',
+  urlBefore: 'https://example.com/home',
+  urlAfter:  'https://example.com/workspace/new',
+  domHashBefore: 'aaaa1111',
+  domHashAfter:  'bbbb2222',   // captured at bootstrap, before deferred content renders
+};
+
+// The destination as it looks a moment later: more has rendered, so the
+// fingerprint no longer matches what bootstrap recorded.
+const DESTINATION_LATER = { url: 'https://example.com/workspace/new', domHash: 'cccc3333' };
+
+test('navigation: a completed navigation stays settled while we remain at its destination', () => {
+  assert.equal(__deriveSettledSteps([NAV_STEP], DESTINATION_LATER, { elements: [] }).length, 1,
+    'deferred rendering on the destination must not un-settle the navigation that produced it');
+});
+
+test('navigation: leaving the destination makes the control targetable again', () => {
+  const elsewhere = { url: 'https://example.com/somewhere-else', domHash: 'dddd4444' };
+  assert.equal(__deriveSettledSteps([NAV_STEP], elsewhere, { elements: [] }).length, 0,
+    'the transition is only evidence while it still holds');
+});
+
+test('navigation: a step that changed no URL is unaffected by the transition rule', () => {
+  // Same-page click (a menu opening). It keeps the fingerprint semantics it
+  // has always had, so nothing about in-page actions changes.
+  const samePage = { ...NAV_STEP, urlAfter: NAV_STEP.urlBefore };
+  const quiet   = { url: 'https://example.com/home', domHash: 'bbbb2222' };
+  const churned = { url: 'https://example.com/home', domHash: 'cccc3333' };
+  assert.equal(__deriveSettledSteps([samePage], quiet,   { elements: [] }).length, 1);
+  assert.equal(__deriveSettledSteps([samePage], churned, { elements: [] }).length, 0);
+});
+
+// ── Goal consumed: a finished task is not replanned into escalation ──────────
+//
+// After a successful action, isGoalSatisfied needs the goal's words to
+// reappear in the URL/page, and a successful submit rarely echoes all of them
+// (a "#submitted" fragment satisfies "submit" but never "profile"). The loop
+// then replanned the finished task, found zero text candidates once the
+// completed action was withheld, and escalated to visual perception and then
+// the cloud. These pin the generic rule that closes that gap. Synthetic
+// controls only; no site, selector or phrase.
+
+const consumedRouter = new DecisionRouter();
+const E = (id, role, tag, props) => ({ id, role, tag, visible: true, enabled: true, ...props });
+
+const SUBMIT_STEP = {
+  intent: 'click_Send Report', description: "Click 'Send Report'",
+  urlBefore: 'https://example.test/report', urlAfter: 'https://example.test/report#sent',
+};
+const AFTER_SUBMIT = { elements: [
+  E('el_1', 'textbox', 'input', { ariaLabel: 'Title', value: 'Q3' }),
+  E('el_2', 'textbox', 'input', { ariaLabel: 'Notes', value: 'ok' }),
+  E('el_3', 'button', 'button', { text: 'Send Report' }),
+] };
+
+test('goal consumed: after the only matching action succeeds, the task is complete', () => {
+  assert.equal(
+    __isGoalConsumed({ goal: 'send report' }, AFTER_SUBMIT, [SUBMIT_STEP], consumedRouter),
+    true,
+    'nothing left expresses the goal — completing beats escalating to vision/cloud',
+  );
+});
+
+test('goal consumed: a first cycle with no progress is never declared complete', () => {
+  // Protects the visual-question path: no completed step yet, so an empty
+  // ranking must still reach visual perception rather than "finish".
+  assert.equal(
+    __isGoalConsumed({ goal: 'what color is the background' }, AFTER_SUBMIT, [], consumedRouter),
+    false,
+  );
+});
+
+test('goal consumed: a remaining candidate that still grounds the goal keeps the task going', () => {
+  // Multi-step flow: the first action opened a menu, whose item still matches.
+  const menuStep = { intent: 'click_Add new', description: "Click 'Add new'",
+    urlBefore: 'https://example.test/w', urlAfter: 'https://example.test/w' };
+  const menuOpen = { elements: [
+    E('el_1', 'button', 'button', { text: 'Add new' }),
+    E('el_2', 'menuitem', 'a', { text: 'New payment method' }),
+  ] };
+  assert.equal(__isGoalConsumed({ goal: 'add a new payment method' }, menuOpen, [menuStep], consumedRouter), false);
+});
+
+test('goal consumed: a pending structural continuation keeps the task going', () => {
+  // A filled field whose form still has an unclicked submit control: the
+  // continuation must run, even though no remaining control matches lexically.
+  const fillStep = { intent: 'fill_Query', description: "Type 'widgets' into 'Query'",
+    targetLabel: 'Query', requestedValue: 'widgets',
+    urlBefore: 'https://example.test/', urlAfter: 'https://example.test/' };
+  const filled = { elements: [
+    E('el_1', 'textbox', 'input', { ariaLabel: 'Query', value: 'widgets', formId: 'f0' }),
+    E('el_2', 'button', 'button', { text: 'Go', type: 'submit', formId: 'f0' }),
+  ] };
+  assert.equal(__isGoalConsumed({ goal: 'look up widgets' }, filled, [fillStep], consumedRouter), false,
+    'a fill awaiting its submit is not finished');
+});
+
+test('goal consumed: clarifications are part of what must be consumed', () => {
+  // The user clarified toward a control that is still on the page — not done.
+  const state = { elements: [
+    E('el_1', 'button', 'button', { text: 'Send Report' }),
+    E('el_2', 'button', 'button', { text: 'Archive Report' }),
+  ] };
+  assert.equal(
+    __isGoalConsumed({ goal: 'send report', clarifications: [{ text: 'archive it' }] }, state, [SUBMIT_STEP], consumedRouter),
+    false,
   );
 });

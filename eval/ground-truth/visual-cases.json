@@ -1,0 +1,96 @@
+{
+  "description": "Visual-context benchmark. MANUALLY ENTERED GROUND TRUTH: 'expectedTargetId' is the id of the element a correct agent must highlight for 'goal' (null = no correct target exists on the page; the correct behaviour is to highlight nothing). Fixtures are generic synthetic pages; ScreenPilot receives no knowledge of them. 'html' is the <body> content; 'htmlFile' loads a whole page from the repo instead.",
+  "cases": [
+    {
+      "id": "labelled-submit",
+      "category": "labelled",
+      "goal": "Click Submit Profile",
+      "expectedTargetId": "submit-profile",
+      "html": "<h1>Student Profile</h1><form onsubmit='return false'><label for='fullname'>Full name</label><input id='fullname'><label for='city'>City</label><input id='city'><div class='row'><button id='submit-profile' type='button'>Submit Profile</button><button id='cancel-btn' type='button' class='ghost'>Cancel</button></div></form>"
+    },
+    {
+      "id": "labelled-nav-link",
+      "category": "labelled",
+      "goal": "Open the settings page",
+      "expectedTargetId": "nav-settings",
+      "html": "<nav class='topnav'><a id='nav-home' href='#home'>Home</a><a id='nav-projects' href='#projects'>Projects</a><a id='nav-settings' href='#settings'>Settings</a><a id='nav-help' href='#help'>Help</a></nav><main><h1>Dashboard</h1><p>Welcome back.</p></main>"
+    },
+    {
+      "id": "labelled-search-input",
+      "category": "labelled",
+      "goal": "Search for artificial intelligence",
+      "expectedTargetId": "search-input",
+      "html": "<header class='row'><strong>Encyclopedia</strong><input id='search-input' type='search' placeholder='Search the encyclopedia'><button id='search-btn' type='button'>Search</button><a id='lang-link' href='#lang'>English</a></header><main><h1>Main page</h1><p>Featured article of the day.</p></main>"
+    },
+    {
+      "id": "labelled-sidebar-paraphrase",
+      "category": "labelled",
+      "goal": "I want to download my latest invoice",
+      "expectedTargetId": "nav-billing",
+      "html": "<div class='row'><aside class='sidebar'><a id='nav-profile' href='#p'>Profile</a><a id='nav-billing' href='#b'>Billing and invoices</a><a id='nav-notifications' href='#n'>Notifications</a><a id='nav-security' href='#s'>Security</a></aside><main><h1>Account</h1><p>Manage your account.</p></main></div>"
+    },
+    {
+      "id": "icon-warning-demo-page",
+      "category": "icon_only",
+      "goal": "Click the button with the warning icon",
+      "expectedTargetId": "warning-btn",
+      "htmlFile": "node_modules/privacy-demo.html"
+    },
+    {
+      "id": "icon-single-svg-gear",
+      "category": "icon_only",
+      "goal": "Click the settings gear icon",
+      "expectedTargetId": "gear-btn",
+      "html": "<nav class='topnav'><a id='nav-home' href='#home'>Home</a><a id='nav-reports' href='#reports'>Reports</a><button id='gear-btn' type='button' class='icon'><svg width='22' height='22' viewBox='0 0 24 24'><circle cx='12' cy='12' r='3.2' fill='none' stroke='#333' stroke-width='2'/><path d='M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1' stroke='#333' stroke-width='2'/></svg></button></nav><main><h1>Reports</h1><p>Quarterly summary.</p></main>"
+    },
+    {
+      "id": "icon-two-svg-trash",
+      "category": "icon_only",
+      "goal": "Click the trash can icon",
+      "expectedTargetId": "trash-btn",
+      "html": "<h1>Saved item</h1><p>Blue ceramic mug</p><div class='row'><button id='heart-btn' type='button' class='icon'><svg width='22' height='22' viewBox='0 0 24 24'><path d='M12 21s-7-4.5-9.5-9A5 5 0 0 1 12 6a5 5 0 0 1 9.5 6c-2.5 4.5-9.5 9-9.5 9z' fill='#e0245e'/></svg></button><button id='trash-btn' type='button' class='icon'><svg width='22' height='22' viewBox='0 0 24 24'><path d='M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14' fill='none' stroke='#333' stroke-width='2'/></svg></button></div>"
+    },
+    {
+      "id": "visual-color-swatch",
+      "category": "visual",
+      "goal": "Click the green square",
+      "expectedTargetId": "swatch-green",
+      "html": "<h1>Pick a colour</h1><div class='row'><button id='swatch-red' type='button' class='swatch' style='background:#d32f2f'></button><button id='swatch-green' type='button' class='swatch' style='background:#2e7d32'></button><button id='swatch-blue' type='button' class='swatch' style='background:#1565c0'></button></div>"
+    },
+    {
+      "id": "visual-big-blue-button",
+      "category": "visual",
+      "goal": "Click the big blue button",
+      "expectedTargetId": "continue-btn",
+      "html": "<h1>Checkout</h1><p>Review your order before paying.</p><div class='row'><a id='back-link' href='#back' class='small'>Back</a><button id='continue-btn' type='button' style='background:#1565c0;color:#fff;font-size:22px;padding:18px 48px;border:none;border-radius:8px'>Continue</button></div>"
+    },
+    {
+      "id": "visual-duplicate-label-by-colour",
+      "category": "visual",
+      "goal": "Click the red Delete button",
+      "expectedTargetId": "delete-danger",
+      "html": "<h1>Repository settings</h1><section><h2>Draft</h2><button id='delete-draft' type='button'>Delete</button></section><section><h2>Danger zone</h2><button id='delete-danger' type='button' style='background:#d32f2f;color:#fff;border:none;padding:8px 16px'>Delete</button></section>"
+    },
+    {
+      "id": "negative-missing-control",
+      "category": "negative",
+      "goal": "Click the logout button",
+      "expectedTargetId": null,
+      "html": "<nav class='topnav'><a id='nav-home' href='#home'>Home</a><a id='nav-profile' href='#profile'>Profile</a><a id='nav-settings' href='#settings'>Settings</a></nav><main><h1>Home</h1><p>Nothing to see here.</p></main>"
+    },
+    {
+      "id": "negative-missing-colour",
+      "category": "negative",
+      "goal": "Click the yellow square",
+      "expectedTargetId": null,
+      "html": "<h1>Pick a colour</h1><div class='row'><button id='swatch-red' type='button' class='swatch' style='background:#d32f2f'></button><button id='swatch-blue' type='button' class='swatch' style='background:#1565c0'></button></div>"
+    },
+    {
+      "id": "negative-unrelated-goal",
+      "category": "negative",
+      "goal": "Book a flight to Delhi",
+      "expectedTargetId": null,
+      "html": "<h1>Recipe: Masala chai</h1><p>Ingredients and steps.</p><div class='row'><button id='print-btn' type='button'>Print recipe</button><button id='share-btn' type='button'>Share</button></div>"
+    }
+  ]
+}

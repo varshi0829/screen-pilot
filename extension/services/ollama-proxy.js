@@ -6,28 +6,45 @@
 // messages. Touches no chrome.* APIs — pure fetch/AbortController/setTimeout — so
 // it's unit-testable in Node with a stubbed global fetch.
 
-// Must match local-qwen-adapter.js's QWEN_GENERATE_TIMEOUT_MS — this is the
-// proxied path actually used inside the extension. See that file for the
-// real-hardware cold/warm latency measurements behind this value.
-const OLLAMA_GENERATE_TIMEOUT_MS = 15_000;
+// Safe default — used whenever a caller doesn't supply message.timeoutMs, or
+// supplies something unusable (see resolveTimeoutMs). Previously this was the
+// ONLY timeout in effect for every proxied request regardless of which local
+// adapter (Qwen vs Moondream) sent it, since each adapter's own *_GENERATE_TIMEOUT_MS
+// constant only applied to its direct-fetch fallback path, never to the
+// proxied path actually used in the real extension. Callers now pass their
+// own configured timeout per request (see resolveTimeoutMs below).
+// Kept in step with local-qwen-adapter.js's QWEN_GENERATE_TIMEOUT_MS — see the
+// re-benchmark recorded there. Only applies when a caller sends no timeoutMs
+// of its own; both local adapters send theirs explicitly.
+const OLLAMA_GENERATE_TIMEOUT_MS = 45_000;
 
 const activeOllamaRequests = new Map();
+
+// Accepts only a finite, positive number — anything else (missing, NaN,
+// zero, negative, a string, etc.) falls back to the safe default rather than
+// producing a broken/instant/never-firing timeout.
+function resolveTimeoutMs(candidate) {
+  return (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0)
+    ? candidate
+    : OLLAMA_GENERATE_TIMEOUT_MS;
+}
 
 export async function handleOllamaGenerate(message) {
   const reqId = message.reqId || `req_bg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const url = message.url || 'http://127.0.0.1:11434/api/generate';
+  const timeoutMs = resolveTimeoutMs(message.timeoutMs);
   const t0 = Date.now();
 
   const controller = new AbortController();
   activeOllamaRequests.set(reqId, controller);
 
   console.log(`[SP:V2:DEBUG] [Background] controller_created reqId=${reqId} signalAborted=${controller.signal.aborted}`);
-  console.log(`[SP:V2:DEBUG] [Background] request_lifecycle status=start reqId=${reqId} url=${url}`);
+  console.log(`[SP:V2:DEBUG] [Background] request_lifecycle status=start reqId=${reqId} url=${url} timeoutMs=${timeoutMs}`);
 
   const timeoutId = setTimeout(() => {
-    console.log(`[SP:V2:DEBUG] [Background] abort_reason reqId=${reqId} reason=ollama_timeout_${OLLAMA_GENERATE_TIMEOUT_MS}ms`);
-    controller.abort(`ollama_timeout_${OLLAMA_GENERATE_TIMEOUT_MS}ms`);
-  }, OLLAMA_GENERATE_TIMEOUT_MS);
+    console.log(`[SP:V2:DEBUG] [Background] abort_reason reqId=${reqId} reason=ollama_timeout_${timeoutMs}ms`);
+    controller.abort(`ollama_timeout_${timeoutMs}ms`);
+  }, timeoutMs);
 
   try {
     console.log(`[SP:V2:DEBUG] [Background] signal_start reqId=${reqId} aborted=${controller.signal.aborted}`);
@@ -89,4 +106,10 @@ export async function handleOllamaCancel(message) {
 // Test-only accessor — never used by background.js itself.
 export function __getActiveRequestCount() {
   return activeOllamaRequests.size;
+}
+
+// Test-only accessor for the validation/fallback logic — never used by
+// background.js itself (handleOllamaGenerate calls the private function directly).
+export function __resolveTimeoutMsForTests(candidate) {
+  return resolveTimeoutMs(candidate);
 }
