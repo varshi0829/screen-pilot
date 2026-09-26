@@ -828,13 +828,11 @@ ${lines.join("\n")}`);
     /**
      * @param {object} [options]
      * @param {string} [options.baseUrl]    - Backend base URL (defaults to Vercel deployment)
-     * @param {string} [options.apiKey]     - User-supplied Gemini key (BYOK); omit to use shared key
      * @param {string} [options.sessionId]  - Session identifier for rate limiting and telemetry
      */
-    constructor({ baseUrl = DEFAULT_BASE_URL, apiKey, sessionId } = {}) {
+    constructor({ baseUrl = DEFAULT_BASE_URL, sessionId } = {}) {
       super();
       this._baseUrl = baseUrl.replace(/\/$/, "");
-      this._apiKey = apiKey ?? null;
       this._sessionId = sessionId ?? crypto.randomUUID().slice(0, 16);
     }
     get name() {
@@ -939,7 +937,6 @@ ${lines.join("\n")}`);
         "Content-Type": "application/json",
         "X-Session-ID": this._sessionId
       };
-      if (this._apiKey) headers["X-OpenRouter-Key"] = this._apiKey;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3e4);
       const callerSignal = options?.signal;
@@ -1004,85 +1001,200 @@ ${lines.join("\n")}`);
     }
   };
 
+  // extension/lib/pii-detector.js
+  var SensitiveType = Object.freeze({
+    PASSWORD: "password",
+    OTP: "otp",
+    EMAIL: "email",
+    PHONE: "phone",
+    CREDIT_CARD: "credit_card",
+    SSN: "ssn",
+    BANK_ACCOUNT: "bank_account",
+    ADDRESS: "address",
+    DATE_OF_BIRTH: "date_of_birth",
+    JWT: "jwt",
+    API_KEY: "api_key",
+    SECRET: "secret"
+  });
+  var T = SensitiveType;
+  var INPUT_TYPE_MAP = {
+    password: T.PASSWORD,
+    email: T.EMAIL,
+    tel: T.PHONE
+  };
+  var AUTOCOMPLETE_MAP = {
+    "current-password": T.PASSWORD,
+    "new-password": T.PASSWORD,
+    "one-time-code": T.OTP,
+    "cc-number": T.CREDIT_CARD,
+    "cc-csc": T.CREDIT_CARD,
+    "cc-exp": T.CREDIT_CARD,
+    "cc-exp-month": T.CREDIT_CARD,
+    "cc-exp-year": T.CREDIT_CARD,
+    "cc-name": T.CREDIT_CARD,
+    "email": T.EMAIL,
+    "tel": T.PHONE,
+    "tel-national": T.PHONE,
+    "street-address": T.ADDRESS,
+    "address-line1": T.ADDRESS,
+    "address-line2": T.ADDRESS,
+    "postal-code": T.ADDRESS,
+    "bday": T.DATE_OF_BIRTH,
+    "ssn": T.SSN
+  };
+  var LABEL_RULES = [
+    [/\b(?:password|passcode)\b/i, T.PASSWORD],
+    [/\b(?:otp|one[- ]time[- ]code)\b/i, T.OTP],
+    [/\b(?:cvv|cvc|security\s*code|card\s*number|credit\s*card|debit\s*card)\b/i, T.CREDIT_CARD],
+    [/\b(?:ssn|social\s*security)\b/i, T.SSN],
+    [/\b(?:routing\s*number|account\s*number|iban)\b/i, T.BANK_ACCOUNT],
+    [/\b(?:api\s*key|secret\s*key|private\s*key|client\s*secret)\b/i, T.API_KEY],
+    [/\b(?:auth\s*token|access\s*token|pin\s*code)\b/i, T.SECRET]
+  ];
+  function byInputType(type) {
+    return INPUT_TYPE_MAP[String(type || "").toLowerCase()] ?? null;
+  }
+  function byAutocomplete(autocomplete) {
+    return AUTOCOMPLETE_MAP[String(autocomplete || "").toLowerCase()] ?? null;
+  }
+  function byLabel(...strings) {
+    for (const raw of strings) {
+      if (typeof raw !== "string" || !raw) continue;
+      const s = raw.replace(/[_-]+/g, " ");
+      for (const [re, type] of LABEL_RULES) {
+        if (re.test(s)) return type;
+      }
+    }
+    return null;
+  }
+  var JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
+  var API_KEY_RES = [
+    /\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/g,
+    // OpenAI / OpenRouter / Anthropic style
+    /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    // Google API key
+    /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
+    // GitHub tokens
+    /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+    /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+    // Slack
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    // AWS access key id
+    /\bglpat-[A-Za-z0-9_-]{20,}/g,
+    // GitLab
+    /\bnpm_[A-Za-z0-9]{36}\b/g,
+    // npm
+    /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/g
+    // Authorization header value
+  ];
+  var PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+  var ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|(?:access|auth|refresh|id)[_-]?token|token)\b\s*[:=]\s*["']?([^\s"'&;,<>]{6,})/gid;
+  var SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
+  var CARD_RE = /\b\d(?:[ -]?\d){12,18}\b/g;
+  var SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+  var EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  var PHONE_RES = [
+    /(?<![\w])(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}(?!\d)/g,
+    /(?<![\w])\+\d[\d ()-]{7,15}\d(?!\d)/g
+  ];
+  function isLuhnValid(digits) {
+    const s = String(digits).replace(/\D/g, "");
+    if (s.length < 13 || s.length > 19) return false;
+    let sum = 0;
+    let dbl = false;
+    for (let i = s.length - 1; i >= 0; i--) {
+      let n = s.charCodeAt(i) - 48;
+      if (dbl) {
+        n *= 2;
+        if (n > 9) n -= 9;
+      }
+      sum += n;
+      dbl = !dbl;
+    }
+    return sum % 10 === 0;
+  }
+  function assignmentType(keyName) {
+    if (/pass|pwd/i.test(keyName)) return T.PASSWORD;
+    if (/key/i.test(keyName)) return T.API_KEY;
+    return T.SECRET;
+  }
+  function findPII(text) {
+    if (typeof text !== "string" || !text) return [];
+    const spans = [];
+    const overlaps = (s, e) => spans.some((x) => s < x.end && e > x.start);
+    const add = (type, start, end) => {
+      if (end > start && !overlaps(start, end)) spans.push({ type, start, end });
+    };
+    const scan = (re, type, accept) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (!accept || accept(m[0])) add(type, m.index, m.index + m[0].length);
+        if (m[0].length === 0) re.lastIndex++;
+      }
+    };
+    const scanAssignments = (re, typeOf) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const [start, end] = m.indices[2];
+        add(typeOf(m[1]), start, end);
+      }
+    };
+    scan(PRIVATE_KEY_RE, T.SECRET);
+    scan(JWT_RE, T.JWT);
+    API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
+    scanAssignments(ASSIGNMENT_RE, assignmentType);
+    scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
+    scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
+    scan(SSN_RE, T.SSN);
+    scan(EMAIL_RE, T.EMAIL);
+    PHONE_RES.forEach((re) => scan(re, T.PHONE));
+    return spans.sort((a, b) => a.start - b.start);
+  }
+  function detectType(text) {
+    const spans = findPII(text);
+    return spans.length ? spans[0].type : null;
+  }
+  function redactText(text, replacement = "[REDACTED]") {
+    if (typeof text !== "string" || !text) return text;
+    const spans = findPII(text);
+    if (!spans.length) return text;
+    let out = "";
+    let last = 0;
+    for (const s of spans) {
+      out += text.slice(last, s.start) + replacement;
+      last = s.end;
+    }
+    return out + text.slice(last);
+  }
+  function classifyElement(el) {
+    if (!el) return null;
+    return byInputType(el.type) || byAutocomplete(el.autocomplete) || byLabel(el.placeholder, el.ariaLabel, el.name, el.id, el.label) || detectType(el.value) || detectType(el.text) || null;
+  }
+  var SENSITIVE_PARAM_RE = /^(?:token|access[_-]?token|id[_-]?token|refresh[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|pwd|auth|authorization|session|session[_-]?id|sessionid|sid|code|otp|signature|sig|jwt|bearer|ticket|email|e-?mail|phone|mobile|tel)$/i;
+  var SENSITIVE_KEY_RE = /^(?:password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|bearer|jwt|private[_-]?key|client[_-]?secret)$/i;
+  function isSensitiveParamName(name) {
+    return SENSITIVE_PARAM_RE.test(String(name || ""));
+  }
+  function isSensitiveKeyName(name) {
+    return SENSITIVE_KEY_RE.test(String(name || ""));
+  }
+
   // extension/lib/privacy-sanitizer.js
   var REDACTED = "[REDACTED]";
-  var SENSITIVE_INPUT_TYPES = /* @__PURE__ */ new Set(["password", "email", "tel"]);
-  var SENSITIVE_AUTOCOMPLETE = /* @__PURE__ */ new Set([
-    "current-password",
-    "new-password",
-    "one-time-code",
-    "cc-number",
-    "cc-csc",
-    "cc-exp",
-    "cc-exp-month",
-    "cc-exp-year",
-    "cc-name",
-    "email",
-    "tel",
-    "tel-national",
-    "street-address",
-    "address-line1",
-    "address-line2",
-    "postal-code",
-    "bday",
-    "ssn"
-  ]);
-  var SENSITIVE_LABEL_PATTERN = new RegExp(
-    "\\b(" + [
-      "password",
-      "passcode",
-      "pin\\s*code",
-      "otp",
-      "one[- ]time[- ]code",
-      "cvv",
-      "cvc",
-      "security\\s*code",
-      "card\\s*number",
-      "credit\\s*card",
-      "ssn",
-      "social\\s*security",
-      "routing\\s*number",
-      "account\\s*number",
-      "api\\s*key",
-      "secret\\s*key",
-      "auth\\s*token"
-    ].join("|") + ")\\b",
-    "i"
-  );
-  var PII_PATTERNS = [
-    { name: "email", re: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
-    { name: "ssn", re: /\b\d{3}-\d{2}-\d{4}\b/ },
-    { name: "credit_card", re: /\b(?:\d[ -]?){13,19}\b/ },
-    { name: "phone", re: /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/ }
-  ];
-  function isSensitiveInputType(type) {
-    return SENSITIVE_INPUT_TYPES.has(String(type || "").toLowerCase());
-  }
-  function isSensitiveAutocomplete(autocomplete) {
-    return SENSITIVE_AUTOCOMPLETE.has(String(autocomplete || "").toLowerCase());
-  }
-  function hasSensitiveLabelSignal(...strings) {
-    return strings.some((s) => typeof s === "string" && s && SENSITIVE_LABEL_PATTERN.test(s));
-  }
-  function containsPII(text) {
-    if (!text || typeof text !== "string") return false;
-    return PII_PATTERNS.some((p) => p.re.test(text));
-  }
   function isSensitiveElement(el) {
-    if (!el) return false;
-    if (isSensitiveInputType(el.type)) return true;
-    if (isSensitiveAutocomplete(el.autocomplete)) return true;
-    if (hasSensitiveLabelSignal(el.placeholder, el.ariaLabel)) return true;
-    if (containsPII(el.value) || containsPII(el.text)) return true;
-    return false;
+    return classifyElement(el) !== null;
   }
   function sanitizeElement(el) {
-    if (!isSensitiveElement(el)) return el;
+    const sensitiveType = classifyElement(el);
+    if (!sensitiveType) return el;
     return {
       ...el,
       text: el.text ? REDACTED : el.text,
       value: el.value ? REDACTED : el.value,
-      sensitive: true
+      sensitive: true,
+      sensitiveType
     };
   }
   function sanitizeElements(elements) {
@@ -1096,6 +1208,7 @@ ${lines.join("\n")}`);
   var PrivacySanitizer = {
     REDACTED,
     isSensitiveElement,
+    getSensitiveType: classifyElement,
     sanitizeElement,
     sanitizeElements,
     getSensitiveRegions
@@ -1384,12 +1497,71 @@ ${lines.join("\n")}`);
     globalThis.module.exports = UIGroundingService;
   }
 
+  // extension/lib/compact-page-state.js
+  var DEFAULT_MAX_ELEMENTS = 150;
+  var MAX_NAME_LENGTH = 60;
+  function truncate(s) {
+    return s.length > MAX_NAME_LENGTH ? s.slice(0, MAX_NAME_LENGTH) : s;
+  }
+  function bestName(el, sensitiveType) {
+    if (sensitiveType) {
+      const label = el.placeholder || el.ariaLabel || "";
+      return label ? truncate(label) : PrivacySanitizer.REDACTED;
+    }
+    return truncate(el.text || el.placeholder || el.ariaLabel || "");
+  }
+  function toCompactElement(el) {
+    const sensitiveType = PrivacySanitizer.getSensitiveType(el);
+    return {
+      id: el.id,
+      role: el.role,
+      name: bestName(el, sensitiveType),
+      type: el.tag,
+      sensitive: sensitiveType !== null,
+      sensitiveType
+    };
+  }
+  function toCompactPageState(pageState, { maxElements = DEFAULT_MAX_ELEMENTS } = {}) {
+    const elements = Array.isArray(pageState?.elements) ? pageState.elements : [];
+    const visibleInteractiveElements = [];
+    for (const el of elements) {
+      if (!el || el.visible === false || el.enabled === false) continue;
+      visibleInteractiveElements.push(toCompactElement(el));
+      if (visibleInteractiveElements.length >= maxElements) break;
+    }
+    return {
+      url: pageState?.url ?? "",
+      title: pageState?.title ?? "",
+      visibleInteractiveElements
+    };
+  }
+  function estimatePayloadBytes(value) {
+    try {
+      return new TextEncoder().encode(JSON.stringify(value)).length;
+    } catch {
+      return 0;
+    }
+  }
+  function estimateCompactionSavings(pageState, options) {
+    const compact = toCompactPageState(pageState, options);
+    const rawBytes = estimatePayloadBytes(pageState?.elements ?? []);
+    const compactBytes = estimatePayloadBytes(compact.visibleInteractiveElements);
+    return {
+      rawElementCount: Array.isArray(pageState?.elements) ? pageState.elements.length : 0,
+      compactElementCount: compact.visibleInteractiveElements.length,
+      rawBytes,
+      compactBytes,
+      reductionPct: rawBytes > 0 ? Math.round((1 - compactBytes / rawBytes) * 100) : 0
+    };
+  }
+
   // extension/providers/local-qwen-adapter.js
   var DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
   var DEFAULT_MODEL = "qwen2.5-coder:7b";
   var DEFAULT_KEEP_ALIVE = "5m";
   var DEFAULT_KEEP_ALIVE_MS = 5 * 60 * 1e3;
   var QWEN_GENERATE_TIMEOUT_MS = 45e3;
+  var VALID_ACTIONS = /* @__PURE__ */ new Set(["click", "fill", "select", "navigate", "finish"]);
   var QWEN_AVAILABILITY_TIMEOUT_MS = 2500;
   var LocalQwenAdapter = class extends BackendAdapter {
     /**
@@ -1655,11 +1827,10 @@ ${lines.join("\n")}`);
       const page = request.page ?? {};
       const history2 = request.executionHistory?.completedSteps ?? [];
       const elements = request.elements ?? [];
-      const compactElements = elements.slice(0, 25).map((e) => ({
-        id: e.id,
-        role: e.role,
-        text: e.text || e.ariaLabel || e.placeholder || ""
-      }));
+      const compactElements = elements.slice(0, 25).map((e) => {
+        const c = toCompactElement(e);
+        return c.sensitive ? { id: c.id, role: c.role, text: c.name, sensitive: true } : { id: c.id, role: c.role, text: e.text || e.ariaLabel || e.placeholder || "" };
+      });
       return `Goal: "${request.goal}"
 Page: ${page.title || ""} (${page.url || ""})
 ${history2.length ? `History: ${history2.map((h) => h.description).join(" -> ")}` : ""}
@@ -1673,16 +1844,22 @@ Distinguish two different things:
 - TARGET: which element (by id, from the list above) to act on. An
   element's own text/placeholder/label is metadata describing that control \u2014
   it is never something the user typed.
-- VALUE: only when the action is "type" \u2014 the actual content the user wants
+- VALUE: only when the action is "fill" \u2014 the actual content the user wants
   entered, understood from the goal's own meaning. It is never the target
   element's own label, and never the goal sentence itself. For any other
-  action (click/select/navigate/finish), value must be an empty string.
+  action (click/select/navigate/finish), value must be null. Never give a
+  value for an element marked "sensitive": true \u2014 use null.
+- "elementId" MUST be copied exactly from the list above. Never invent one.
 
 Return JSON ONLY:
-{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","value":"","confidence":0.95}`;
+{"action":"click"|"fill"|"select"|"navigate"|"finish","elementId":"el_1","value":null,"confidence":0.95}`;
     }
     _formatPlanResponse(request, qwenOutput, latencyMs) {
-      const action = qwenOutput.action ?? "click";
+      const rawAction = qwenOutput.action ?? "click";
+      const action = rawAction === "type" ? "fill" : rawAction;
+      if (!VALID_ACTIONS.has(action)) {
+        return this._networkFailure(`Local Qwen returned an invalid action "${String(rawAction).slice(0, 30)}"`, "INVALID_ACTION");
+      }
       const isFinish = action === "finish";
       const elementId = qwenOutput.elementId;
       if (isFinish) {
@@ -1697,9 +1874,10 @@ Return JSON ONLY:
         };
       }
       const resolvedElement = (request.elements || []).find((e) => e.id === elementId);
-      const elementLabel = resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || "the target";
-      const isFillAction = action === "type";
-      const value = isFillAction && typeof qwenOutput.value === "string" ? qwenOutput.value.trim() : "";
+      const isSensitive = resolvedElement ? toCompactElement(resolvedElement).sensitive : false;
+      const elementLabel = isSensitive ? resolvedElement.placeholder || resolvedElement.ariaLabel || elementId : resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || "the target";
+      const isFillAction = action === "fill";
+      const value = isFillAction && !isSensitive && typeof qwenOutput.value === "string" ? qwenOutput.value.trim() : "";
       const description = value ? `Type '${value}' into '${elementLabel}'` : `${isFillAction ? "Fill" : "Click"} '${elementLabel}'`;
       const step = {
         id: 1,
@@ -2123,14 +2301,15 @@ Return JSON ONLY:
       const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 0;
       const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 0;
       const compactElements = elements.slice(0, 25).map((e) => {
-        const entry = {
-          id: e.id,
-          role: e.role,
-          text: e.text || e.ariaLabel || e.placeholder || ""
+        const c = toCompactElement(e);
+        const entry2 = {
+          id: c.id,
+          role: c.role,
+          text: c.sensitive ? c.name : e.text || e.ariaLabel || e.placeholder || ""
         };
         const bbox = normalizeBboxForVision(e.bbox, viewportWidth, viewportHeight);
-        if (bbox) entry.bbox = bbox;
-        return entry;
+        if (bbox) entry2.bbox = bbox;
+        return entry2;
       });
       return `Goal: "${request.goal}"
 Page: ${page.title || ""} (${page.url || ""})
@@ -2195,6 +2374,281 @@ Return JSON ONLY:
       };
     }
   };
+
+  // extension/lib/sensitive-policy.js
+  var Outbound = Object.freeze({
+    PLACEHOLDER: "placeholder",
+    REDACT: "redact"
+  });
+  function entry(outbound, noun) {
+    return Object.freeze({ outbound, noun, guidance: "user_enters", autonomousFill: false });
+  }
+  var POLICY = Object.freeze({
+    [SensitiveType.PASSWORD]: entry(Outbound.REDACT, "password"),
+    [SensitiveType.OTP]: entry(Outbound.REDACT, "one-time code"),
+    [SensitiveType.CREDIT_CARD]: entry(Outbound.REDACT, "card details"),
+    [SensitiveType.SSN]: entry(Outbound.REDACT, "Social Security number"),
+    [SensitiveType.BANK_ACCOUNT]: entry(Outbound.REDACT, "bank account details"),
+    [SensitiveType.ADDRESS]: entry(Outbound.REDACT, "address"),
+    [SensitiveType.DATE_OF_BIRTH]: entry(Outbound.REDACT, "date of birth"),
+    [SensitiveType.JWT]: entry(Outbound.REDACT, "access token"),
+    [SensitiveType.API_KEY]: entry(Outbound.REDACT, "API key"),
+    [SensitiveType.SECRET]: entry(Outbound.REDACT, "secret value"),
+    // Contact details are useful for the model to reason about ("send to
+    // [EMAIL_1]"), so they get reversible placeholders instead of a hard redact.
+    [SensitiveType.EMAIL]: entry(Outbound.PLACEHOLDER, "email address"),
+    [SensitiveType.PHONE]: entry(Outbound.PLACEHOLDER, "phone number")
+  });
+  function outboundHandling(type) {
+    return POLICY[type]?.outbound ?? Outbound.REDACT;
+  }
+  function fieldInstruction(type) {
+    const p = POLICY[type];
+    if (!p) return null;
+    return `Enter your ${p.noun} in the highlighted field yourself \u2014 ScreenPilot never reads, stores, or types it.`;
+  }
+  var POLICY_TYPES = Object.freeze(Object.keys(POLICY));
+
+  // extension/lib/pii-vault.js
+  var TOKEN_LABEL = { [SensitiveType.EMAIL]: "EMAIL", [SensitiveType.PHONE]: "PHONE" };
+  var TOKEN_RE = /\[(EMAIL|PHONE)_(\d+)\]/g;
+  var SKIP_KEYS = /* @__PURE__ */ new Set(["image", "mimeType", "schemaVersion", "requestId", "sessionId", "planId"]);
+  var MAX_DEPTH = 12;
+  var TRUNCATED = "[TRUNCATED]";
+  function normalizeForKey(type, value) {
+    const v = String(value).trim();
+    if (type === SensitiveType.EMAIL) return v.toLowerCase();
+    if (type === SensitiveType.PHONE) return v.replace(/\D/g, "");
+    return v;
+  }
+  var TokenVault = class {
+    #byToken = /* @__PURE__ */ new Map();
+    #byKey = /* @__PURE__ */ new Map();
+    #counters = {};
+    /** Register a value and return its stable placeholder (same value → same token). */
+    register(type, value) {
+      const label = TOKEN_LABEL[type];
+      if (!label) throw new Error(`TokenVault: type "${type}" is not tokenizable`);
+      const key = `${type}:${normalizeForKey(type, value)}`;
+      const existing = this.#byKey.get(key);
+      if (existing) return existing;
+      const n = this.#counters[type] = (this.#counters[type] ?? 0) + 1;
+      const token = `[${label}_${n}]`;
+      this.#byKey.set(key, token);
+      this.#byToken.set(token, String(value).trim());
+      return token;
+    }
+    /** Replace any known placeholders in `text` with the real values. Unknown tokens are left as-is. */
+    restore(text) {
+      if (typeof text !== "string" || !text || !text.includes("[")) return text;
+      return text.replace(TOKEN_RE, (token) => this.#byToken.get(token) ?? token);
+    }
+    get size() {
+      return this.#byToken.size;
+    }
+    clear() {
+      this.#byToken.clear();
+      this.#byKey.clear();
+      this.#counters = {};
+    }
+    // Defense in depth: even JSON.stringify(vault) can never expose a value.
+    toJSON() {
+      return { tokens: this.size };
+    }
+  };
+  function tallyOne(tally, type) {
+    if (tally) tally[type] = (tally[type] ?? 0) + 1;
+  }
+  function sanitizeText(text, vault, tally = null) {
+    if (typeof text !== "string" || !text) return text;
+    const spans = findPII(text);
+    if (!spans.length) return text;
+    let out = "";
+    let last = 0;
+    for (const s of spans) {
+      out += text.slice(last, s.start);
+      out += outboundHandling(s.type) === Outbound.PLACEHOLDER ? vault.register(s.type, text.slice(s.start, s.end)) : REDACTED;
+      tallyOne(tally, s.type);
+      last = s.end;
+    }
+    return out + text.slice(last);
+  }
+  function safeDecode(s) {
+    try {
+      return decodeURIComponent(s);
+    } catch {
+      return s;
+    }
+  }
+  function sanitizeParams(params, vault, tally) {
+    return params.split("&").map((pair) => {
+      const eq = pair.indexOf("=");
+      if (eq < 0) return sanitizeText(pair, vault, tally);
+      const name = pair.slice(0, eq);
+      const value = pair.slice(eq + 1);
+      if (!value) return pair;
+      if (isSensitiveParamName(safeDecode(name))) {
+        tallyOne(tally, SensitiveType.SECRET);
+        return `${name}=${REDACTED}`;
+      }
+      const decoded = safeDecode(value);
+      const safe2 = sanitizeText(decoded, vault, tally);
+      return safe2 === decoded ? pair : `${name}=${safe2}`;
+    }).join("&");
+  }
+  function sanitizeUrl(url, vault, tally = null) {
+    if (typeof url !== "string" || !url) return url;
+    const hashIdx = url.indexOf("#");
+    const fragment = hashIdx >= 0 ? url.slice(hashIdx + 1) : null;
+    const beforeHash = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+    const qIdx = beforeHash.indexOf("?");
+    const query = qIdx >= 0 ? beforeHash.slice(qIdx + 1) : null;
+    let base = qIdx >= 0 ? beforeHash.slice(0, qIdx) : beforeHash;
+    if (/\/\/[^/@\s]+@/.test(base)) {
+      base = base.replace(/\/\/[^/@\s]+@/, `//${REDACTED}@`);
+      tallyOne(tally, SensitiveType.SECRET);
+    }
+    let out = sanitizeText(base, vault, tally);
+    if (query !== null) out += `?${sanitizeParams(query, vault, tally)}`;
+    if (fragment !== null) out += `#${sanitizeParams(fragment, vault, tally)}`;
+    return out;
+  }
+  var URL_KEY_RE = /(?:url|urls|href)$/i;
+  function sanitizeDeep(value, vault, tally = null, key = "", depth = 0) {
+    if (depth > MAX_DEPTH) return TRUNCATED;
+    if (typeof value === "string") {
+      if (key && isSensitiveKeyName(key)) {
+        tallyOne(tally, SensitiveType.SECRET);
+        return REDACTED;
+      }
+      return URL_KEY_RE.test(key) ? sanitizeUrl(value, vault, tally) : sanitizeText(value, vault, tally);
+    }
+    if (Array.isArray(value)) {
+      return value.map((v) => sanitizeDeep(v, vault, tally, key, depth + 1));
+    }
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) {
+        out[k] = SKIP_KEYS.has(k) ? v : sanitizeDeep(v, vault, tally, k, depth + 1);
+      }
+      return out;
+    }
+    return value;
+  }
+  function restoreDeep(value, vault, depth = 0) {
+    if (typeof value === "string") return vault.restore(value);
+    if (depth > MAX_DEPTH) return value;
+    if (Array.isArray(value)) return value.map((v) => restoreDeep(v, vault, depth + 1));
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = restoreDeep(v, vault, depth + 1);
+      return out;
+    }
+    return value;
+  }
+
+  // extension/providers/sanitizing-adapter.js
+  function defaultOnEvent(evt) {
+    console.log(`[SP:PII] ${JSON.stringify(evt)}`);
+  }
+  var SanitizingAdapter = class _SanitizingAdapter extends BackendAdapter {
+    /**
+     * @param {BackendAdapter} inner
+     * @param {object} [options]
+     * @param {TokenVault} [options.vault]   - per-task vault; a fresh in-memory one by default
+     * @param {(evt: object) => void} [options.onEvent] - receives PII-free events ({event, method, types:{type:count}, placeholders})
+     */
+    constructor(inner, { vault = new TokenVault(), onEvent = defaultOnEvent } = {}) {
+      super();
+      if (!inner) throw new TypeError("SanitizingAdapter: inner adapter is required");
+      this._inner = inner;
+      this._vault = vault;
+      this._onEvent = onEvent;
+    }
+    get name() {
+      return `Sanitizing(${this._inner.name})`;
+    }
+    async plan(request, options = {}) {
+      return this._call("plan", request, options);
+    }
+    async recover(request, options = {}) {
+      return this._call("recover", request, options);
+    }
+    async explain(request, options = {}) {
+      return this._call("explain", request, options);
+    }
+    async ask(request, options = {}) {
+      return this._call("ask", request, options);
+    }
+    estimateCost(operation, request) {
+      return this._inner.estimateCost(operation, request);
+    }
+    async checkAvailability() {
+      return this._inner.checkAvailability();
+    }
+    async _call(method, request, options) {
+      const tally = {};
+      let safe2;
+      try {
+        safe2 = sanitizeDeep(request, this._vault, tally);
+      } catch {
+        this._emit({ event: "sanitize_failed", method });
+        return _SanitizingAdapter._failure();
+      }
+      if (Object.keys(tally).length) {
+        this._emit({ event: "pii_redacted", method, types: tally, placeholders: this._vault.size });
+      }
+      const response = await this._inner[method](safe2, options);
+      return restoreDeep(response, this._vault);
+    }
+    _emit(evt) {
+      try {
+        this._onEvent(evt);
+      } catch {
+      }
+    }
+    static _failure() {
+      return {
+        schemaVersion: "1",
+        result: "FAILED",
+        blockers: [],
+        confidence: 0,
+        providerMetadata: { provider: "sanitizer", model: "none", plannerVersion: "unknown", latencyMs: 0 },
+        error: "Privacy sanitization failed; the request was not sent.",
+        errorCode: "SANITIZE_ERROR"
+      };
+    }
+  };
+
+  // extension/lib/sp-logger.js
+  var PREFIX = "[SP:EVENT]";
+  var MAX_DEPTH2 = 6;
+  function redactValue(key, value, depth) {
+    if (depth > MAX_DEPTH2) return "[TRUNCATED]";
+    if (typeof value === "string") {
+      return isSensitiveKeyName(key) ? "[REDACTED]" : redactText(value);
+    }
+    if (Array.isArray(value)) return value.map((v) => redactValue(key, v, depth + 1));
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = redactValue(k, v, depth + 1);
+      return out;
+    }
+    return value;
+  }
+  function write(sink, level, event, fields) {
+    const safeFields = redactValue("", fields ?? {}, 0);
+    sink(`${PREFIX} ${JSON.stringify({ event, level, ts: Date.now(), ...safeFields })}`);
+  }
+  function logEvent(event, fields = {}) {
+    write((line) => console.log(line), "info", event, fields);
+  }
+  function logWarn(event, fields = {}) {
+    write((line) => console.warn(line), "warn", event, fields);
+  }
+  function logError(event, fields = {}) {
+    write((line) => console.error(line), "error", event, fields);
+  }
 
   // extension/services/goal-verifier.js
   function normalize(value) {
@@ -2548,6 +3002,7 @@ Return JSON ONLY:
   var DETERMINISTIC_THRESHOLD = 0.85;
   var ML_GROUNDING_THRESHOLD = 0.7;
   var QWEN_CANDIDATE_LIMIT = 25;
+  var QWEN_MIN_CONFIDENCE = 0.7;
   var AMBIGUITY_MARGIN = 0.05;
   var RIVAL_SHARE = 0.3;
   var DECISIVE_MARGIN = 0.15;
@@ -2598,9 +3053,10 @@ Return JSON ONLY:
       this.deterministicThreshold = deterministicThreshold;
       this.mlGroundingThreshold = mlGroundingThreshold;
       this.executionMode = executionMode;
-      this.localQwenAdapter = localQwenAdapter ?? new LocalQwenAdapter();
-      this.localVisionAdapter = localVisionAdapter ?? new LocalVisionAdapter();
-      this.cloudAdapter = cloudAdapter ?? new VercelBackendAdapter();
+      const defaultVault = new TokenVault();
+      this.localQwenAdapter = localQwenAdapter ?? new SanitizingAdapter(new LocalQwenAdapter(), { vault: defaultVault });
+      this.localVisionAdapter = localVisionAdapter ?? new SanitizingAdapter(new LocalVisionAdapter(), { vault: defaultVault });
+      this.cloudAdapter = cloudAdapter ?? new SanitizingAdapter(new VercelBackendAdapter(), { vault: defaultVault });
     }
     /**
      * Route a task goal through the 3-tier local hierarchy.
@@ -2689,7 +3145,7 @@ Return JSON ONLY:
         return { layer: "ml_grounding", planResponse: continuation, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
       }
       const l3Reason = insufficientEvidence ? `lexical_evidence_insufficient(${insufficientEvidence})` : "confidence_below_threshold";
-      console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode} reason=${l3Reason}`);
+      logEvent("layer3_invoked", { goal, executionMode: this.executionMode, reason: l3Reason, candidateCount: candidates.length });
       console.log(`[SP:V2:DEBUG] layer=L3 reason=${l3Reason} candidateCount=${candidates.length} topScore=${assessment.topScore} margin=${assessment.margin.toFixed(3)} executionMode=${this.executionMode}`);
       const l3 = await this._runLayer3(groundingIntent, pageState, candidates, options, ranked);
       if (insufficientEvidence && l3?.planResponse?.result !== "OK") {
@@ -2837,10 +3293,13 @@ Return JSON ONLY:
             if (planResponse2?.result === "FAILED") {
               qwenFailureReason = planResponse2.error || planResponse2.errorCode || "qwen_failed";
               console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) \u2014 falling back to cloud once`);
+            } else if (qwenFailureReason = this._qwenUnusableReason(planResponse2, qwenElements)) {
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN result unusable (${qwenFailureReason}, ${qwenMs}ms) \u2014 falling back to cloud once`);
             } else {
               const step = planResponse2?.plan?.steps?.[0];
               const t = step?.targetElement || {};
-              console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? "n/a"} phase=${step?.phase ?? "n/a"} value=${JSON.stringify(t.value ?? "")}`);
+              console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? "n/a"} phase=${step?.phase ?? "n/a"}`);
+              logEvent("layer3_qwen_ok", { elementId: t.elementId ?? null, phase: step?.phase ?? null, hasValue: !!t.value });
               return { layer: "local_qwen", planResponse: planResponse2, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
             }
           } catch (err) {
@@ -2874,6 +3333,25 @@ Return JSON ONLY:
       return { layer: "cloud", planResponse, qwenMs, visionMs, cloudMs, qwenFailureReason, visionFailureReason };
     }
     // ── Helpers ─────────────────────────────────────────────────────────────────
+    /**
+     * Why a non-FAILED Qwen plan can't be trusted, or null when it can. Qwen may
+     * only ever point at an element it was offered from the CURRENT page state, and
+     * must be confident enough. (A "finish" answer names no element, so only its
+     * confidence is checked.)
+     *
+     * @param {object} planResponse
+     * @param {object[]} elements - the candidates Qwen was offered (a subset of the current page state)
+     * @returns {'invalid_element_id'|'low_confidence'|null}
+     */
+    _qwenUnusableReason(planResponse, elements) {
+      if (planResponse?.state !== "complete") {
+        const elementId = planResponse?.plan?.steps?.[0]?.targetElement?.elementId;
+        if (!elementId || !elements.some((el) => el.id === elementId)) return "invalid_element_id";
+      }
+      const confidence = planResponse?.confidence;
+      if (typeof confidence === "number" && confidence < QWEN_MIN_CONFIDENCE) return "low_confidence";
+      return null;
+    }
     /**
      * Does this element correspond to the target of one of the given steps?
      *
@@ -3297,9 +3775,10 @@ Return JSON ONLY:
   var MAX_CONSECUTIVE_AMBIGUOUS = 3;
   var MAX_CONSECUTIVE_FINAL = 3;
   var MAX_AUTH_ATTEMPTS = 3;
-  function _maxPlannerCalls(session) {
+  function maxPlannerCalls(session) {
     return Math.min(10 + 2 * session.completedSteps.length, 40);
   }
+  var _maxPlannerCalls = maxPlannerCalls;
   function sessionKey(tabId) {
     return KEY_PREFIX + tabId;
   }
@@ -3354,6 +3833,13 @@ Return JSON ONLY:
         // via patchSession when a plan carrying it is accepted. NOT a schema bump, so
         // existing sessions (which lack this field) still load unchanged.
         goalCompletionCriteria: null,
+        // Phase 4 (TaskProgress): additive, optional fields — same pattern as
+        // goalCompletionCriteria above. NOT a schema bump; a pre-Phase-4 session
+        // simply lacks them, and every reader treats their absence as "unknown"
+        // rather than an error (see task-progress.js).
+        replanCount: 0,
+        lastActionResult: null,
+        lastActionAt: null,
         phase: "PLANNING",
         createdAt: t,
         updatedAt: t,
@@ -3625,6 +4111,25 @@ Return JSON ONLY:
       return { isStuck: false, reason: null };
     },
     /**
+     * Increment replanCount (Phase 4). Purely informational — no stuck-threshold
+     * of its own; the existing plannerAttemptCount/stepAttemptCount budgets
+     * (above) already bound how many times a session can actually replan. This
+     * only gives TaskProgress a real number to report instead of inferring one.
+     * Call alongside each genuine REPLAN_TRIGGERED transition (never on a
+     * SESSION_RESUME/PAUSED-resume — those are not replans).
+     *
+     * @param {number} tabId
+     * @returns {Promise<number>} the new count, or 0 if the session is gone
+     */
+    async incrementReplanCount(tabId) {
+      const session = await _read(tabId);
+      if (!session) return 0;
+      const next = (session.replanCount ?? 0) + 1;
+      const t = nowMs();
+      await _write(tabId, { ...session, replanCount: next, updatedAt: t, expiresAt: t + SESSION_TTL_MS });
+      return next;
+    },
+    /**
      * Increment consecutiveFinalCount.
      * Call when outcome === 'goal_reached'. Triggers guard at MAX_CONSECUTIVE_FINAL.
      * When the user denies: patchSession(tabId, { consecutiveFinalCount: 0, goalDeniedCount: n+1 }).
@@ -3753,6 +4258,135 @@ Return JSON ONLY:
       return { classification: NavClassification.WORKFLOW_NAVIGATION, matchedStepIndex: null };
     }
     return { classification: NavClassification.UNKNOWN, matchedStepIndex: null };
+  }
+
+  // extension/lib/sensitive-guard.js
+  function classifyDomElement(el) {
+    try {
+      if (!el || typeof el.getAttribute !== "function") return null;
+      const tag = String(el.tagName || "").toLowerCase();
+      const isField = tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable === true;
+      if (!isField) return null;
+      const attr = (name) => el.getAttribute(name) || "";
+      return classifyElement({
+        type: tag === "input" ? attr("type") || el.type || "" : "",
+        autocomplete: attr("autocomplete"),
+        placeholder: attr("placeholder"),
+        ariaLabel: attr("aria-label") || attr("title"),
+        name: attr("name"),
+        id: attr("id"),
+        label: el.labels?.[0]?.textContent || ""
+      });
+    } catch {
+      return null;
+    }
+  }
+  function guardHighlighter(highlighter, { classify = classifyDomElement } = {}) {
+    return {
+      show(element, text) {
+        const type = classify(element);
+        return highlighter.show(element, type && fieldInstruction(type) || text);
+      },
+      clear() {
+        return highlighter.clear();
+      }
+    };
+  }
+
+  // extension/lib/task-progress.js
+  var ProgressStatus = Object.freeze({
+    IDLE: "idle",
+    PLANNING: "planning",
+    RUNNING: "running",
+    PAUSED: "paused",
+    COMPLETE: "complete",
+    ERROR: "error",
+    ABORTED: "aborted"
+  });
+  var TASKSTATE_TO_STATUS = Object.freeze({
+    IDLE: ProgressStatus.IDLE,
+    PLANNING: ProgressStatus.PLANNING,
+    EXECUTING: ProgressStatus.RUNNING,
+    AWAITING_USER: ProgressStatus.RUNNING,
+    VALIDATING: ProgressStatus.RUNNING,
+    RECOVERING: ProgressStatus.RUNNING,
+    PAUSED: ProgressStatus.PAUSED,
+    COMPLETE: ProgressStatus.COMPLETE,
+    ERROR: ProgressStatus.ERROR
+  });
+  var PHASE_TO_STATUS = Object.freeze({
+    PLANNING: ProgressStatus.PLANNING,
+    EXECUTING: ProgressStatus.RUNNING,
+    PAUSED: ProgressStatus.PAUSED
+  });
+  var TERMINAL_STATUSES = Object.freeze([ProgressStatus.COMPLETE, ProgressStatus.ERROR, ProgressStatus.ABORTED]);
+  function safe(text) {
+    return typeof text === "string" && text ? redactText(text) : text ?? null;
+  }
+  function summarizeStep(step) {
+    if (!step) return null;
+    return {
+      description: safe(step.description),
+      intent: safe(step.intent),
+      completionCondition: step.completionCondition ?? null,
+      completedAt: step.completedAt ?? null
+    };
+  }
+  function deriveStatus(session, taskState, aborted) {
+    if (aborted) return ProgressStatus.ABORTED;
+    if (taskState && TASKSTATE_TO_STATUS[taskState]) return TASKSTATE_TO_STATUS[taskState];
+    if (!session) return ProgressStatus.IDLE;
+    return PHASE_TO_STATUS[session.phase] ?? ProgressStatus.RUNNING;
+  }
+  function deriveTaskProgress(session, { taskState, aborted = false } = {}) {
+    const status = deriveStatus(session, taskState, aborted);
+    if (!session) {
+      return {
+        goal: null,
+        status,
+        currentStep: null,
+        completedSteps: { count: 0, steps: [] },
+        remainingSteps: null,
+        expectedState: null,
+        attempts: null,
+        replanCount: 0,
+        lastAction: null,
+        completion: { complete: status === ProgressStatus.COMPLETE, reason: null },
+        failure: { failed: status === ProgressStatus.ERROR, reason: null },
+        aborted: status === ProgressStatus.ABORTED,
+        createdAt: null,
+        updatedAt: null
+      };
+    }
+    const completedSteps = Array.isArray(session.completedSteps) ? session.completedSteps : [];
+    const budget = maxPlannerCalls({ completedSteps });
+    return {
+      goal: safe(session.goal),
+      status,
+      currentStep: summarizeStep(session.pendingStep),
+      completedSteps: { count: completedSteps.length, steps: completedSteps.map(summarizeStep) },
+      // Always null — see the module doc comment: genuinely not tracked by the
+      // current single-step-per-cycle architecture, never fabricated here.
+      remainingSteps: null,
+      expectedState: session.pendingStep ? {
+        urlPattern: session.pendingStep.expectedUrlPattern ?? null,
+        urlChanges: session.pendingStep.expectedUrlChanges ?? false
+      } : null,
+      attempts: {
+        step: session.stepAttemptCount ?? 0,
+        stepMax: 3,
+        // MAX_STEP_ATTEMPTS in session-store.js — not exported as a constant import to keep this module's only session-store dependency the pure budget formula; both are small, stable, already-tested constants.
+        planner: session.plannerAttemptCount ?? 0,
+        plannerMax: budget
+      },
+      replanCount: session.replanCount ?? 0,
+      lastAction: session.lastActionResult ? { result: session.lastActionResult, at: session.lastActionAt ?? null } : null,
+      completion: { complete: status === ProgressStatus.COMPLETE, reason: status === ProgressStatus.COMPLETE ? "goal_reached" : null },
+      failure: { failed: status === ProgressStatus.ERROR, reason: status === ProgressStatus.ERROR ? session.currentBlocker ?? null : null },
+      aborted: status === ProgressStatus.ABORTED,
+      createdAt: session.createdAt ?? null,
+      updatedAt: session.updatedAt ?? null
+    };
   }
 
   // extension/v2-task.js
@@ -4318,9 +4952,12 @@ Return JSON ONLY:
   }
   async function _runPlanLoopInternal(tabId, myGen) {
     const storage = getStorageArea2();
-    const { executionMode = "cloud", openRouterApiKey } = storage ? await storage.get(["executionMode", "openRouterApiKey"]) : { executionMode: "cloud", openRouterApiKey: void 0 };
-    const cloudAdapter = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? void 0 });
-    const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter: new LocalQwenAdapter(), cloudAdapter });
+    const { executionMode = "cloud" } = storage ? await storage.get(["executionMode"]) : { executionMode: "cloud" };
+    const piiVault = new TokenVault();
+    const cloudAdapter = new SanitizingAdapter(new VercelBackendAdapter(), { vault: piiVault });
+    const localQwenAdapter = new SanitizingAdapter(new LocalQwenAdapter(), { vault: piiVault });
+    const localVisionAdapter = new SanitizingAdapter(new LocalVisionAdapter(), { vault: piiVault });
+    const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter, localVisionAdapter, cloudAdapter });
     let planRetryCount = 0;
     let localPageState = null;
     while (true) {
@@ -4334,8 +4971,9 @@ Return JSON ONLY:
         hideStatus();
         return;
       }
+      logEvent("task_progress_snapshot", deriveTaskProgress(session, { taskState: _state }));
       if (_generation !== myGen) return;
-      console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${session.goal}"`);
+      console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${redactText(session.goal)}"`);
       let settledSteps = [];
       let entrySnap = null;
       try {
@@ -4435,6 +5073,7 @@ Return JSON ONLY:
         const pageState = cyclePageState ?? PageStateService.extractPageState();
         localPageState = pageState;
         const domMs = cyclePageState ? cycleExtractMs : Date.now() - tDomStart;
+        logEvent("compact_state_built", { reqId, ...estimateCompactionSavings(pageState) });
         const preL3Check = cycleGenericCheck ?? GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
         if (preL3Check.satisfied) {
           window.removeEventListener("popstate", onNavCheck);
@@ -4482,6 +5121,27 @@ Return JSON ONLY:
         console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? "n/a"}`);
         console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
         console.log(`[SP:V2:PERF] stage=routing routeMs=${layer1Ms + layer2Ms + qwenMs + cloudMs} pageControlsMs=${pageControlsMs} domReused=${cyclePageState ? "yes" : "no"} goalCheckReused=${cycleGenericCheck ? "yes" : "no"}`);
+        logEvent("routing_result", {
+          reqId,
+          layer: routed.layer,
+          layer1Ms,
+          layer2Ms,
+          qwenMs,
+          cloudMs,
+          visionMs: routed.visionMs ?? 0,
+          totalPlanningMs,
+          confidence: planResp.confidence,
+          qwenFailureReason: routed.qwenFailureReason ? redactText(routed.qwenFailureReason) : null,
+          visionFailureReason: routed.visionFailureReason ? redactText(routed.visionFailureReason) : null
+        });
+        if (routed.qwenFailureReason || routed.visionFailureReason) {
+          logWarn("provider_fallback", {
+            reqId,
+            resolvedBy: routed.layer,
+            qwenFailureReason: routed.qwenFailureReason ? redactText(routed.qwenFailureReason) : null,
+            visionFailureReason: routed.visionFailureReason ? redactText(routed.visionFailureReason) : null
+          });
+        }
       } catch (err) {
         window.removeEventListener("popstate", onNavCheck);
         console.log(`[SP:V2:TRACE] plan ERROR reqId=${reqId} name=${err?.name} message=${err?.message}`);
@@ -4492,6 +5152,7 @@ Return JSON ONLY:
           continue;
         }
         console.error("[SP:V2] Planning failed:", err);
+        logError("plan_failed", { reqId, name: err?.name ?? null, message: redactText(err?.message ?? "") });
         applyEvent(TaskEvent.PLAN_FAILED, { reason: "network_error" });
         showStatus(`ScreenPilot: Planning error \u2014 ${err.message}`, "error");
         await SessionStore.clear(tabId);
@@ -4669,6 +5330,7 @@ Return JSON ONLY:
       hideStatus();
       await SessionStore.setPhase(tabId, "EXECUTING");
       const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
+      await SessionStore.patchSession(tabId, { lastActionResult: result, lastActionAt: Date.now() });
       if (result === "navigated" || result === "aborted") {
         if (result === "navigated") {
           setTimeout(() => {
@@ -4690,12 +5352,14 @@ Return JSON ONLY:
         }
         await SessionStore.setPhase(tabId, "PLANNING");
         applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
+        await SessionStore.incrementReplanCount(tabId);
         await _shadowGoalVerify(tabId, "REPLAN", false);
         await new Promise((r) => setTimeout(r, 500));
         continue;
       }
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
+      await SessionStore.incrementReplanCount(tabId);
       await _shadowGoalVerify(tabId, "REPLAN", false);
     }
   }
@@ -4731,7 +5395,7 @@ Return JSON ONLY:
         resolve("aborted");
         return;
       }
-      const highlighter = resolveHighlighter();
+      const highlighter = guardHighlighter(resolveHighlighter());
       const executor = new ExecutorEngine({
         domMatcher: window.DOMMatcher,
         highlighter,
@@ -4754,6 +5418,7 @@ Return JSON ONLY:
           _lastUserActedAtMs = null;
           _lastUserActedIntent = null;
         }
+        logEvent("executor_result", { tabId, ok: true, phase: step.phase, completionCondition: step.completionCondition });
         const elementNav = computeExpectedNavigationFromElement(element);
         if (elementNav) {
           step.expectedPageState = { ...step.expectedPageState, ...elementNav };
@@ -4772,6 +5437,7 @@ Return JSON ONLY:
       executor.on("element:not_found", ({ reason, isOptional }) => {
         if (isOptional) return;
         applyEvent(TaskEvent.ELEMENT_NOT_FOUND, { reason });
+        logEvent("executor_result", { tabId, ok: false, reason: redactText(reason) });
         done("element_not_found");
       });
       executor.on("user:acted", async ({ step, trigger, observedValue }) => {
@@ -4890,7 +5556,7 @@ Return JSON ONLY:
         return;
       }
       if (_generation !== myGen) return;
-      console.log(`[SP:V2] [${ts()}] Resuming: phase=${session.phase} pauseReason=${session.pauseReason ?? "null"} steps=${session.completedSteps.length} goal="${session.goal}"`);
+      console.log(`[SP:V2] [${ts()}] Resuming: phase=${session.phase} pauseReason=${session.pauseReason ?? "null"} steps=${session.completedSteps.length} goal="${redactText(session.goal)}"`);
       if (session.phase === "PAUSED") {
         applyEvent(TaskEvent.WORKFLOW_PAUSED);
         await SessionStore.refreshExpiry(tabId);
@@ -5030,6 +5696,7 @@ Return JSON ONLY:
     _executor?.abort();
     _executor = null;
     ++_generation;
+    logEvent("task_progress_snapshot", deriveTaskProgress(await SessionStore.load(_tabId), { aborted: true }));
     await SessionStore.clear(_tabId);
     _state = TaskState.PAUSED;
     applyEvent(TaskEvent.CANCEL_CLICKED);
@@ -5049,7 +5716,7 @@ Return JSON ONLY:
     _taskContext = { goal, steps: [], startedAt: Date.now() };
     _taskStartedAt = Date.now();
     console.log("[SP:V2] \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
-    console.log(`[SP:V2] [${ts()}] New task: "${goal}"`);
+    console.log(`[SP:V2] [${ts()}] New task: "${redactText(goal)}"`);
     console.log(`[SP:V2] [${ts()}] Page: ${window.location.href}`);
     applyEvent(TaskEvent.GOAL_SUBMITTED, { goal });
     await SessionStore.create(_tabId, goal);
@@ -5067,8 +5734,13 @@ Return JSON ONLY:
     hideStatus();
     hidePausedBanner();
     hideAmbiguousBanner();
-    if (_tabId) SessionStore.clear(_tabId).catch(() => {
-    });
+    if (_tabId) {
+      const tabIdSnapshot = _tabId;
+      SessionStore.load(tabIdSnapshot).then((s) => logEvent("task_progress_snapshot", deriveTaskProgress(s, { aborted: true }))).catch(() => {
+      });
+      SessionStore.clear(tabIdSnapshot).catch(() => {
+      });
+    }
     _state = TaskState.IDLE;
     console.log("[SP:V2] Task aborted");
   }

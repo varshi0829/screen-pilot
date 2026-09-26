@@ -828,13 +828,11 @@ ${lines.join("\n")}`);
     /**
      * @param {object} [options]
      * @param {string} [options.baseUrl]    - Backend base URL (defaults to Vercel deployment)
-     * @param {string} [options.apiKey]     - User-supplied Gemini key (BYOK); omit to use shared key
      * @param {string} [options.sessionId]  - Session identifier for rate limiting and telemetry
      */
-    constructor({ baseUrl = DEFAULT_BASE_URL, apiKey, sessionId } = {}) {
+    constructor({ baseUrl = DEFAULT_BASE_URL, sessionId } = {}) {
       super();
       this._baseUrl = baseUrl.replace(/\/$/, "");
-      this._apiKey = apiKey ?? null;
       this._sessionId = sessionId ?? crypto.randomUUID().slice(0, 16);
     }
     get name() {
@@ -939,7 +937,6 @@ ${lines.join("\n")}`);
         "Content-Type": "application/json",
         "X-Session-ID": this._sessionId
       };
-      if (this._apiKey) headers["X-OpenRouter-Key"] = this._apiKey;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3e4);
       const callerSignal = options?.signal;
@@ -1004,85 +1001,180 @@ ${lines.join("\n")}`);
     }
   };
 
+  // extension/lib/pii-detector.js
+  var SensitiveType = Object.freeze({
+    PASSWORD: "password",
+    OTP: "otp",
+    EMAIL: "email",
+    PHONE: "phone",
+    CREDIT_CARD: "credit_card",
+    SSN: "ssn",
+    BANK_ACCOUNT: "bank_account",
+    ADDRESS: "address",
+    DATE_OF_BIRTH: "date_of_birth",
+    JWT: "jwt",
+    API_KEY: "api_key",
+    SECRET: "secret"
+  });
+  var T = SensitiveType;
+  var INPUT_TYPE_MAP = {
+    password: T.PASSWORD,
+    email: T.EMAIL,
+    tel: T.PHONE
+  };
+  var AUTOCOMPLETE_MAP = {
+    "current-password": T.PASSWORD,
+    "new-password": T.PASSWORD,
+    "one-time-code": T.OTP,
+    "cc-number": T.CREDIT_CARD,
+    "cc-csc": T.CREDIT_CARD,
+    "cc-exp": T.CREDIT_CARD,
+    "cc-exp-month": T.CREDIT_CARD,
+    "cc-exp-year": T.CREDIT_CARD,
+    "cc-name": T.CREDIT_CARD,
+    "email": T.EMAIL,
+    "tel": T.PHONE,
+    "tel-national": T.PHONE,
+    "street-address": T.ADDRESS,
+    "address-line1": T.ADDRESS,
+    "address-line2": T.ADDRESS,
+    "postal-code": T.ADDRESS,
+    "bday": T.DATE_OF_BIRTH,
+    "ssn": T.SSN
+  };
+  var LABEL_RULES = [
+    [/\b(?:password|passcode)\b/i, T.PASSWORD],
+    [/\b(?:otp|one[- ]time[- ]code)\b/i, T.OTP],
+    [/\b(?:cvv|cvc|security\s*code|card\s*number|credit\s*card|debit\s*card)\b/i, T.CREDIT_CARD],
+    [/\b(?:ssn|social\s*security)\b/i, T.SSN],
+    [/\b(?:routing\s*number|account\s*number|iban)\b/i, T.BANK_ACCOUNT],
+    [/\b(?:api\s*key|secret\s*key|private\s*key|client\s*secret)\b/i, T.API_KEY],
+    [/\b(?:auth\s*token|access\s*token|pin\s*code)\b/i, T.SECRET]
+  ];
+  function byInputType(type) {
+    return INPUT_TYPE_MAP[String(type || "").toLowerCase()] ?? null;
+  }
+  function byAutocomplete(autocomplete) {
+    return AUTOCOMPLETE_MAP[String(autocomplete || "").toLowerCase()] ?? null;
+  }
+  function byLabel(...strings) {
+    for (const raw of strings) {
+      if (typeof raw !== "string" || !raw) continue;
+      const s = raw.replace(/[_-]+/g, " ");
+      for (const [re, type] of LABEL_RULES) {
+        if (re.test(s)) return type;
+      }
+    }
+    return null;
+  }
+  var JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
+  var API_KEY_RES = [
+    /\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/g,
+    // OpenAI / OpenRouter / Anthropic style
+    /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    // Google API key
+    /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
+    // GitHub tokens
+    /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+    /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+    // Slack
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    // AWS access key id
+    /\bglpat-[A-Za-z0-9_-]{20,}/g,
+    // GitLab
+    /\bnpm_[A-Za-z0-9]{36}\b/g,
+    // npm
+    /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/g
+    // Authorization header value
+  ];
+  var PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+  var ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|(?:access|auth|refresh|id)[_-]?token|token)\b\s*[:=]\s*["']?([^\s"'&;,<>]{6,})/gid;
+  var SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
+  var CARD_RE = /\b\d(?:[ -]?\d){12,18}\b/g;
+  var SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+  var EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  var PHONE_RES = [
+    /(?<![\w])(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}(?!\d)/g,
+    /(?<![\w])\+\d[\d ()-]{7,15}\d(?!\d)/g
+  ];
+  function isLuhnValid(digits) {
+    const s = String(digits).replace(/\D/g, "");
+    if (s.length < 13 || s.length > 19) return false;
+    let sum = 0;
+    let dbl = false;
+    for (let i = s.length - 1; i >= 0; i--) {
+      let n = s.charCodeAt(i) - 48;
+      if (dbl) {
+        n *= 2;
+        if (n > 9) n -= 9;
+      }
+      sum += n;
+      dbl = !dbl;
+    }
+    return sum % 10 === 0;
+  }
+  function assignmentType(keyName) {
+    if (/pass|pwd/i.test(keyName)) return T.PASSWORD;
+    if (/key/i.test(keyName)) return T.API_KEY;
+    return T.SECRET;
+  }
+  function findPII(text) {
+    if (typeof text !== "string" || !text) return [];
+    const spans = [];
+    const overlaps = (s, e) => spans.some((x) => s < x.end && e > x.start);
+    const add = (type, start, end) => {
+      if (end > start && !overlaps(start, end)) spans.push({ type, start, end });
+    };
+    const scan = (re, type, accept) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (!accept || accept(m[0])) add(type, m.index, m.index + m[0].length);
+        if (m[0].length === 0) re.lastIndex++;
+      }
+    };
+    const scanAssignments = (re, typeOf) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const [start, end] = m.indices[2];
+        add(typeOf(m[1]), start, end);
+      }
+    };
+    scan(PRIVATE_KEY_RE, T.SECRET);
+    scan(JWT_RE, T.JWT);
+    API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
+    scanAssignments(ASSIGNMENT_RE, assignmentType);
+    scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
+    scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
+    scan(SSN_RE, T.SSN);
+    scan(EMAIL_RE, T.EMAIL);
+    PHONE_RES.forEach((re) => scan(re, T.PHONE));
+    return spans.sort((a, b) => a.start - b.start);
+  }
+  function detectType(text) {
+    const spans = findPII(text);
+    return spans.length ? spans[0].type : null;
+  }
+  function classifyElement(el) {
+    if (!el) return null;
+    return byInputType(el.type) || byAutocomplete(el.autocomplete) || byLabel(el.placeholder, el.ariaLabel, el.name, el.id, el.label) || detectType(el.value) || detectType(el.text) || null;
+  }
+
   // extension/lib/privacy-sanitizer.js
   var REDACTED = "[REDACTED]";
-  var SENSITIVE_INPUT_TYPES = /* @__PURE__ */ new Set(["password", "email", "tel"]);
-  var SENSITIVE_AUTOCOMPLETE = /* @__PURE__ */ new Set([
-    "current-password",
-    "new-password",
-    "one-time-code",
-    "cc-number",
-    "cc-csc",
-    "cc-exp",
-    "cc-exp-month",
-    "cc-exp-year",
-    "cc-name",
-    "email",
-    "tel",
-    "tel-national",
-    "street-address",
-    "address-line1",
-    "address-line2",
-    "postal-code",
-    "bday",
-    "ssn"
-  ]);
-  var SENSITIVE_LABEL_PATTERN = new RegExp(
-    "\\b(" + [
-      "password",
-      "passcode",
-      "pin\\s*code",
-      "otp",
-      "one[- ]time[- ]code",
-      "cvv",
-      "cvc",
-      "security\\s*code",
-      "card\\s*number",
-      "credit\\s*card",
-      "ssn",
-      "social\\s*security",
-      "routing\\s*number",
-      "account\\s*number",
-      "api\\s*key",
-      "secret\\s*key",
-      "auth\\s*token"
-    ].join("|") + ")\\b",
-    "i"
-  );
-  var PII_PATTERNS = [
-    { name: "email", re: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
-    { name: "ssn", re: /\b\d{3}-\d{2}-\d{4}\b/ },
-    { name: "credit_card", re: /\b(?:\d[ -]?){13,19}\b/ },
-    { name: "phone", re: /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/ }
-  ];
-  function isSensitiveInputType(type) {
-    return SENSITIVE_INPUT_TYPES.has(String(type || "").toLowerCase());
-  }
-  function isSensitiveAutocomplete(autocomplete) {
-    return SENSITIVE_AUTOCOMPLETE.has(String(autocomplete || "").toLowerCase());
-  }
-  function hasSensitiveLabelSignal(...strings) {
-    return strings.some((s) => typeof s === "string" && s && SENSITIVE_LABEL_PATTERN.test(s));
-  }
-  function containsPII(text) {
-    if (!text || typeof text !== "string") return false;
-    return PII_PATTERNS.some((p) => p.re.test(text));
-  }
   function isSensitiveElement(el) {
-    if (!el) return false;
-    if (isSensitiveInputType(el.type)) return true;
-    if (isSensitiveAutocomplete(el.autocomplete)) return true;
-    if (hasSensitiveLabelSignal(el.placeholder, el.ariaLabel)) return true;
-    if (containsPII(el.value) || containsPII(el.text)) return true;
-    return false;
+    return classifyElement(el) !== null;
   }
   function sanitizeElement(el) {
-    if (!isSensitiveElement(el)) return el;
+    const sensitiveType = classifyElement(el);
+    if (!sensitiveType) return el;
     return {
       ...el,
       text: el.text ? REDACTED : el.text,
       value: el.value ? REDACTED : el.value,
-      sensitive: true
+      sensitive: true,
+      sensitiveType
     };
   }
   function sanitizeElements(elements) {
@@ -1096,6 +1188,7 @@ ${lines.join("\n")}`);
   var PrivacySanitizer = {
     REDACTED,
     isSensitiveElement,
+    getSensitiveType: classifyElement,
     sanitizeElement,
     sanitizeElements,
     getSensitiveRegions
