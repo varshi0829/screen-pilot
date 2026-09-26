@@ -9,59 +9,15 @@
 // Detection only ever inspects local, already-extracted DOM signals (input
 // type, autocomplete, label/placeholder/aria-label text, and the field's own
 // text/value content) — nothing here makes a network call or depends on one.
+//
+// The actual detection rules (input types, autocomplete tokens, label
+// keywords, PII/secret patterns) live in pii-detector.js — the single source
+// of truth shared with the outgoing-text sanitizer and the field guard. This
+// module keeps its original API and adds `sensitiveType` to redacted elements.
+
+import { classifyElement } from './pii-detector.js';
 
 export const REDACTED = '[REDACTED]';
-
-// HTML input types that are inherently sensitive regardless of content.
-const SENSITIVE_INPUT_TYPES = new Set(['password', 'email', 'tel']);
-
-// autocomplete tokens (WHATWG autofill spec) that flag a field as sensitive
-// even when its input `type` is generic (e.g. type="text" autocomplete="cc-number").
-const SENSITIVE_AUTOCOMPLETE = new Set([
-  'current-password', 'new-password', 'one-time-code',
-  'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-name',
-  'email', 'tel', 'tel-national',
-  'street-address', 'address-line1', 'address-line2', 'postal-code',
-  'bday', 'ssn'
-]);
-
-// Label/placeholder/aria-label keyword signals — whole-word matches so we
-// don't over-trigger on unrelated text that happens to contain a substring.
-const SENSITIVE_LABEL_PATTERN = new RegExp(
-  '\\b(' + [
-    'password', 'passcode', 'pin\\s*code', 'otp', 'one[- ]time[- ]code',
-    'cvv', 'cvc', 'security\\s*code', 'card\\s*number', 'credit\\s*card',
-    'ssn', 'social\\s*security', 'routing\\s*number', 'account\\s*number',
-    'api\\s*key', 'secret\\s*key', 'auth\\s*token'
-  ].join('|') + ')\\b',
-  'i'
-);
-
-// Obvious PII patterns matched against a field's own rendered/typed content,
-// independent of what kind of field it is.
-const PII_PATTERNS = [
-  { name: 'email',       re: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
-  { name: 'ssn',         re: /\b\d{3}-\d{2}-\d{4}\b/ },
-  { name: 'credit_card', re: /\b(?:\d[ -]?){13,19}\b/ },
-  { name: 'phone',       re: /\b(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/ },
-];
-
-function isSensitiveInputType(type) {
-  return SENSITIVE_INPUT_TYPES.has(String(type || '').toLowerCase());
-}
-
-function isSensitiveAutocomplete(autocomplete) {
-  return SENSITIVE_AUTOCOMPLETE.has(String(autocomplete || '').toLowerCase());
-}
-
-function hasSensitiveLabelSignal(...strings) {
-  return strings.some((s) => typeof s === 'string' && s && SENSITIVE_LABEL_PATTERN.test(s));
-}
-
-function containsPII(text) {
-  if (!text || typeof text !== 'string') return false;
-  return PII_PATTERNS.some((p) => p.re.test(text));
-}
 
 /**
  * Decide whether a normalized page-state element (see page-state-service.js)
@@ -72,12 +28,7 @@ function containsPII(text) {
  * @returns {boolean}
  */
 function isSensitiveElement(el) {
-  if (!el) return false;
-  if (isSensitiveInputType(el.type)) return true;
-  if (isSensitiveAutocomplete(el.autocomplete)) return true;
-  if (hasSensitiveLabelSignal(el.placeholder, el.ariaLabel)) return true;
-  if (containsPII(el.value) || containsPII(el.text)) return true;
-  return false;
+  return classifyElement(el) !== null;
 }
 
 /**
@@ -85,18 +36,22 @@ function isSensitiveElement(el) {
  * not itself sensitive content (role, tag, id, region, bbox, visible,
  * enabled, placeholder, ariaLabel — i.e. what the field *is*, not what was
  * typed into it) is preserved unchanged; only `text`/`value` content is
- * replaced. Non-sensitive elements are returned as-is.
+ * replaced. Redacted elements are marked `sensitive: true` with the
+ * deterministic `sensitiveType` (see pii-detector.js SensitiveType).
+ * Non-sensitive elements are returned as-is.
  *
  * @param {object} el
  * @returns {object}
  */
 function sanitizeElement(el) {
-  if (!isSensitiveElement(el)) return el;
+  const sensitiveType = classifyElement(el);
+  if (!sensitiveType) return el;
   return {
     ...el,
     text:  el.text  ? REDACTED : el.text,
     value: el.value ? REDACTED : el.value,
-    sensitive: true
+    sensitive: true,
+    sensitiveType
   };
 }
 
@@ -130,6 +85,7 @@ function getSensitiveRegions(elements) {
 export const PrivacySanitizer = {
   REDACTED,
   isSensitiveElement,
+  getSensitiveType: classifyElement,
   sanitizeElement,
   sanitizeElements,
   getSensitiveRegions
