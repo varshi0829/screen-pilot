@@ -1,140 +1,48 @@
 import { NextRequest, NextResponse } from "next/server";
+import { buildCorsHeaders, preflight, newRequestId } from "../../../server/http";
+import { validateAnalyzeRequest, applyPiiBackstop } from "../../../server/validate";
+import { createRateLimiter } from "../../../server/rate-limit";
+import { logEvent, logWarn, logError, logModelOutcome } from "../../../server/logger";
+import { selectVisionProvider } from "../../../server/model-router";
+import { callGemini } from "../../../server/providers/gemini";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
-
-const MODELS = {
-  navigate: GEMINI_MODEL,
-  explain:  GEMINI_MODEL,
-  ask:      GEMINI_MODEL,
+const MODE_CONFIG = {
+  navigate: { temperature: 0.2, maxOutputTokens: 2048 },
+  explain:  { temperature: 0.2, maxOutputTokens: 2048 },
+  ask:      { temperature: 0.3, maxOutputTokens: 512 },
 } as const;
-type Mode = keyof typeof MODELS;
+type Mode = keyof typeof MODE_CONFIG;
 
-const RATE_WINDOW_MS = 60_000;
-const RATE_MAX = 100; // DEV: raised from 12 — restore before public launch
-const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024; // 8 MB base64 limit
+const TOTAL_BUDGET_MS      = 22_000;
+const PER_ATTEMPT_MS       = 12_000;
+const MAX_GEMINI_RETRIES   = 2;
 
-// In-memory store — resets on cold start, sufficient for current scale
-const sessions = new Map<string, { count: number; resetAt: number }>();
-
-// Global rate limiter — protects shared Gemini API key from multi-user overload.
-// Gemini free tier is 15 RPM; keep 3 RPM headroom for network jitter.
-const GLOBAL_MAX  = 12;
-let globalCount   = 0;
-let globalResetAt = 0;
-
-// ── In-process metrics (resets on cold start) ────────────────────────────────
-const _m = {
-  totalRequests:     0,
-  totalGeminiCalls:  0,
-  total429:          0,
-  sharedKeyRequests: 0,
-  userKeyRequests:   0,
-};
-
-function logMetrics(reqId: string) {
-  const avg = _m.totalRequests > 0
-    ? (_m.totalGeminiCalls / _m.totalRequests).toFixed(2)
-    : "0.00";
-  console.log(
-    `[SCREENPILOT_METRICS] reqId=${reqId}` +
-    ` total_requests=${_m.totalRequests}` +
-    ` total_gemini_calls=${_m.totalGeminiCalls}` +
-    ` avg_calls_per_request=${avg}` +
-    ` 429_count=${_m.total429}` +
-    ` shared_key_requests=${_m.sharedKeyRequests}` +
-    ` user_key_requests=${_m.userKeyRequests}`
-  );
-}
-
-type BlockReason = 'session' | 'global' | null;
-
-function allowRequest(sessionId: string, reqId: string): BlockReason {
-  const now = Date.now();
-
-  // ── Per-session limiter ────────────────────────────────────────────────
-  const s = sessions.get(sessionId);
-  let sessionCount: number;
-  if (!s || now > s.resetAt) {
-    sessions.set(sessionId, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    sessionCount = 1;
-  } else {
-    if (s.count >= RATE_MAX) {
-      console.warn(`[analyze] ${reqId} rate=BLOCKED session=${sessionId} count=${s.count}/${RATE_MAX}`);
-      return 'session';
-    }
-    s.count++;
-    sessionCount = s.count;
-  }
-  console.log(`[analyze] ${reqId} rate=PASS session=${sessionId} session_count=${sessionCount}/${RATE_MAX}`);
-
-  // ── Global limiter (protects shared Gemini API key) ────────────────────
-  if (now > globalResetAt) {
-    globalCount = 1;
-    globalResetAt = now + RATE_WINDOW_MS;
-    console.log(`[analyze] ${reqId} global_rate=PASS count=${globalCount}/${GLOBAL_MAX}`);
-    return null;
-  }
-  if (globalCount >= GLOBAL_MAX) {
-    console.warn(`[analyze] ${reqId} rate=GLOBAL_BLOCKED count=${globalCount}/${GLOBAL_MAX}`);
-    return 'global';
-  }
-  globalCount++;
-  console.log(`[analyze] ${reqId} global_rate=PASS count=${globalCount}/${GLOBAL_MAX}`);
-  return null;
-}
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "Content-Type, X-Session-ID, X-Gemini-Key",
-};
+// Phase 2: BYOK removed — provider keys are server-side only. "X-Gemini-Key"
+// is no longer accepted or listed as an allowed request header.
+const CORS_HEADERS = buildCorsHeaders("Content-Type, X-Session-ID");
+const rateLimiter  = createRateLimiter();
 
 export async function OPTIONS() {
-  return new NextResponse(null, {
-    status: 204,
-    headers: { ...CORS_HEADERS, "Access-Control-Allow-Methods": "POST, OPTIONS" },
-  });
+  return preflight(CORS_HEADERS, "POST, OPTIONS");
 }
 
 export async function POST(req: NextRequest) {
-  const reqId = crypto.randomUUID().slice(0, 8);
+  const reqId = newRequestId();
+  const t0    = Date.now();
 
-  // User-supplied key takes priority over shared env key (BYOK).
-  const userApiKey = req.headers.get("x-gemini-key");
-  const sharedKey  = process.env.GEMINI_API_KEY;
-  const apiKey     = userApiKey || sharedKey;
-
-  if (!apiKey) {
-    console.error(`[analyze] ${reqId} no API key available`);
+  const selection = selectVisionProvider();
+  if (!selection) {
+    logError("analyze_no_key", { reqId });
     return json({ error: "Service not configured." }, 500);
   }
 
   const sessionId = req.headers.get("x-session-id") ?? "anon";
+  logEvent("analyze_request", { reqId, session: sessionId.slice(-8), model: selection.model });
 
-  // Skip global rate limit when user provides their own key — they burn their own quota.
-  _m.totalRequests++;
-  if (userApiKey) { _m.userKeyRequests++; } else { _m.sharedKeyRequests++; }
-
-  const keyType = userApiKey ? "user" : "shared";
-  const activeKey = userApiKey ?? sharedKey!;
-  const keyFingerprint = `${activeKey.slice(0, 4)}...${activeKey.slice(-4)}`;
-  console.log(
-    `[SP:REQ] reqId=${reqId} ts=${new Date().toISOString()}` +
-    ` session=${sessionId.slice(-8)} key=${keyType}` +
-    ` keyFingerprint=${keyFingerprint} X-Gemini-Key-present=${!!userApiKey}`
-  );
-
-  if (!userApiKey) {
-    const blockReason = allowRequest(sessionId, reqId);
-    if (blockReason === 'session') {
-      console.error(`[analyze] ${reqId} 429 SESSION_RATE_LIMIT session=${sessionId} max=${RATE_MAX}`);
-      logMetrics(reqId);
-      return json({ error: `Too many requests — please wait a moment and try again.`, source: "session" }, 429);
-    }
-    if (blockReason === 'global') {
-      console.error(`[analyze] ${reqId} 429 GLOBAL_RATE_LIMIT count=${globalCount}/${GLOBAL_MAX}`);
-      logMetrics(reqId);
-      return json({ error: `Too many requests — please wait a moment and try again.`, source: "global" }, 429);
-    }
+  const block = rateLimiter.check(sessionId);
+  if (block === "session" || block === "global") {
+    logWarn("analyze_rate_limited", { reqId, scope: block });
+    return json({ error: "Too many requests — please wait a moment and try again.", source: block }, 429);
   }
 
   let body: {
@@ -162,119 +70,98 @@ export async function POST(req: NextRequest) {
     return json({ error: "Invalid JSON body." }, 400);
   }
 
-  const { screenshot, goal, pageContext = {}, taskState = null, enterpriseContext = null, mode: rawMode = "navigate" } = body;
-  const mode: Mode = (["navigate", "explain", "ask"] as const).includes(rawMode as Mode)
-    ? (rawMode as Mode)
-    : "navigate";
-
-  if (!goal?.trim()) return json({ error: "goal is required." }, 400);
-  if (!screenshot?.image) return json({ error: "screenshot.image is required." }, 400);
-
-  // Payload size guard — reject oversized screenshots before sending to Gemini
-  if (screenshot.image.length > MAX_SCREENSHOT_BYTES) {
-    console.warn(`[analyze] ${reqId} screenshot too large: ${screenshot.image.length} bytes`);
-    return json({ error: "Screenshot too large. Please zoom out or reduce browser zoom level." }, 413);
+  const invalid = validateAnalyzeRequest(body);
+  if (invalid) {
+    if (invalid.status === 413) logWarn("analyze_screenshot_too_large", { reqId, bytes: body?.screenshot?.image?.length });
+    return json({ error: invalid.error }, invalid.status);
   }
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${MODELS[mode]}:generateContent`;
+  // Server-side PII backstop — a second, independent layer behind the
+  // extension's own client-side sanitizer (Phase 1). Never rejects; the
+  // screenshot passes through untouched (masked client-side, not scanned here).
+  const safeBody = applyPiiBackstop(body, reqId, "analyze");
+
+  const { screenshot, goal, pageContext = {}, taskState = null, enterpriseContext = null, mode: rawMode = "navigate" } = safeBody;
+  const mode: Mode = (["navigate", "explain", "ask"] as const).includes(rawMode as Mode) ? (rawMode as Mode) : "navigate";
+
   const prompt = mode === "ask"
     ? buildQAPrompt(goal, pageContext)
     : buildNavigatePrompt(goal, pageContext, taskState, enterpriseContext);
 
-  // Build request body for logging
-  const requestBody = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType: screenshot.mimeType ?? "image/jpeg", data: screenshot.image } },
-        ],
-      },
-    ],
-    generationConfig: {
-      temperature: mode === "ask" ? 0.3 : 0.2,
-      maxOutputTokens: mode === "ask" ? 512 : 2048,
-      thinkingConfig: { thinkingBudget: 0 },
-    },
-  };
+  logEvent("analyze_dispatch", { reqId, mode, model: selection.model, session: sessionId, promptLen: prompt.length, imageLen: screenshot.image.length });
 
-  console.log(`[analyze] ${reqId} mode=${mode} model=${MODELS[mode]} session=${sessionId} prompt_len=${prompt.length} image_len=${screenshot.image.length}`);
+  const gController  = new AbortController();
+  const gBudgetTimer = setTimeout(() => gController.abort(), TOTAL_BUDGET_MS);
+  const { temperature, maxOutputTokens } = MODE_CONFIG[mode];
 
-  const TOTAL_BUDGET_MS = 22_000;
-  const PER_ATTEMPT_MS  = 12_000;
-  const gController     = new AbortController();
-  const gBudgetTimer    = setTimeout(() => gController.abort(), TOTAL_BUDGET_MS);
-  const MAX_GEMINI_RETRIES = 2;
   try {
-    for (let gAttempt = 1; gAttempt <= MAX_GEMINI_RETRIES; gAttempt++) {
+    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
       if (gController.signal.aborted) {
-        console.error(`[analyze] ${reqId} gemini_budget_exhausted session=${sessionId}`);
+        logError("analyze_budget_exhausted", { reqId, session: sessionId });
         return json({ error: "Analysis timed out — please try again." }, 504);
       }
-      _m.totalGeminiCalls++;
-      console.log(
-        `[SP:GEMINI] reqId=${reqId} attempt=${gAttempt}/${MAX_GEMINI_RETRIES}` +
-        ` ts=${new Date().toISOString()} session=${sessionId.slice(-8)}` +
-        ` key=${keyType} mode=${mode}`
-      );
 
-      let upstream;
-      let localTimeout: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const localController = new AbortController();
-        localTimeout = setTimeout(() => localController.abort(), PER_ATTEMPT_MS);
-        gController.signal.addEventListener('abort', () => localController.abort(), { once: true });
-        upstream = await fetch(`${geminiUrl}?key=${apiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requestBody),
-          signal: localController.signal,
-        });
-        clearTimeout(localTimeout);
-        localTimeout = undefined;
-      } catch (err: unknown) {
-        clearTimeout(localTimeout);
-        const name = (err as Error).name;
-        if (name === "TimeoutError" || name === "AbortError") {
+      logEvent("analyze_attempt", { reqId, attempt, maxAttempts: MAX_GEMINI_RETRIES, mode, model: selection.model });
+
+      const local     = new AbortController();
+      const localTimer = setTimeout(() => local.abort(), PER_ATTEMPT_MS);
+      gController.signal.addEventListener("abort", () => local.abort(), { once: true });
+      const call = await callGemini({ key: selection.key, model: selection.model, prompt, screenshot, signal: local.signal, temperature, maxOutputTokens });
+      clearTimeout(localTimer);
+
+      if (!call.ok) {
+        // A genuine timeout/AbortError (callGemini reports it as status:0,
+        // message:"timeout") is retried once, then 504 — original /api/analyze
+        // behavior, deliberately differing from /api/plan's Gemini retry policy
+        // (which also retries 5xx). See routes-characterization.test.mjs.
+        // A DIFFERENT network-layer failure (status:0 but some other message —
+        // e.g. a generic fetch TypeError) is NOT retried and maps to a plain
+        // 500 "Internal server error." — also original behavior, and the one
+        // case callGemini's uniform {status:0} shape can't distinguish on its
+        // own, so it's disambiguated here via the message it set.
+        if (call.status === 0 && call.message === "timeout") {
           if (gController.signal.aborted) {
-            console.error(`[analyze] ${reqId} gemini_budget_exhausted session=${sessionId}`);
+            logError("analyze_budget_exhausted", { reqId, session: sessionId });
             return json({ error: "Analysis timed out — please try again." }, 504);
           }
-          if (gAttempt < MAX_GEMINI_RETRIES) {
-            const backoffMs = 1000 * Math.pow(2, gAttempt - 1) + Math.random() * 500;
-            console.warn(`[analyze] ${reqId} gemini_timeout retry ${gAttempt + 1}/${MAX_GEMINI_RETRIES} in ${Math.round(backoffMs)}ms`);
-            await new Promise(r => setTimeout(r, backoffMs));
+          if (attempt < MAX_GEMINI_RETRIES) {
+            const backoffMs = 1000 * Math.pow(2, attempt - 1) + Math.random() * 500;
+            logWarn("analyze_timeout_retry", { reqId, nextAttempt: attempt + 1, backoffMs: Math.round(backoffMs) });
+            await new Promise((r) => setTimeout(r, backoffMs));
             continue;
           }
-          console.error(`[analyze] ${reqId} gemini_timeout session=${sessionId}`);
+          logError("analyze_timeout", { reqId, session: sessionId });
           return json({ error: "Analysis timed out — please try again." }, 504);
         }
-        console.error(`[analyze] ${reqId} internal_error`, err);
-        return json({ error: "Internal server error." }, 500);
-      }
-
-      if (!upstream.ok) {
-        const errBody = await upstream.json().catch(() => null);
-        console.error(`[analyze] ${reqId} gemini_status=${upstream.status} body=${JSON.stringify(errBody)}`);
-        if (upstream.status === 429) {
-          // Never retry a 429 — retrying burns more quota without benefit.
-          _m.total429++;
-          const geminiMsg = errBody?.error?.message || JSON.stringify(errBody);
-          console.error(`[SP:GEMINI] ${reqId} 429 QUOTA_EXCEEDED key=${keyType} — not retrying`);
-          logMetrics(reqId);
-          return json({ error: `Gemini API quota exceeded: ${geminiMsg}`, source: "gemini" }, 429);
+        if (call.status === 0) {
+          logError("analyze_internal_error", { reqId });
+          return json({ error: "Internal server error." }, 500);
         }
-        return json({ error: `Upstream error ${upstream.status}.` }, 502);
+
+        logError("analyze_upstream_error", { reqId, status: call.status });
+        if (call.status === 429) {
+          logError("analyze_quota_exceeded", { reqId, model: selection.model });
+          return json({ error: `Gemini API quota exceeded: ${call.message}`, source: "gemini" }, 429);
+        }
+        return json({ error: `Upstream error ${call.status}.` }, 502);
       }
 
-      const data = await upstream.json();
-      console.log(`[SP:GEMINI] ${reqId} attempt=${gAttempt} OK mode=${mode}`);
-      logMetrics(reqId);
-      return NextResponse.json(data, { headers: CORS_HEADERS });
+      logModelOutcome("analyze_model_output", { reqId, model: selection.model, rawLength: call.data.rawText.length, parsedOk: true });
+      logEvent("analyze_complete", { reqId, attempt, mode, latencyMs: Date.now() - t0 });
+      // Contract: /api/analyze returns the raw provider response body verbatim
+      // (vision-service.js reads candidates[0].content.parts[0].text itself) —
+      // unchanged from before this refactor.
+      return NextResponse.json(call.data.raw, { headers: CORS_HEADERS });
     }
+  } catch (err) {
+    logError("analyze_internal_error", { reqId, message: (err as Error)?.message });
+    return json({ error: "Internal server error." }, 500);
   } finally {
     clearTimeout(gBudgetTimer);
   }
+
+  // Unreachable — the loop above always returns; kept only to satisfy TS.
+  return json({ error: "Internal server error." }, 500);
 }
 
 function json(body: object, status: number) {

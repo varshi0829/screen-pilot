@@ -3,9 +3,12 @@
 // Implements BackendAdapter for the ScreenPilot Vercel deployment.
 // The extension never calls AI providers directly; all AI calls are proxied here.
 //
+// Provider API keys are server-side only (Phase 2) — this adapter never holds
+// or sends one; the backend resolves its own key from its own environment.
+//
 // Usage:
 //   import { VercelBackendAdapter } from './vercel-backend-adapter.js';
-//   const backend = new VercelBackendAdapter({ apiKey: userKey });
+//   const backend = new VercelBackendAdapter();
 //   const response = await backend.plan(planRequest);
 
 import { BackendAdapter } from './interface.js';
@@ -20,13 +23,11 @@ export class VercelBackendAdapter extends BackendAdapter {
   /**
    * @param {object} [options]
    * @param {string} [options.baseUrl]    - Backend base URL (defaults to Vercel deployment)
-   * @param {string} [options.apiKey]     - User-supplied Gemini key (BYOK); omit to use shared key
    * @param {string} [options.sessionId]  - Session identifier for rate limiting and telemetry
    */
-  constructor({ baseUrl = DEFAULT_BASE_URL, apiKey, sessionId } = {}) {
+  constructor({ baseUrl = DEFAULT_BASE_URL, sessionId } = {}) {
     super();
     this._baseUrl   = baseUrl.replace(/\/$/, '');
-    this._apiKey    = apiKey ?? null;
     this._sessionId = sessionId ?? crypto.randomUUID().slice(0, 16);
   }
 
@@ -144,7 +145,6 @@ export class VercelBackendAdapter extends BackendAdapter {
       'Content-Type': 'application/json',
       'X-Session-ID': this._sessionId,
     };
-    if (this._apiKey) headers['X-OpenRouter-Key'] = this._apiKey;
 
     // 30 s client-side timeout — matches the Vercel function's own budget ceiling.
     // Without this, a stalled connection hangs the service worker indefinitely.

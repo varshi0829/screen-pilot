@@ -1,16 +1,19 @@
 import { NextResponse } from "next/server";
+import { buildCorsHeaders, preflight } from "../../../server/http";
+import { selectPlannerChain } from "../../../server/model-router";
 
-// Phase 1: single model. See VISION_MODELS in route.ts.
-const VISION_MODELS = ["google/gemini-2.5-flash"] as const;
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-};
+const CORS_HEADERS = buildCorsHeaders("Content-Type");
+const SERVER_SIDE_BUDGET = 12;
 
 export async function GET() {
   const openRouterKeyPresent = !!process.env.OPENROUTER_API_KEY;
   const geminiKeyPresent     = !!process.env.GEMINI_API_KEY;
   const activeProvider       = openRouterKeyPresent ? "openrouter" : geminiKeyPresent ? "gemini-direct" : "none";
+
+  // Phase 2 fix: previously reported a hardcoded, stale model name
+  // ("google/gemini-2.5-flash") unrelated to what /api/plan actually uses.
+  // Now reflects the REAL currently-configured model chain (still never the key).
+  const models = selectPlannerChain().map((s) => s.model);
 
   return NextResponse.json(
     {
@@ -18,16 +21,13 @@ export async function GET() {
       activeProvider,
       openRouterKeyPresent,
       geminiKeyPresent,
-      models:               VISION_MODELS,
-      serverSideBudget:     12,
+      models,
+      serverSideBudget:     SERVER_SIDE_BUDGET,
     },
     { headers: CORS_HEADERS }
   );
 }
 
 export async function OPTIONS() {
-  return new NextResponse(null, {
-    status:  204,
-    headers: { ...CORS_HEADERS, "Access-Control-Allow-Methods": "GET, OPTIONS" },
-  });
+  return preflight(CORS_HEADERS, "GET, OPTIONS");
 }

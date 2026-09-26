@@ -3,6 +3,10 @@
 document.addEventListener('DOMContentLoaded', () => {
   const DEFAULT_BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
 
+  // Phase 2: BYOK removed — provider keys are server-side only now. Purge any
+  // key a previous version of the popup may have stored in plaintext.
+  chrome.storage.local.remove(['openRouterApiKey', 'geminiApiKey']).catch(() => {});
+
   // ── Tab switching ─────────────────────────────────────────────────────────────
   document.querySelectorAll('.sp-tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -128,19 +132,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Settings tab ──────────────────────────────────────────────────────────────
   async function loadSettings() {
-    const { openRouterApiKey, screenPilotBackendUrl, executionMode } = await chrome.storage.local.get(['openRouterApiKey', 'screenPilotBackendUrl', 'executionMode']);
+    const { screenPilotBackendUrl, executionMode } = await chrome.storage.local.get(['screenPilotBackendUrl', 'executionMode']);
     localAiCheckbox.checked = executionMode === 'local-qwen';
-    const statusEl = document.getElementById('key-status');
-    const inputEl  = document.getElementById('openrouter-key-input');
-    if (openRouterApiKey) {
-      inputEl.placeholder = '••••••••' + openRouterApiKey.slice(-4);
-      statusEl.textContent = 'Your key is active — using your own OpenRouter quota';
-      statusEl.className = 'sp-key-status saved';
-    } else {
-      inputEl.placeholder = 'sk-or-...';
-      statusEl.textContent = 'No key set — using shared quota (may hit limits)';
-      statusEl.className = 'sp-key-status';
-    }
 
     const backendInput = document.getElementById('backend-url-input');
     const backendStatus = document.getElementById('backend-status');
@@ -155,32 +148,6 @@ document.addEventListener('DOMContentLoaded', () => {
       backendStatus.className = 'sp-key-status';
     }
   }
-
-  document.getElementById('save-key-btn').addEventListener('click', async () => {
-    const inputEl  = document.getElementById('openrouter-key-input');
-    const statusEl = document.getElementById('key-status');
-    const key = inputEl.value.trim();
-    if (!key) {
-      statusEl.textContent = 'Paste a key first.';
-      statusEl.className = 'sp-key-status error';
-      return;
-    }
-    await chrome.storage.local.set({ openRouterApiKey: key });
-    inputEl.value = '';
-    inputEl.placeholder = '••••••••' + key.slice(-4);
-    statusEl.textContent = 'Key saved — using your own OpenRouter quota';
-    statusEl.className = 'sp-key-status saved';
-  });
-
-  document.getElementById('clear-key-btn').addEventListener('click', async () => {
-    await chrome.storage.local.remove('openRouterApiKey');
-    const inputEl  = document.getElementById('openrouter-key-input');
-    const statusEl = document.getElementById('key-status');
-    inputEl.value = '';
-    inputEl.placeholder = 'sk-or-...';
-    statusEl.textContent = 'Key cleared — using shared quota';
-    statusEl.className = 'sp-key-status';
-  });
 
   document.getElementById('save-backend-btn').addEventListener('click', async () => {
     const inputEl = document.getElementById('backend-url-input');

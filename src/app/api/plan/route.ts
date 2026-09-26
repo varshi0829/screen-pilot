@@ -1,40 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
+import { buildCorsHeaders, preflight, newRequestId } from "../../../server/http";
+import { validatePlanRequest, applyPiiBackstop } from "../../../server/validate";
+import { createRateLimiter } from "../../../server/rate-limit";
+import { logEvent, logWarn, logError, logModelOutcome } from "../../../server/logger";
+import { selectPlannerChain, runPlannerChain } from "../../../server/model-router";
 
 const PLANNER_VERSION       = "2.0";
-const GEMINI_MODEL          = "gemini-2.5-flash";
-const RATE_WINDOW_MS        = 60_000;
-const RATE_MAX              = 100;
-const MAX_SCREENSHOT_BYTES  = 8 * 1024 * 1024;
 const TOTAL_BUDGET_MS       = 22_000;
 const PER_ATTEMPT_MS        = 12_000;
-const MAX_GEMINI_RETRIES    = 2;
-const GLOBAL_MAX            = 12;
 const MAX_SERVER_SIDE_CALLS = 12;
 
-// Submission-day stabilization: Gemini free-tier quota exhausted — temporarily
-// switched to a free OpenRouter multimodal model. Swap back by changing this
-// one string; nothing else in the OpenRouter path is model-specific.
-// Phase 1: single model only. Phase 2: add "anthropic/claude-haiku-4-5-20251001".
-const VISION_MODELS: readonly string[] = [
-  "google/gemma-4-26b-a4b-it:free",
-];
+// Phase 2: BYOK removed — provider keys are server-side only (env vars via
+// model-router.ts). "X-OpenRouter-Key"/"X-Gemini-Key" are no longer accepted
+// or listed as allowed request headers.
+const CORS_HEADERS = buildCorsHeaders("Content-Type, X-Session-ID");
+const rateLimiter  = createRateLimiter();
 
-// 400/401/403 mean the request itself is broken — retrying a different model won't help.
-const FATAL_UPSTREAM_STATUS = new Set([400, 401, 403]);
-
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
-const sessions = new Map<string, { count: number; resetAt: number }>();
-let globalCount   = 0;
-let globalResetAt = 0;
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Headers": "Content-Type, X-Session-ID, X-OpenRouter-Key",
-};
-
-// ── Request / Response types ──────────────────────────────────────────────────
+// ── Request / Response types (unchanged) ───────────────────────────────────────
 
 type PlanRequest = {
   schemaVersion?: string;
@@ -117,46 +99,6 @@ type PlannerOutput = {
   };
 };
 
-// ── Rate limiting ─────────────────────────────────────────────────────────────
-
-function checkRateLimit(sessionId: string, reqId: string, isUserKey: boolean): "session" | "global" | null {
-  const now = Date.now();
-  const s   = sessions.get(sessionId);
-  if (!s || now > s.resetAt) {
-    sessions.set(sessionId, { count: 1, resetAt: now + RATE_WINDOW_MS });
-  } else {
-    if (s.count >= RATE_MAX) {
-      console.warn(`[SP:PLAN] ${reqId} rate=BLOCKED session=${sessionId}`);
-      return "session";
-    }
-    s.count++;
-  }
-  if (isUserKey) return null;
-  if (now > globalResetAt) {
-    globalCount   = 1;
-    globalResetAt = now + RATE_WINDOW_MS;
-    return null;
-  }
-  if (globalCount >= GLOBAL_MAX) {
-    console.warn(`[SP:PLAN] ${reqId} rate=GLOBAL_BLOCKED count=${globalCount}/${GLOBAL_MAX}`);
-    return "global";
-  }
-  globalCount++;
-  return null;
-}
-
-// ── Provider abstraction ──────────────────────────────────────────────────────
-
-type ProviderResult = {
-  rawText:      string;
-  finishReason: string;
-  modelUsed:    string;
-  usage: { inputTokens: number; outputTokens: number };
-};
-
-type CallOk    = { ok: true;  data: ProviderResult };
-type CallError = { ok: false; status: number; message: string };
-
 function extractJson(text: string): string {
   // Strip markdown code fences that Claude, Qwen, and others add around JSON output
   const stripped = text.replace(/^```(?:json)?\s*\n?/m, "").replace(/\n?```\s*$/m, "").trim();
@@ -164,144 +106,16 @@ function extractJson(text: string): string {
   return match?.[0] ?? stripped;
 }
 
-async function callGeminiDirect(
-  key:        string,
-  prompt:     string,
-  screenshot: { image: string; mimeType?: string },
-  signal:     AbortSignal,
-): Promise<CallOk | CallError> {
-  const body = {
-    contents: [{
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: screenshot.mimeType ?? "image/jpeg", data: screenshot.image } },
-      ],
-    }],
-    generationConfig: {
-      temperature:     0.1,
-      maxOutputTokens: 2048,
-      thinkingConfig:  { thinkingBudget: 0 }, // Gemini-specific: disable extended thinking
-    },
-  };
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${GEMINI_URL}?key=${key}`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(body),
-      signal,
-    });
-  } catch (err: unknown) {
-    const name = (err as Error).name;
-    return { ok: false, status: 0, message: (name === "AbortError" || name === "TimeoutError") ? "timeout" : (err as Error).message };
-  }
-
-  if (!upstream.ok) {
-    const errBody = await upstream.json().catch(() => null);
-    return { ok: false, status: upstream.status, message: errBody?.error?.message ?? JSON.stringify(errBody ?? "").slice(0, 500) };
-  }
-
-  const data        = await upstream.json();
-  const rawText     = (data?.candidates?.[0]?.content?.parts?.[0]?.text  as string | undefined) ?? "";
-  const finishReason = (data?.candidates?.[0]?.finishReason               as string | undefined) ?? "STOP";
-  return {
-    ok: true,
-    data: {
-      rawText,
-      finishReason,
-      modelUsed: GEMINI_MODEL,
-      usage: {
-        inputTokens:  (data?.usageMetadata?.promptTokenCount     as number | undefined) ?? 0,
-        outputTokens: (data?.usageMetadata?.candidatesTokenCount as number | undefined) ?? 0,
-      },
-    },
-  };
-}
-
-async function callOpenRouter(
-  key:        string,
-  model:      string,
-  prompt:     string,
-  screenshot: { image: string; mimeType?: string },
-  signal:     AbortSignal,
-): Promise<CallOk | CallError> {
-  const mimeType = screenshot.mimeType ?? "image/jpeg";
-  const body = {
-    model,
-    messages: [{
-      role:    "user",
-      content: [
-        { type: "text",      text: prompt },
-        { type: "image_url", image_url: { url: `data:${mimeType};base64,${screenshot.image}` } },
-      ],
-    }],
-    temperature: 0.1,
-    max_tokens:  768,
-  };
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(OPENROUTER_URL, {
-      method:  "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${key}`,
-        "HTTP-Referer":  "https://screen-pilot-j1az.vercel.app",
-        "X-Title":       "ScreenPilot",
-      },
-      body:   JSON.stringify(body),
-      signal,
-    });
-  } catch (err: unknown) {
-    const name = (err as Error).name;
-    return { ok: false, status: 0, message: (name === "AbortError" || name === "TimeoutError") ? "timeout" : (err as Error).message };
-  }
-
-  // TEMPORARY DEBUG (submission-day Gemma compatibility diagnosis — remove after) —
-  // never logs the key; content-type + status only, no body read yet.
-
-  if (!upstream.ok) {
-    const errBody = await upstream.json().catch(() => null);
-    return { ok: false, status: upstream.status, message: errBody?.error?.message ?? JSON.stringify(errBody ?? "").slice(0, 500) };
-  }
-
-  const data         = await upstream.json();
-  const rawText      = (data?.choices?.[0]?.message?.content as string | undefined) ?? "";
-  const finishReason = (data?.choices?.[0]?.finish_reason   as string | undefined) ?? "stop";
-  // TEMPORARY DEBUG — truncated raw content only, never the API key.
-  console.log(
-    ` raw_len=${rawText.length} raw_content=${JSON.stringify(rawText.slice(0, 800))}`
-  );
-  return {
-    ok: true,
-    data: {
-      rawText,
-      finishReason,
-      modelUsed: model,
-      usage: {
-        inputTokens:  (data?.usage?.prompt_tokens     as number | undefined) ?? 0,
-        outputTokens: (data?.usage?.completion_tokens as number | undefined) ?? 0,
-      },
-    },
-  };
-}
-
-// ── Telemetry ─────────────────────────────────────────────────────────────────
-
-function logTelemetry(fields: Record<string, unknown>): void {
-  console.log(JSON.stringify({ ...fields, ts: new Date().toISOString() }));
-}
-
-// ── Plan response assembly ────────────────────────────────────────────────────
+// ── Plan response assembly (unchanged logic; provider tag now selection-driven) ─
 
 function assemblePlanResponse(
   reqId:     string,
   t0:        number,
   requestId: string | undefined,
   goal:      string,
-  keyType:   string,
-  { rawText, finishReason, modelUsed, usage }: ProviderResult,
+  provider:  string,
+  model:     string,
+  { rawText, finishReason, usage }: { rawText: string; finishReason: string; usage: { inputTokens: number; outputTokens: number } },
 ): NextResponse {
   // Safety blocks: Gemini uses SAFETY/PROHIBITED_CONTENT, OpenRouter uses content_filter
   const isBlocked = finishReason === "SAFETY"
@@ -309,25 +123,20 @@ function assemblePlanResponse(
     || finishReason === "content_filter";
 
   if (!rawText || isBlocked) {
-    console.error(`[SP:PLAN] reqId=${reqId} blocked finishReason=${finishReason ?? "no_candidates"} model=${modelUsed}`);
-    logTelemetry({ event: "plan_failed", reqId, keyType, model: modelUsed, latencyMs: Date.now() - t0, errorCode: "SAFETY_BLOCK", success: false });
-    return errorResponse(reqId, "Request blocked by content filters.", "SAFETY_BLOCK", 422, t0);
+    logError("plan_blocked", { reqId, finishReason: finishReason ?? "no_candidates", model });
+    logEvent("plan_failed", { reqId, provider, model, latencyMs: Date.now() - t0, errorCode: "SAFETY_BLOCK", success: false });
+    return errorResponse(reqId, "Request blocked by content filters.", "SAFETY_BLOCK", 422, t0, provider, model);
   }
 
   let parsed: PlannerOutput;
   try {
     parsed = JSON.parse(extractJson(rawText));
-  } catch (err) {
-    // TEMPORARY DEBUG (submission-day Gemma compatibility diagnosis — remove after) —
-    // exact parse error plus what extraction produced, so we can see whether
-    // extractJson even isolated something JSON-shaped before JSON.parse threw.
-    console.error(
-      ` extracted=${JSON.stringify(extractJson(rawText).slice(0, 800))}`
-    );
-    console.error(`[SP:PLAN] reqId=${reqId} parse_failed model=${modelUsed} raw=${rawText.slice(0, 300)}`);
-    logTelemetry({ event: "plan_failed", reqId, keyType, model: modelUsed, latencyMs: Date.now() - t0, errorCode: "PARSE_ERROR", success: false });
-    return errorResponse(reqId, "Planner returned an unparseable response.", "PARSE_ERROR", 502, t0);
+  } catch {
+    logModelOutcome("plan_parse_failed", { reqId, model, rawLength: rawText.length, parsedOk: false });
+    logEvent("plan_failed", { reqId, provider, model, latencyMs: Date.now() - t0, errorCode: "PARSE_ERROR", success: false });
+    return errorResponse(reqId, "Planner returned an unparseable response.", "PARSE_ERROR", 502, t0, provider, model);
   }
+  logModelOutcome("plan_model_output", { reqId, model, rawLength: rawText.length, parsedOk: true });
 
   const VALID_RESULTS = new Set(["OK", "NEEDS_USER", "FAILED"]);
   const VALID_STATES  = new Set(["planned", "blocked", "complete", "ambiguous"]);
@@ -336,7 +145,7 @@ function assemblePlanResponse(
   const state  = VALID_STATES.has(parsed.state)   ? parsed.state  as "planned" | "blocked" | "complete" | "ambiguous" : "ambiguous";
 
   if (result !== parsed.result || state !== parsed.state) {
-    console.warn(`[SP:PLAN] reqId=${reqId} invalid_enum result=${String(parsed.result)}→${result} state=${String(parsed.state)}→${state}`);
+    logWarn("plan_invalid_enum", { reqId, rawResult: String(parsed.result), result, rawState: String(parsed.state), state });
   }
 
   const planId = crypto.randomUUID();
@@ -359,27 +168,17 @@ function assemblePlanResponse(
   } : undefined;
 
   if (!planApplicable && parsed.plan != null) {
-    console.warn(`[SP:PLAN] reqId=${reqId} plan_suppressed state=${state}`);
+    logWarn("plan_suppressed", { reqId, state });
   }
 
   const latencyMs    = Date.now() - t0;
   const stepCount    = Array.isArray(plan?.steps) ? plan.steps.length : 0;
   const estimatedUSD = ((usage.inputTokens * 0.25) + (usage.outputTokens * 0.75)) / 1_000_000;
 
-  logTelemetry({
-    event:        "plan_complete",
-    reqId,
-    keyType,
-    model:        modelUsed,
-    latencyMs,
-    inputTokens:  usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    estimatedUSD,
-    result,
-    state,
-    steps:        stepCount,
-    confidence:   parsed.confidence ?? 0,
-    success:      true,
+  logEvent("plan_complete", {
+    reqId, provider, model, latencyMs,
+    inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedUSD,
+    result, state, steps: stepCount, confidence: parsed.confidence ?? 0, success: true,
   });
 
   return NextResponse.json({
@@ -395,8 +194,8 @@ function assemblePlanResponse(
     plannerSummary: parsed.plannerSummary,
     confidence:     parsed.confidence ?? 0,
     providerMetadata: {
-      provider:       "openrouter",
-      model:          modelUsed,
+      provider,
+      model,
       plannerVersion: PLANNER_VERSION,
       latencyMs,
       inputTokens:    usage.inputTokens,
@@ -409,62 +208,60 @@ function assemblePlanResponse(
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 export async function OPTIONS() {
-  return new NextResponse(null, {
-    status:  204,
-    headers: { ...CORS_HEADERS, "Access-Control-Allow-Methods": "POST, OPTIONS" },
-  });
+  return preflight(CORS_HEADERS, "POST, OPTIONS");
 }
 
 export async function POST(req: NextRequest) {
-  const reqId = crypto.randomUUID().slice(0, 8);
+  const reqId = newRequestId();
   const t0    = Date.now();
 
-  const userOrKey   = req.headers.get("x-openrouter-key"); // BYOK: user's own OpenRouter key
-  const sharedOrKey = process.env.OPENROUTER_API_KEY;      // primary shared key
-  const geminiKey   = process.env.GEMINI_API_KEY;          // legacy fallback
-  const sessionId   = req.headers.get("x-session-id") ?? "anon";
-  const keyType     = userOrKey ? "byok" : sharedOrKey ? "shared-or" : "shared-gemini";
+  const chain     = selectPlannerChain();
+  const provider  = chain[0]?.provider ?? "none";
+  const sessionId = req.headers.get("x-session-id") ?? "anon";
 
-  console.log(
-    `[SP:PLAN] reqId=${reqId} ts=${new Date().toISOString()}` +
-    ` session=${sessionId.slice(-8)} keyType=${keyType}` +
-    ` openRouterPresent=${!!(userOrKey || sharedOrKey)} geminiPresent=${!!geminiKey}`
-  );
+  logEvent("plan_request", {
+    reqId, session: sessionId.slice(-8), provider,
+    openRouterPresent: !!process.env.OPENROUTER_API_KEY, geminiPresent: !!process.env.GEMINI_API_KEY,
+  });
 
-  if (!userOrKey && !sharedOrKey && !geminiKey) {
-    return errorResponse(reqId, "Service not configured — no API key available.", "SERVICE_UNAVAILABLE", 500, t0);
+  if (chain.length === 0) {
+    return errorResponse(reqId, "Service not configured — no API key available.", "SERVICE_UNAVAILABLE", 500, t0, "none", "none");
   }
 
-  if (!userOrKey) {
-    const block = checkRateLimit(sessionId, reqId, false);
-    if (block === "session") return errorResponse(reqId, "Too many requests — please wait a moment.", "RATE_LIMITED", 429, t0);
-    if (block === "global")  return errorResponse(reqId, "Too many requests — please wait a moment.", "RATE_LIMITED", 429, t0);
+  const block = rateLimiter.check(sessionId);
+  if (block === "session" || block === "global") {
+    logWarn("plan_rate_limited", { reqId, scope: block });
+    return errorResponse(reqId, "Too many requests — please wait a moment.", "RATE_LIMITED", 429, t0, provider, chain[0].model);
   }
 
-  let body: PlanRequest;
+  let body: Partial<PlanRequest> | null;
   try {
     body = await req.json();
   } catch {
-    return errorResponse(reqId, "Invalid JSON body.", "INVALID_REQUEST", 400, t0);
+    return errorResponse(reqId, "Invalid JSON body.", "INVALID_REQUEST", 400, t0, provider, chain[0].model);
   }
+
+  const invalid = validatePlanRequest(body as PlanRequest | null);
+  if (invalid) {
+    return errorResponse(reqId, invalid.error, invalid.status === 413 ? "SCREENSHOT_TOO_LARGE" : "INVALID_REQUEST", invalid.status, t0, provider, chain[0].model);
+  }
+
+  // Server-side PII backstop — a SECOND, independent layer behind the
+  // extension's own client-side sanitizer (Phase 1). Redacts and logs; never
+  // rejects. The screenshot is passed through untouched (masked client-side).
+  const safeBody = applyPiiBackstop(body as PlanRequest, reqId, "plan");
 
   const {
     goal, page, previousPage, executionHistory, workflowMemory,
     recoveryContext, preferences, applicationMetadata, requestId, clarifications,
     pageControls,
-  } = body;
-
-  if (!goal?.trim())            return errorResponse(reqId, "goal is required.",                   "INVALID_REQUEST",     400, t0);
-  if (!page?.url)               return errorResponse(reqId, "page.url is required.",               "INVALID_REQUEST",     400, t0);
-  if (!page?.screenshot?.image) return errorResponse(reqId, "page.screenshot.image is required.",  "INVALID_REQUEST",     400, t0);
-  if (page.screenshot.image.length > MAX_SCREENSHOT_BYTES)
-    return errorResponse(reqId, "Screenshot too large — zoom out and try again.", "SCREENSHOT_TOO_LARGE", 413, t0);
+  } = safeBody;
 
   // Server-side budget — second line of defense after the client-side session budget
   const attemptCount = executionHistory?.attemptCount ?? 0;
   if (attemptCount > MAX_SERVER_SIDE_CALLS) {
-    console.warn(`[SP:PLAN] reqId=${reqId} BUDGET_EXCEEDED attemptCount=${attemptCount}`);
-    return errorResponse(reqId, "Planner budget exceeded for this workflow.", "BUDGET_EXCEEDED", 429, t0);
+    logWarn("plan_budget_exceeded", { reqId, attemptCount });
+    return errorResponse(reqId, "Planner budget exceeded for this workflow.", "BUDGET_EXCEEDED", 429, t0, provider, chain[0].model);
   }
 
   let prompt: string;
@@ -475,79 +272,56 @@ export async function POST(req: NextRequest) {
       pageControls,
     });
   } catch (err) {
-    console.error(`[SP:PLAN] reqId=${reqId} prompt_build_error`, err);
-    return errorResponse(reqId, "Invalid request data.", "INVALID_REQUEST", 400, t0);
+    logError("plan_prompt_build_error", { reqId, message: (err as Error)?.message });
+    return errorResponse(reqId, "Invalid request data.", "INVALID_REQUEST", 400, t0, provider, chain[0].model);
   }
 
-  console.log(
-    `[SP:PLAN] reqId=${reqId} keyType=${keyType}` +
-    ` prompt_len=${prompt.length} image_len=${page.screenshot.image.length} attemptCount=${attemptCount}`
-  );
+  logEvent("plan_dispatch", { reqId, provider, promptLen: prompt.length, imageLen: page.screenshot.image.length, attemptCount });
 
   const gController  = new AbortController();
   const gBudgetTimer = setTimeout(() => gController.abort(), TOTAL_BUDGET_MS);
 
   try {
-    // ── BYOK: user-supplied OpenRouter key ─────────────────────────────────
-    if (userOrKey) {
-      if (gController.signal.aborted) return errorResponse(reqId, "Analysis timed out.", "TIMEOUT", 504, t0);
-      const local = new AbortController();
-      const lt    = setTimeout(() => local.abort(), PER_ATTEMPT_MS);
-      gController.signal.addEventListener("abort", () => local.abort(), { once: true });
-      const call  = await callOpenRouter(userOrKey, VISION_MODELS[0], prompt, page.screenshot, local.signal);
-      clearTimeout(lt);
-      if (!call.ok) {
-        logTelemetry({ event: "plan_failed", reqId, keyType, model: VISION_MODELS[0], latencyMs: Date.now() - t0, upstreamStatus: call.status, errorCode: "UPSTREAM_ERROR", success: false });
-        return errorResponse(reqId, call.message, "UPSTREAM_ERROR", 502, t0, { provider: "openrouter", upstreamStatus: call.status, message: call.message });
-      }
-      return assemblePlanResponse(reqId, t0, requestId, goal, keyType, call.data);
+    const chainResult = await runPlannerChain(chain, {
+      prompt,
+      screenshot: page.screenshot,
+      outerSignal: gController.signal,
+      perAttemptMs: PER_ATTEMPT_MS,
+      onAttempt: (evt) => logEvent("plan_attempt", { reqId, ...evt }),
+    });
+
+    if (chainResult.ok) {
+      return assemblePlanResponse(reqId, t0, requestId, goal, chainResult.selection.provider, chainResult.selection.model, chainResult.data);
     }
 
-    // ── Shared OpenRouter key: try each model in priority order ────────────
-    if (sharedOrKey) {
-      let lastErr = { status: 0, message: "all models exhausted" };
-      for (const model of VISION_MODELS) {
-        if (gController.signal.aborted) return errorResponse(reqId, "Analysis timed out.", "TIMEOUT", 504, t0);
-        console.log(`[SP:PLAN] reqId=${reqId} trying model=${model}`);
-        const local = new AbortController();
-        const lt    = setTimeout(() => local.abort(), PER_ATTEMPT_MS);
-        gController.signal.addEventListener("abort", () => local.abort(), { once: true });
-        const call  = await callOpenRouter(sharedOrKey, model, prompt, page.screenshot, local.signal);
-        clearTimeout(lt);
-        if (call.ok) return assemblePlanResponse(reqId, t0, requestId, goal, keyType, call.data);
-        logTelemetry({ event: "plan_failed", reqId, keyType, model, latencyMs: Date.now() - t0, upstreamStatus: call.status, errorCode: "UPSTREAM_ERROR", success: false });
-        lastErr = { status: call.status, message: call.message };
-        if (FATAL_UPSTREAM_STATUS.has(call.status)) {
-          console.error(`[SP:PLAN] reqId=${reqId} fatal status=${call.status} model=${model} — aborting`);
-          return errorResponse(reqId, call.message, "UPSTREAM_ERROR", 502, t0, { provider: "openrouter", upstreamStatus: call.status, message: call.message });
-        }
-        console.warn(`[SP:PLAN] reqId=${reqId} model=${model} status=${call.status} — trying next`);
-      }
-      return errorResponse(reqId, lastErr.message, "UPSTREAM_ERROR", 502, t0, { provider: "openrouter", upstreamStatus: lastErr.status, message: lastErr.message });
+    const failedProvider = chainResult.selection?.provider ?? provider;
+    const failedModel    = chainResult.selection?.model ?? chain[0].model;
+
+    if (gController.signal.aborted && chainResult.message === "timeout") {
+      return errorResponse(reqId, "Analysis timed out.", "TIMEOUT", 504, t0, failedProvider, failedModel);
     }
 
-    // ── Legacy: shared Gemini key (OPENROUTER_API_KEY not set) ────────────
-    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
-      if (gController.signal.aborted) return errorResponse(reqId, "Analysis timed out.", "TIMEOUT", 504, t0);
-      console.log(`[SP:PLAN] reqId=${reqId} gemini-direct attempt=${attempt}/${MAX_GEMINI_RETRIES}`);
-      const local = new AbortController();
-      const lt    = setTimeout(() => local.abort(), PER_ATTEMPT_MS);
-      gController.signal.addEventListener("abort", () => local.abort(), { once: true });
-      const call  = await callGeminiDirect(geminiKey!, prompt, page.screenshot, local.signal);
-      clearTimeout(lt);
-      if (call.ok) return assemblePlanResponse(reqId, t0, requestId, goal, keyType, call.data);
-      logTelemetry({ event: "plan_failed", reqId, keyType, model: GEMINI_MODEL, latencyMs: Date.now() - t0, upstreamStatus: call.status, errorCode: call.status === 429 ? "QUOTA_EXCEEDED" : "UPSTREAM_ERROR", success: false });
-      if (FATAL_UPSTREAM_STATUS.has(call.status) || call.status === 429) {
-        return errorResponse(reqId, call.message, call.status === 429 ? "QUOTA_EXCEEDED" : "UPSTREAM_ERROR",
-          call.status === 429 ? 429 : 502, t0, { provider: "gemini", upstreamStatus: call.status, message: call.message });
+    logEvent("plan_failed", { reqId, provider: failedProvider, model: failedModel, latencyMs: Date.now() - t0, upstreamStatus: chainResult.status, success: false });
+
+    // Reproduces the exact pre-refactor per-provider status mapping:
+    //   OpenRouter — any failure -> 502 UPSTREAM_ERROR.
+    //   Gemini     — 429 -> 429 QUOTA_EXCEEDED (never retried, handled inside
+    //                the chain); a fatal 400/401/403 -> 502 UPSTREAM_ERROR;
+    //                anything else (timeout/5xx, already retried once inside
+    //                the chain) -> 504 TIMEOUT.
+    if (failedProvider === "gemini") {
+      if (chainResult.status === 429) {
+        return errorResponse(reqId, chainResult.message, "QUOTA_EXCEEDED", 429, t0, failedProvider, failedModel,
+          { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });
       }
-      if (attempt < MAX_GEMINI_RETRIES) {
-        const backoff = 1000 * Math.pow(2, attempt - 1) + Math.random() * 500;
-        console.warn(`[SP:PLAN] reqId=${reqId} gemini timeout — retry in ${Math.round(backoff)}ms`);
-        await new Promise(r => setTimeout(r, backoff));
+      if ([400, 401, 403].includes(chainResult.status)) {
+        return errorResponse(reqId, chainResult.message, "UPSTREAM_ERROR", 502, t0, failedProvider, failedModel,
+          { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });
       }
+      return errorResponse(reqId, "Analysis timed out — please try again.", "TIMEOUT", 504, t0, failedProvider, failedModel);
     }
-    return errorResponse(reqId, "Analysis timed out — please try again.", "TIMEOUT", 504, t0);
+    return errorResponse(reqId, chainResult.message, "UPSTREAM_ERROR", 502, t0, failedProvider, failedModel,
+      { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });
   } finally {
     clearTimeout(gBudgetTimer);
   }
@@ -561,22 +335,19 @@ function errorResponse(
   errorCode: string,
   status:    number,
   t0:        number,
+  provider:  string,
+  model:     string,
   extra?:    Record<string, unknown>,
 ) {
   const latencyMs = Date.now() - t0;
-  console.error(`[SP:PLAN] reqId=${reqId} ${errorCode} latencyMs=${latencyMs}`);
+  logError("plan_error", { reqId, errorCode, latencyMs });
   return NextResponse.json(
     {
       schemaVersion: "1",
       result:        "FAILED",
       blockers:      [],
       confidence:    0,
-      providerMetadata: {
-        provider:       "openrouter",
-        model:          VISION_MODELS[0],
-        plannerVersion: PLANNER_VERSION,
-        latencyMs,
-      },
+      providerMetadata: { provider, model, plannerVersion: PLANNER_VERSION, latencyMs },
       error:     message,
       errorCode,
       ...extra,
