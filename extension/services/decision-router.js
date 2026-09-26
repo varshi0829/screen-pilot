@@ -46,6 +46,10 @@ import { LocalQwenAdapter }       from '../providers/local-qwen-adapter.js';
 import { LocalVisionAdapter }     from '../providers/local-vision-adapter.js';
 import { VercelBackendAdapter }   from '../providers/vercel-backend-adapter.js';
 
+import { SanitizingAdapter }     from '../providers/sanitizing-adapter.js';
+import { TokenVault }            from '../lib/pii-vault.js';
+import { logEvent }              from '../lib/sp-logger.js';
+
 import { GoalVerifier }      from './goal-verifier.js';
 
 export const DETERMINISTIC_THRESHOLD = 0.85;
@@ -63,6 +67,11 @@ export const VISION_CANDIDATE_LIMIT  = 10;
 // generically — no site/phrase-specific logic, just reusing the ranking L2
 // already computed.
 export const QWEN_CANDIDATE_LIMIT    = 25;
+// Phase 6: a Qwen answer below this confidence is not trusted — it is treated
+// exactly like any other local-provider failure and follows the existing
+// fallback (straight to Cloud; never to the other local provider). Same bar
+// L2 grounding has to clear.
+export const QWEN_MIN_CONFIDENCE     = 0.70;
 // Minimum lead the top candidate must hold over the runner-up for L2 to commit
 // on its own. Below it, several candidates are covering the goal's vocabulary
 // equally well and the winner is decided by sort order — measured at exactly
@@ -177,9 +186,13 @@ export class DecisionRouter {
     this.deterministicThreshold = deterministicThreshold;
     this.mlGroundingThreshold  = mlGroundingThreshold;
     this.executionMode          = executionMode;
-    this.localQwenAdapter       = localQwenAdapter ?? new LocalQwenAdapter();
-    this.localVisionAdapter    = localVisionAdapter ?? new LocalVisionAdapter();
-    this.cloudAdapter           = cloudAdapter ?? new VercelBackendAdapter();
+    // Phase 6: defaults are wrapped in SanitizingAdapter (one shared per-router
+    // vault) so a router built without injected adapters can never send raw PII
+    // to any model. v2-task.js injects its own already-wrapped adapters.
+    const defaultVault = new TokenVault();
+    this.localQwenAdapter       = localQwenAdapter ?? new SanitizingAdapter(new LocalQwenAdapter(), { vault: defaultVault });
+    this.localVisionAdapter    = localVisionAdapter ?? new SanitizingAdapter(new LocalVisionAdapter(), { vault: defaultVault });
+    this.cloudAdapter           = cloudAdapter ?? new SanitizingAdapter(new VercelBackendAdapter(), { vault: defaultVault });
   }
 
   /**
@@ -332,7 +345,8 @@ export class DecisionRouter {
     const l3Reason = insufficientEvidence
       ? `lexical_evidence_insufficient(${insufficientEvidence})`
       : 'confidence_below_threshold';
-    console.log(`[SP:DecisionRouter] Layer 3 invoked for goal: "${goal}" executionMode=${this.executionMode} reason=${l3Reason}`);
+    // The goal is user text: it is only ever logged through the PII-safe logger.
+    logEvent('layer3_invoked', { goal, executionMode: this.executionMode, reason: l3Reason, candidateCount: candidates.length });
     console.log(`[SP:V2:DEBUG] layer=L3 reason=${l3Reason} candidateCount=${candidates.length} topScore=${assessment.topScore} margin=${assessment.margin.toFixed(3)} executionMode=${this.executionMode}`);
     const l3 = await this._runLayer3(groundingIntent, pageState, candidates, options, ranked);
 
@@ -540,10 +554,19 @@ export class DecisionRouter {
           if (planResponse?.result === 'FAILED') {
             qwenFailureReason = planResponse.error || planResponse.errorCode || 'qwen_failed';
             console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN resolved FAILED (${qwenFailureReason}, ${qwenMs}ms) — falling back to cloud once`);
+          } else if ((qwenFailureReason = this._qwenUnusableReason(planResponse, qwenElements))) {
+            // Phase 6: an OK-shaped answer that can't be trusted (unknown
+            // elementId, or too little confidence) is a local-provider
+            // failure like any other: straight to Cloud, never to Moondream.
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN result unusable (${qwenFailureReason}, ${qwenMs}ms) — falling back to cloud once`);
           } else {
             const step = planResponse?.plan?.steps?.[0];
             const t = step?.targetElement || {};
-            console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? 'n/a'} phase=${step?.phase ?? 'n/a'} value=${JSON.stringify(t.value ?? '')}`);
+            // The value is restored user data by now (SanitizingAdapter puts real
+            // emails/phones back) — it is only ever reported as present/absent.
+            // The line below keeps its exact prefix: eval/lib/metrics.mjs counts it.
+            console.log(`[SP:DecisionRouter] Layer 3 LOCAL QWEN succeeded (${qwenMs}ms) elementId=${t.elementId ?? 'n/a'} phase=${step?.phase ?? 'n/a'}`);
+            logEvent('layer3_qwen_ok', { elementId: t.elementId ?? null, phase: step?.phase ?? null, hasValue: !!t.value });
             return { layer: 'local_qwen', planResponse, qwenMs, visionMs, cloudMs: 0, qwenFailureReason: null, visionFailureReason };
           }
         } catch (err) {
@@ -587,6 +610,26 @@ export class DecisionRouter {
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Why a non-FAILED Qwen plan can't be trusted, or null when it can. Qwen may
+   * only ever point at an element it was offered from the CURRENT page state, and
+   * must be confident enough. (A "finish" answer names no element, so only its
+   * confidence is checked.)
+   *
+   * @param {object} planResponse
+   * @param {object[]} elements - the candidates Qwen was offered (a subset of the current page state)
+   * @returns {'invalid_element_id'|'low_confidence'|null}
+   */
+  _qwenUnusableReason(planResponse, elements) {
+    if (planResponse?.state !== 'complete') {
+      const elementId = planResponse?.plan?.steps?.[0]?.targetElement?.elementId;
+      if (!elementId || !elements.some((el) => el.id === elementId)) return 'invalid_element_id';
+    }
+    const confidence = planResponse?.confidence;
+    if (typeof confidence === 'number' && confidence < QWEN_MIN_CONFIDENCE) return 'low_confidence';
+    return null;
+  }
 
   /**
    * Does this element correspond to the target of one of the given steps?

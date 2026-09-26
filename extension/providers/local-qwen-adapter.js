@@ -5,6 +5,7 @@
 // Uses `keep_alive: "5m"` to keep model warm in memory and `temperature: 0` for fast CPU evaluation.
 
 import { BackendAdapter } from './interface.js';
+import { toCompactElement } from '../lib/compact-page-state.js';
 
 const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 const DEFAULT_MODEL      = 'qwen2.5-coder:7b';
@@ -44,6 +45,7 @@ const DEFAULT_KEEP_ALIVE_MS = 5 * 60 * 1000;
 const QWEN_GENERATE_TIMEOUT_MS      = 45_000;
 // Cheap /api/tags liveness probe before attempting a full generate call, so an
 // unreachable Ollama fails fast instead of waiting out the generate timeout.
+const VALID_ACTIONS = new Set(['click', 'fill', 'select', 'navigate', 'finish']);
 const QWEN_AVAILABILITY_TIMEOUT_MS  = 2_500;
 
 export class LocalQwenAdapter extends BackendAdapter {
@@ -385,11 +387,15 @@ export class LocalQwenAdapter extends BackendAdapter {
     const history   = request.executionHistory?.completedSteps ?? [];
     const elements  = request.elements ?? [];
 
-    const compactElements = elements.slice(0, 25).map(e => ({
-      id: e.id,
-      role: e.role,
-      text: e.text || e.ariaLabel || e.placeholder || ''
-    }));
+    // toCompactElement() is the single definition of what a model is shown about
+    // an element: a sensitive element contributes only its static label (never
+    // text/value) and is flagged so the model knows not to propose a value.
+    const compactElements = elements.slice(0, 25).map((e) => {
+      const c = toCompactElement(e);
+      return c.sensitive
+        ? { id: c.id, role: c.role, text: c.name, sensitive: true }
+        : { id: c.id, role: c.role, text: e.text || e.ariaLabel || e.placeholder || '' };
+    });
 
     return `Goal: "${request.goal}"
 Page: ${page.title || ''} (${page.url || ''})
@@ -404,17 +410,25 @@ Distinguish two different things:
 - TARGET: which element (by id, from the list above) to act on. An
   element's own text/placeholder/label is metadata describing that control —
   it is never something the user typed.
-- VALUE: only when the action is "type" — the actual content the user wants
+- VALUE: only when the action is "fill" — the actual content the user wants
   entered, understood from the goal's own meaning. It is never the target
   element's own label, and never the goal sentence itself. For any other
-  action (click/select/navigate/finish), value must be an empty string.
+  action (click/select/navigate/finish), value must be null. Never give a
+  value for an element marked "sensitive": true — use null.
+- "elementId" MUST be copied exactly from the list above. Never invent one.
 
 Return JSON ONLY:
-{"action":"click"|"type"|"select"|"navigate"|"finish","elementId":"el_1","value":"","confidence":0.95}`;
+{"action":"click"|"fill"|"select"|"navigate"|"finish","elementId":"el_1","value":null,"confidence":0.95}`;
   }
 
   _formatPlanResponse(request, qwenOutput, latencyMs) {
-    const action    = qwenOutput.action ?? 'click';
+    // "fill" is the schema's verb; "type" (the original verb) is still accepted
+    // as an alias and normalised, so older/habitual model output keeps working.
+    const rawAction = qwenOutput.action ?? 'click';
+    const action    = rawAction === 'type' ? 'fill' : rawAction;
+    if (!VALID_ACTIONS.has(action)) {
+      return this._networkFailure(`Local Qwen returned an invalid action "${String(rawAction).slice(0, 30)}"`, 'INVALID_ACTION');
+    }
     const isFinish  = action === 'finish';
     const elementId = qwenOutput.elementId;
 
@@ -436,14 +450,24 @@ Return JSON ONLY:
     // live DOM, so it must be real element metadata, not anything derived
     // from the goal or guessed by the model.
     const resolvedElement = (request.elements || []).find((e) => e.id === elementId);
-    const elementLabel = resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || 'the target';
+    // (An elementId that doesn't resolve is rejected one level up: DecisionRouter
+    // validates it against the candidates Qwen was offered and treats it as a
+    // Qwen failure — see DecisionRouter._qwenUnusableReason.)
+    // A sensitive element is labelled by its static placeholder/aria-label only
+    // — never by text/value content — and never carries a value.
+    const isSensitive  = resolvedElement ? toCompactElement(resolvedElement).sensitive : false;
+    const elementLabel = isSensitive
+      ? (resolvedElement.placeholder || resolvedElement.ariaLabel || elementId)
+      : (resolvedElement?.text || resolvedElement?.ariaLabel || resolvedElement?.placeholder || elementId || 'the target');
 
     // The user-provided payload — kept fully separate from elementLabel.
     // Only meaningful for a "type" action; empty for everything else, per
     // the prompt's own instruction, defensively re-enforced here too (never
     // falls back to the goal string or the element's own label).
-    const isFillAction = action === 'type';
-    const value = isFillAction && typeof qwenOutput.value === 'string' ? qwenOutput.value.trim() : '';
+    // A sensitive field is never given a value: the user enters it themselves
+    // (the guard shows the fixed policy instruction), so it is forced to ''.
+    const isFillAction = action === 'fill';
+    const value = isFillAction && !isSensitive && typeof qwenOutput.value === 'string' ? qwenOutput.value.trim() : '';
 
     // The user-facing instruction — built from the target's real label and
     // the extracted value, never the raw goal and never the overloaded

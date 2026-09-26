@@ -159,7 +159,8 @@ test('J. Complex ambiguous task can still reach Qwen when executionMode=local-qw
     checkAvailability: async () => ({ available: true }),
     plan: async () => {
       qwenCalled = true;
-      return { result: 'OK', plan: { steps: [{ id: 1, description: 'Qwen step' }] } };
+      // Phase 6: Qwen's answer must name an element it was offered.
+      return { result: 'OK', confidence: 0.9, plan: { steps: [{ id: 1, description: 'Qwen step', targetElement: { elementId: 'el_2' } }] } };
     }
   };
   const router = new DecisionRouter({ executionMode: 'local-qwen', localQwenAdapter: mockQwen });

@@ -96,7 +96,8 @@ test('DecisionRouter routes to Layer 3 Local Qwen when executionMode=local-qwen 
     plan: async () => ({
       result: 'OK',
       state: 'planned',
-      plan: { steps: [{ targetElement: { text: 'Complex Choice' } }] },
+      confidence: 0.9,
+      plan: { steps: [{ targetElement: { text: 'Search', elementId: 'el_1' } }] },
       providerMetadata: { provider: 'local-qwen' }
     })
   };

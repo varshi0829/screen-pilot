@@ -88,7 +88,7 @@ test('V2 Integration D: LocalQwenAdapter formats 1-action prompt and parses stru
           id: 1,
           description: 'Click Checkout',
           intent: 'click_checkout',
-          targetElement: { text: 'Checkout', type: 'button', elementId: 'el_5' }
+          targetElement: { text: 'Checkout', type: 'button', elementId: 'el_1' }
         }]
       },
       providerMetadata: { provider: 'local-qwen', model: 'qwen2.5-coder:7b' }

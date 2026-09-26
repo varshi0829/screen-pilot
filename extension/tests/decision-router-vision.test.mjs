@@ -68,8 +68,9 @@ function succeedingQwen(text = 'Qwen Choice') {
   return {
     checkAvailability: async () => ({ available: true }),
     plan: async () => ({
-      result: 'OK', state: 'planned',
-      plan: { steps: [{ targetElement: { text } }] },
+      result: 'OK', state: 'planned', confidence: 0.9,
+      // Phase 6: Qwen's answer is only trusted if its elementId is one it was offered.
+      plan: { steps: [{ targetElement: { text, elementId: 'el_1' } }] },
       providerMetadata: { provider: 'local-qwen' }
     })
   };

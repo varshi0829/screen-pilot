@@ -22,6 +22,7 @@
 // itself and never talks to any endpoint other than local Ollama.
 
 import { BackendAdapter } from './interface.js';
+import { toCompactElement } from '../lib/compact-page-state.js';
 
 const DEFAULT_OLLAMA_URL = 'http://127.0.0.1:11434';
 const DEFAULT_MODEL      = 'moondream';
@@ -613,10 +614,12 @@ export class LocalVisionAdapter extends BackendAdapter {
     const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0;
 
     const compactElements = elements.slice(0, 25).map(e => {
+      // toCompactElement(): a sensitive element contributes only its static label.
+      const c = toCompactElement(e);
       const entry = {
-        id: e.id,
-        role: e.role,
-        text: e.text || e.ariaLabel || e.placeholder || ''
+        id: c.id,
+        role: c.role,
+        text: c.sensitive ? c.name : (e.text || e.ariaLabel || e.placeholder || '')
       };
       const bbox = normalizeBboxForVision(e.bbox, viewportWidth, viewportHeight);
       if (bbox) entry.bbox = bbox;
