@@ -2,6 +2,7 @@
 // Sends screenshot + goal to the ScreenPilot backend; backend holds the API key.
 
 import { ScreenContextService } from './screen-context.js';
+import { TokenVault, sanitizeDeep, restoreDeep } from '../lib/pii-vault.js';
 
 export const VisionService = (() => {
   'use strict';
@@ -94,36 +95,42 @@ export const VisionService = (() => {
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
+      // Privacy: goal/question, page context, task state and enterprise context
+      // are sanitized locally before anything is sent (email/phone → per-request
+      // placeholders, secrets → [REDACTED]); placeholders in the response are
+      // restored below. Runs before the fetch, so if it throws nothing is sent.
+      const vault  = new TokenVault();
+      const tally  = {};
+      const safe   = sanitizeDeep({ goal, pageContext, taskState, enterpriseContext: enterpriseContext || null }, vault, tally);
+      if (Object.keys(tally).length) {
+        console.log(`[SP:PII] ${JSON.stringify({ event: 'pii_redacted', method: mode, types: tally, placeholders: vault.size })}`);
+      }
+
       const sessionId = await getOrCreateSessionId();
-      const { geminiApiKey } = await chrome.storage.local.get('geminiApiKey');
       const backendUrl = await resolveBackendUrl();
 
-      const keyType = geminiApiKey ? 'user' : 'shared';
-      if (geminiApiKey) { _m.userKey++; } else { _m.sharedKey++; }
-      const keyFingerprint = geminiApiKey
-        ? `${geminiApiKey.slice(0, 4)}...${geminiApiKey.slice(-4)}`
-        : '(none — using shared backend key)';
+      // Phase 2: BYOK removed — the backend resolves its own provider key
+      // server-side; the extension never holds or sends one.
+      _m.sharedKey++;
       console.log(
         `[SP:REQ] ts=${new Date().toISOString()}` +
-        ` session=${sessionId.slice(-8)} key=${keyType}` +
-        ` keyFingerprint=${keyFingerprint} mode=${mode}`
+        ` session=${sessionId.slice(-8)} key=shared mode=${mode}`
       );
 
       const headers = {
         'Content-Type': 'application/json',
         'X-Session-ID': sessionId,
       };
-      if (geminiApiKey) headers['X-Gemini-Key'] = geminiApiKey;
 
       const res = await fetch(backendUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify({
           screenshot:      { image: screenshot.image, mimeType: screenshot.mimeType },
-          goal,
-          pageContext,
-          taskState,
-          enterpriseContext: enterpriseContext || null,
+          goal:            safe.goal,
+          pageContext:     safe.pageContext,
+          taskState:       safe.taskState,
+          enterpriseContext: safe.enterpriseContext,
           mode,
         }),
         signal: controller.signal,
@@ -140,7 +147,7 @@ export const VisionService = (() => {
         throw err;
       }
 
-      return res.json();
+      return restoreDeep(await res.json(), vault);
     } finally {
       clearTimeout(timer);
     }

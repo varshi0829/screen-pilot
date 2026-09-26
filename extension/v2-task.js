@@ -1,13 +1,16 @@
 // ScreenPilot v2 — Task Orchestrator (Architecture B)
 //
 // Restored mechanically from committed bundle e9a3031 (v2-task section lines 1319–2044).
-// Single intentional deviation: BYOK apiKey pass-through in _runPlanLoop().
+// Phase 2: BYOK (the earlier "single intentional deviation" this comment used
+// to describe) was removed — provider keys are server-side only.
 
 import { ExecutorEngine, valueSatisfies }         from './services/executor-engine.js';
 import { VercelBackendAdapter }                   from './providers/vercel-backend-adapter.js';
 import { PageStateService }                       from './services/page-state-service.js';
 import { DecisionRouter }                          from './services/decision-router.js';
 import { LocalQwenAdapter }                        from './providers/local-qwen-adapter.js';
+import { LocalVisionAdapter }                      from './providers/local-vision-adapter.js';
+import { TokenVault }                              from './lib/pii-vault.js';
 import { capturePageSnapshot }                    from './lib/page-snapshot.js';
 import { TaskState, TaskEvent, transition }       from './shared/state-machine/transitions.js';
 import { SessionStore }                           from './services/session-store.js';
@@ -15,6 +18,12 @@ import { GoalVerifier }                           from './services/goal-verifier
 import { UIGroundingService }                     from './services/ui-grounding-service.js';
 import { classifyNavigation, NavClassification }  from './services/navigation-classifier.js';
 import { PrivacySanitizer }                       from './lib/privacy-sanitizer.js';
+import { SanitizingAdapter }                      from './providers/sanitizing-adapter.js';
+import { guardHighlighter }                       from './lib/sensitive-guard.js';
+import { redactText }                             from './lib/pii-detector.js';
+import { estimateCompactionSavings }              from './lib/compact-page-state.js';
+import { logEvent, logWarn, logError }            from './lib/sp-logger.js';
+import { deriveTaskProgress }                     from './lib/task-progress.js';
 
 let _state = TaskState.IDLE;
 function ts() {
@@ -734,11 +743,18 @@ async function _runPlanLoop(tabId, myGen) {
 
 async function _runPlanLoopInternal(tabId, myGen) {
   const storage = getStorageArea();
-  const { executionMode = 'cloud', openRouterApiKey } = storage
-    ? await storage.get(['executionMode', 'openRouterApiKey'])
-    : { executionMode: 'cloud', openRouterApiKey: undefined };
-  const cloudAdapter   = new VercelBackendAdapter({ apiKey: openRouterApiKey ?? undefined });
-  const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter: new LocalQwenAdapter(), cloudAdapter });
+  const { executionMode = 'cloud' } = storage
+    ? await storage.get(['executionMode'])
+    : { executionMode: 'cloud' };
+  // Every model call — the cloud planner AND the local Qwen / Moondream
+  // adapters — passes through SanitizingAdapter (PII → placeholders/[REDACTED],
+  // restored locally on the way back). All three share ONE in-memory token
+  // vault per plan loop, so a placeholder means the same thing in every tier.
+  const piiVault         = new TokenVault();
+  const cloudAdapter     = new SanitizingAdapter(new VercelBackendAdapter(), { vault: piiVault });
+  const localQwenAdapter = new SanitizingAdapter(new LocalQwenAdapter(), { vault: piiVault });
+  const localVisionAdapter = new SanitizingAdapter(new LocalVisionAdapter(), { vault: piiVault });
+  const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter, localVisionAdapter, cloudAdapter });
   // B5: consecutive retryable-failure counter, reset on every successful planner response.
   let planRetryCount = 0;
   // Set inside the local-mode branch each iteration; used after the try/catch below
@@ -755,8 +771,11 @@ async function _runPlanLoopInternal(tabId, myGen) {
       hideStatus();
       return;
     }
+    // Phase 4 observability only — a pure read of state that already exists;
+    // does not affect control flow or persist anything new by itself.
+    logEvent('task_progress_snapshot', deriveTaskProgress(session, { taskState: _state }));
     if (_generation !== myGen) return;
-    console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${session.goal}"`);
+    console.log(`[SP:V2:TRACE] state transition phase=${session.phase} goal="${redactText(session.goal)}"`);
 
     // This cycle's task-progress projection (see deriveSettledSteps). Computed
     // from the same snapshot the entry diagnostic logs, so the cycle costs no
@@ -904,6 +923,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
       const pageState = cyclePageState ?? PageStateService.extractPageState();
       localPageState  = pageState;
       const domMs     = cyclePageState ? cycleExtractMs : Date.now() - tDomStart;
+      // Observability only (Phase 3) — measures the compaction opportunity;
+      // does not alter pageState or anything derived from it below.
+      logEvent('compact_state_built', { reqId, ...estimateCompactionSavings(pageState) });
 
       // Pre-L3 goal satisfaction check — applies regardless of executionMode,
       // so cloud users also skip a paid LLM call when the goal is already met.
@@ -960,6 +982,24 @@ async function _runPlanLoopInternal(tabId, myGen) {
       console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? 'n/a'}`);
       console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
       console.log(`[SP:V2:PERF] stage=routing routeMs=${layer1Ms + layer2Ms + qwenMs + cloudMs} pageControlsMs=${pageControlsMs} domReused=${cyclePageState ? 'yes' : 'no'} goalCheckReused=${cycleGenericCheck ? 'yes' : 'no'}`);
+      logEvent('routing_result', {
+        reqId,
+        layer: routed.layer,
+        layer1Ms, layer2Ms, qwenMs, cloudMs,
+        visionMs: routed.visionMs ?? 0,
+        totalPlanningMs,
+        confidence: planResp.confidence,
+        qwenFailureReason: routed.qwenFailureReason ? redactText(routed.qwenFailureReason) : null,
+        visionFailureReason: routed.visionFailureReason ? redactText(routed.visionFailureReason) : null
+      });
+      if (routed.qwenFailureReason || routed.visionFailureReason) {
+        logWarn('provider_fallback', {
+          reqId,
+          resolvedBy: routed.layer,
+          qwenFailureReason: routed.qwenFailureReason ? redactText(routed.qwenFailureReason) : null,
+          visionFailureReason: routed.visionFailureReason ? redactText(routed.visionFailureReason) : null
+        });
+      }
     } catch (err) {
       window.removeEventListener('popstate', onNavCheck);
       console.log(`[SP:V2:TRACE] plan ERROR reqId=${reqId} name=${err?.name} message=${err?.message}`);
@@ -970,6 +1010,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
         continue;
       }
       console.error("[SP:V2] Planning failed:", err);
+      logError('plan_failed', { reqId, name: err?.name ?? null, message: redactText(err?.message ?? '') });
       applyEvent(TaskEvent.PLAN_FAILED, { reason: "network_error" });
       showStatus(`ScreenPilot: Planning error — ${err.message}`, "error");
       await SessionStore.clear(tabId);
@@ -1214,6 +1255,11 @@ async function _runPlanLoopInternal(tabId, myGen) {
     hideStatus();
     await SessionStore.setPhase(tabId, "EXECUTING");
     const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
+    // Phase 4: record the last executor outcome so it survives navigation/
+    // reload (a page-scoped `result` local otherwise vanishes). No-ops
+    // harmlessly if the session was already cleared inside _executeStep
+    // (the "goal_complete" path) — patchSession() already tolerates that.
+    await SessionStore.patchSession(tabId, { lastActionResult: result, lastActionAt: Date.now() });
     if (result === "navigated" || result === "aborted") {
       if (result === "navigated") {
         // Phase 26B — soft-navigation resume bridge. The progression contract used
@@ -1245,12 +1291,14 @@ async function _runPlanLoopInternal(tabId, myGen) {
       }
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
+      await SessionStore.incrementReplanCount(tabId);
       await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
       await new Promise((r) => setTimeout(r, 500));
       continue;
     }
     await SessionStore.setPhase(tabId, "PLANNING");
     applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
+    await SessionStore.incrementReplanCount(tabId);
     await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
   }
 }
@@ -1292,7 +1340,8 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       resolve("aborted");
       return;
     }
-    const highlighter = resolveHighlighter();
+    // guide-only: sensitive fields get a fixed "enter this yourself" instruction
+    const highlighter = guardHighlighter(resolveHighlighter());
     const executor = new ExecutorEngine({
       domMatcher: window.DOMMatcher,
       highlighter,
@@ -1320,6 +1369,7 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
         _lastUserActedAtMs = null;
         _lastUserActedIntent = null;
       }
+      logEvent('executor_result', { tabId, ok: true, phase: step.phase, completionCondition: step.completionCondition });
       // Ground-truth correction from the ACTUAL resolved DOM element — see
       // computeExpectedNavigationFromElement. Runs here because the live node
       // is only known once the executor has resolved a candidate; only
@@ -1343,6 +1393,7 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
     executor.on("element:not_found", ({ reason, isOptional }) => {
       if (isOptional) return;
       applyEvent(TaskEvent.ELEMENT_NOT_FOUND, { reason });
+      logEvent('executor_result', { tabId, ok: false, reason: redactText(reason) });
       done("element_not_found");
     });
     executor.on("user:acted", async ({ step, trigger, observedValue }) => {
@@ -1491,7 +1542,7 @@ export async function _bootstrapSession(tabId) {
       return;
     }
     if (_generation !== myGen) return;
-    console.log(`[SP:V2] [${ts()}] Resuming: phase=${session.phase} pauseReason=${session.pauseReason ?? "null"} steps=${session.completedSteps.length} goal="${session.goal}"`);
+    console.log(`[SP:V2] [${ts()}] Resuming: phase=${session.phase} pauseReason=${session.pauseReason ?? "null"} steps=${session.completedSteps.length} goal="${redactText(session.goal)}"`);
     if (session.phase === "PAUSED") {
       applyEvent(TaskEvent.WORKFLOW_PAUSED);
       await SessionStore.refreshExpiry(tabId);
@@ -1647,6 +1698,10 @@ async function _handleStop() {
   _executor?.abort();
   _executor = null;
   ++_generation;
+  // Phase 4: a final snapshot before the session disappears — otherwise
+  // "this task was cancelled" leaves no trace at all (SessionStore.clear()
+  // looks identical whether the task completed, failed, or was cancelled).
+  logEvent('task_progress_snapshot', deriveTaskProgress(await SessionStore.load(_tabId), { aborted: true }));
   await SessionStore.clear(_tabId);
   _state = TaskState.PAUSED;
   applyEvent(TaskEvent.CANCEL_CLICKED);
@@ -1666,7 +1721,7 @@ async function _startNewTask(goal) {
   _taskContext = { goal, steps: [], startedAt: Date.now() };
   _taskStartedAt = Date.now();
   console.log("[SP:V2] ─────────────────────────────────────────");
-  console.log(`[SP:V2] [${ts()}] New task: "${goal}"`);
+  console.log(`[SP:V2] [${ts()}] New task: "${redactText(goal)}"`);
   console.log(`[SP:V2] [${ts()}] Page: ${window.location.href}`);
   applyEvent(TaskEvent.GOAL_SUBMITTED, { goal });
   await SessionStore.create(_tabId, goal);
@@ -1684,8 +1739,17 @@ function _abortTask() {
   hideStatus();
   hidePausedBanner();
   hideAmbiguousBanner();
-  if (_tabId) SessionStore.clear(_tabId).catch(() => {
-  });
+  if (_tabId) {
+    const tabIdSnapshot = _tabId;
+    // Phase 4: same final-snapshot-before-clear as _handleStop, kept
+    // fire-and-forget to match this function's existing sync contract
+    // (window.__SP_V2_ABORT = _abortTask) and its existing clear().catch() style.
+    SessionStore.load(tabIdSnapshot)
+      .then((s) => logEvent('task_progress_snapshot', deriveTaskProgress(s, { aborted: true })))
+      .catch(() => {});
+    SessionStore.clear(tabIdSnapshot).catch(() => {
+    });
+  }
   _state = TaskState.IDLE;
   console.log("[SP:V2] Task aborted");
 }

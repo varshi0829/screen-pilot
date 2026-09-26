@@ -30,9 +30,12 @@ export const MAX_AUTH_ATTEMPTS         = 3;
 
 // Dynamic global budget: 10 base + 2 per confirmed step, capped at 40.
 // A session with N completed steps has earned N*2 additional attempts.
-function _maxPlannerCalls(session) {
+// Exported (Phase 4) so task-progress.js can report the same budget a
+// session is actually held to, without duplicating this formula.
+export function maxPlannerCalls(session) {
   return Math.min(10 + 2 * session.completedSteps.length, 40);
 }
+const _maxPlannerCalls = maxPlannerCalls;
 
 function sessionKey(tabId) {
   return KEY_PREFIX + tabId;
@@ -93,6 +96,13 @@ export const SessionStore = {
       // via patchSession when a plan carrying it is accepted. NOT a schema bump, so
       // existing sessions (which lack this field) still load unchanged.
       goalCompletionCriteria:    null,
+      // Phase 4 (TaskProgress): additive, optional fields — same pattern as
+      // goalCompletionCriteria above. NOT a schema bump; a pre-Phase-4 session
+      // simply lacks them, and every reader treats their absence as "unknown"
+      // rather than an error (see task-progress.js).
+      replanCount:               0,
+      lastActionResult:          null,
+      lastActionAt:              null,
       phase:                     'PLANNING',
       createdAt:                 t,
       updatedAt:                 t,
@@ -388,6 +398,26 @@ export const SessionStore = {
       };
     }
     return { isStuck: false, reason: null };
+  },
+
+  /**
+   * Increment replanCount (Phase 4). Purely informational — no stuck-threshold
+   * of its own; the existing plannerAttemptCount/stepAttemptCount budgets
+   * (above) already bound how many times a session can actually replan. This
+   * only gives TaskProgress a real number to report instead of inferring one.
+   * Call alongside each genuine REPLAN_TRIGGERED transition (never on a
+   * SESSION_RESUME/PAUSED-resume — those are not replans).
+   *
+   * @param {number} tabId
+   * @returns {Promise<number>} the new count, or 0 if the session is gone
+   */
+  async incrementReplanCount(tabId) {
+    const session = await _read(tabId);
+    if (!session) return 0;
+    const next = (session.replanCount ?? 0) + 1;
+    const t = nowMs();
+    await _write(tabId, { ...session, replanCount: next, updatedAt: t, expiresAt: t + SESSION_TTL_MS });
+    return next;
   },
 
   /**
