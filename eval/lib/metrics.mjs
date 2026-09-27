@@ -166,3 +166,87 @@ export function phaseBreakdown(events) {
     cycles: seq.filter((e) => e.to === 'PLANNING').length,
   };
 }
+
+// ── Phase 7 — task_metrics parsing + evaluation ratios ──────────────────────
+//
+// task_metrics (extension/lib/task-metrics.js) is emitted once per task as a
+// single [SP:EVENT] {"event":"task_metrics",...} console line via the
+// existing sp-logger.js — already captured by the harness's
+// page.on('console', ...) like every other line. This section only parses
+// that one new line shape and derives the small set of ratios the Phase 7
+// audit asked for; it reads no new signal and adds no new capture mechanism.
+
+const SP_EVENT_PREFIX = '[SP:EVENT] ';
+
+/** Every well-formed [SP:EVENT] {...} line, JSON.parse'd. Malformed lines are skipped. */
+export function parseSpEvents(lines) {
+  const out = [];
+  for (const line of lines) {
+    if (!line.startsWith(SP_EVENT_PREFIX)) continue;
+    try {
+      out.push(JSON.parse(line.slice(SP_EVENT_PREFIX.length)));
+    } catch { /* not a well-formed [SP:EVENT] line — skip */ }
+  }
+  return out;
+}
+
+/** Every task_metrics summary in this run's console output (one per task that reached a task-exit point). */
+export function parseTaskMetrics(lines) {
+  return parseSpEvents(lines).filter((e) => e && e.event === 'task_metrics');
+}
+
+/** Fraction of tasks that reached outcome==='complete'. null if no tasks. */
+export function successRate(taskMetricsList) {
+  if (!taskMetricsList.length) return null;
+  const complete = taskMetricsList.filter((t) => t.outcome === 'complete').length;
+  return complete / taskMetricsList.length;
+}
+
+/** Mean of totalLatencyMs across tasks that have it. null if none do. */
+export function averageTotalLatencyMs(taskMetricsList) {
+  const values = taskMetricsList.map((t) => t.totalLatencyMs).filter((v) => typeof v === 'number');
+  return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+}
+
+/**
+ * Replans per completed action, across the whole run set (not averaged
+ * per-task first) — a longer task is expected to accumulate more replans, so
+ * pooling avoids conflating task length with replan frequency.
+ */
+export function replanRate(taskMetricsList) {
+  const totalReplans = taskMetricsList.reduce((a, t) => a + (t.replans?.total ?? 0), 0);
+  const totalActions = taskMetricsList.reduce((a, t) => a + (t.actions?.completed ?? 0), 0);
+  return totalActions > 0 ? totalReplans / totalActions : null;
+}
+
+function layerCallShare(taskMetricsList, keys) {
+  const totalRouted = taskMetricsList.reduce((a, t) => a + (t.cycles?.routed ?? 0), 0);
+  if (!totalRouted) return null;
+  const matched = taskMetricsList.reduce(
+    (a, t) => a + keys.reduce((s, k) => s + (t.layerCounts?.[k] ?? 0), 0), 0
+  );
+  return matched / totalRouted;
+}
+
+/** Share of ROUTED cycles resolved by a local model (Qwen or Moondream). */
+export function localReasoningRate(taskMetricsList) {
+  return layerCallShare(taskMetricsList, ['localQwen', 'localVision']);
+}
+
+/** Share of ROUTED cycles that escalated to local vision (Moondream). */
+export function visionEscalationRate(taskMetricsList) {
+  return layerCallShare(taskMetricsList, ['localVision']);
+}
+
+/** Share of ROUTED cycles that escalated to the cloud provider. */
+export function cloudEscalationRate(taskMetricsList) {
+  return layerCallShare(taskMetricsList, ['cloud']);
+}
+
+/** Of tasks that completed, the fraction that never made a single cloud call. */
+export function pctCompletedWithoutCloud(taskMetricsList) {
+  const completed = taskMetricsList.filter((t) => t.outcome === 'complete');
+  if (!completed.length) return null;
+  const withoutCloud = completed.filter((t) => (t.layerCounts?.cloud ?? 0) === 0).length;
+  return withoutCloud / completed.length;
+}

@@ -1305,6 +1305,41 @@ await test('fill_form: with no requested value, existing quiet-period behavior i
   ex.abort();
 });
 
+// ── Phase 7 interaction boundary ─────────────────────────────────────────────
+//
+// v2-task.js's fill-verification-failure branch (isFillStep && requestedValue
+// && observedValue != null && !valueSatisfies(...)) reads observedValue off
+// THIS event — but this file's own "a partially entered value does NOT settle
+// the step" test above already establishes that ExecutorEngine never emits
+// user:acted for a fill step with a requested value until valueSatisfies()
+// is already true. The two facts together mean that branch is UNREACHABLE via
+// real DOM input simulation: a wrong-but-complete value never fires the
+// event at all, it just waits silently forever (bounded only by the step's
+// own attempt budget in v2-task.js, not by anything here). This is pinned
+// explicitly so a future change to either side doesn't silently reopen or
+// re-close that gap without a test noticing — matching the Phase 7 audit's
+// own finding that this scenario belongs at the unit level, never the
+// real-browser e2e harness.
+await test('Phase 7: user:acted is never emitted for a fill step whose value never satisfies the request — the field is left waiting, not reported as a failure', async () => {
+  const ex = makeExecutor();
+  ex.start(makePlan([fillStep({ targetElement: { text: 'Query', type: 'input', value: 'artificial intelligence' } })]));
+  await nextEvent(ex, 'element:ready');
+
+  const outcome = await Promise.race([
+    nextEvent(ex, 'user:acted').then((payload) => ({ fired: true, payload })),
+    new Promise((r) => setTimeout(() => r({ fired: false }), 100)),
+  ]);
+  // A value that will NEVER satisfy the request (unlike the "still typing"
+  // fixture above, which types a genuine prefix of the eventual match).
+  mockDocument.dispatch('input', { target: textField('completely unrelated text') });
+
+  assert.equal(outcome.fired, false,
+    'a non-satisfying value must never emit user:acted — there is no ' +
+    'observedValue-carrying event for v2-task.js\'s fill-verification-failure ' +
+    'branch to ever actually receive through real DOM input');
+  ex.abort();
+});
+
 await test('valueSatisfies: generic value comparison, no site or control knowledge', () => {
   assert.equal(valueSatisfies('arti', 'artificial intelligence'), false, 'partial value must fail');
   assert.equal(valueSatisfies('artificial intelligence', 'artificial intelligence'), true);

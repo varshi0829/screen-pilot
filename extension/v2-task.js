@@ -11,7 +11,7 @@ import { DecisionRouter }                          from './services/decision-rou
 import { LocalQwenAdapter }                        from './providers/local-qwen-adapter.js';
 import { LocalVisionAdapter }                      from './providers/local-vision-adapter.js';
 import { TokenVault }                              from './lib/pii-vault.js';
-import { capturePageSnapshot }                    from './lib/page-snapshot.js';
+import { capturePageSnapshot, computeRelevantStateFingerprint } from './lib/page-snapshot.js';
 import { TaskState, TaskEvent, transition }       from './shared/state-machine/transitions.js';
 import { SessionStore }                           from './services/session-store.js';
 import { GoalVerifier }                           from './services/goal-verifier.js';
@@ -24,6 +24,7 @@ import { redactText }                             from './lib/pii-detector.js';
 import { estimateCompactionSavings }              from './lib/compact-page-state.js';
 import { logEvent, logWarn, logError }            from './lib/sp-logger.js';
 import { deriveTaskProgress }                     from './lib/task-progress.js';
+import { deriveTaskMetrics }                      from './lib/task-metrics.js';
 
 let _state = TaskState.IDLE;
 function ts() {
@@ -52,6 +53,14 @@ let _taskStartedAt = null;
 // instances — one per step.
 let _lastUserActedAtMs = null;
 let _lastUserActedIntent = null;
+// Phase 7: per-cycle metrics records for the CURRENT task, accumulated across
+// planning-loop cycles within this content-script lifetime. Page-scoped, like
+// _taskContext/_taskStartedAt above — reset only on a genuinely NEW task
+// (_startNewTask), not on a resume/bootstrap, so a task_metrics summary
+// emitted after a navigation/reload honestly covers only the cycles that ran
+// in THIS lifetime (same class of scoping limitation _taskContext already
+// has across navigation).
+let _cycleRecords = [];
 const MAX_CLARIFICATIONS = 5;
 // B5: transient backend failures that are safe to retry without clearing the session.
 // HTTP_ERROR is the adapter's fallback code for a non-OK HTTP response (5xx surface here);
@@ -701,6 +710,18 @@ function resolveOutcome(planResp) {
 function isTerminalStep(step) {
   return step?.completionCondition === "final";
 }
+// Phase 7 — emit exactly one task_metrics event for this task, from whatever
+// per-cycle records this content-script lifetime actually accumulated (see
+// _cycleRecords above). PII-safe: deriveTaskMetrics() never reads goal text,
+// URLs, or provider output — see its own doc comment.
+function _emitTaskMetrics(session, { outcome, outcomeReason = null } = {}) {
+  try {
+    logEvent('task_metrics', deriveTaskMetrics(_cycleRecords, session, { outcome, outcomeReason }));
+  } catch (err) {
+    console.warn('[SP:V2] task_metrics emission failed (ignored):', err);
+  }
+}
+
 // Present the completion card and clear the session. Reused by both terminal-step
 // paths (local validation and navigation-resume). Loads the session BEFORE clearing
 // so the card reports the true completed-step count.
@@ -711,6 +732,7 @@ async function _showGoalCompleteCard(tabId, goal) {
     steps: s?.completedSteps.length ?? 0,
     startedAt: _taskStartedAt
   });
+  _emitTaskMetrics(s, { outcome: 'complete' });
   await SessionStore.clear(tabId);
 }
 let _activePlanPromise = null;
@@ -760,6 +782,12 @@ async function _runPlanLoopInternal(tabId, myGen) {
   // Set inside the local-mode branch each iteration; used after the try/catch below
   // to enrich the chosen step with ground-truth nav/region info (see Bug A fix).
   let localPageState = null;
+  // Phase 7: bounds the fingerprint-skip optimization to at most ONE skip in a
+  // row (see computeRelevantStateFingerprint's caller below) — reset to 0 the
+  // instant any real decisionRouter.route() call happens. In-memory and local
+  // to this one plan-loop invocation; never persisted, never a task-level
+  // retry/stop limit — it cannot fail, stop, or bound the task itself.
+  let consecutiveSkipCount = 0;
   while (true) {
     if (_generation !== myGen) {
       console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} — exiting`);
@@ -872,9 +900,64 @@ async function _runPlanLoopInternal(tabId, myGen) {
     if (budgetExhausted) {
       applyEvent(TaskEvent.PLAN_FAILED, { reason: budgetReason });
       showStatus(`ScreenPilot: ${budgetReason}`, "error");
+      _emitTaskMetrics(session, { outcome: 'failed', outcomeReason: 'PLANNER_BUDGET_EXCEEDED' });
       await SessionStore.clear(tabId);
       return;
     }
+
+    // ── Phase 7: relevant-state fingerprint optimization ──────────────────────
+    // Strictly AFTER every correctness-critical check above (goal-verifier
+    // completion, goal-consumed, planner-budget exhaustion — all of which can
+    // already end the task and are completely unaffected by anything below).
+    // Reuses THIS cycle's own PageStateService extraction (cyclePageState,
+    // already computed above) — no second DOM walk. Decides only whether to
+    // skip decisionRouter.route() this cycle.
+    const currentFingerprint = computeRelevantStateFingerprint(cyclePageState);
+    const canSkipRouting =
+      session.lastCycleOutcome === 'step_completed' &&
+      !!session.lastFingerprint &&
+      session.lastFingerprint.url === currentFingerprint.url &&
+      session.lastFingerprint.hash === currentFingerprint.hash &&
+      consecutiveSkipCount < 1;
+
+    // Records this cycle's outcome + fingerprint on the session (read fresh at
+    // the top of every iteration, so this works uniformly across a plain
+    // loop-restart, the _runPlanLoop recursive re-invocation, and a
+    // bootstrap/resume) and pushes this cycle's metrics record. Called at
+    // every real outcome site below — never on a skip, which deliberately
+    // leaves session.lastFingerprint/lastCycleOutcome untouched (see the
+    // audited design: nothing new was actually verified on a skip).
+    async function recordCycleOutcome(outcome, extra = {}) {
+      _cycleRecords.push({
+        skipped: false,
+        domMs: cycleExtractMs,
+        layer: null,
+        layer1Ms: 0, layer2Ms: 0, qwenMs: 0, visionMs: 0, cloudMs: 0,
+        verifyMs: null,
+        verdict: null,
+        outcome,
+        ...extra,
+      });
+      await SessionStore.patchSession(tabId, { lastCycleOutcome: outcome, lastFingerprint: currentFingerprint });
+    }
+
+    if (canSkipRouting) {
+      _cycleRecords.push({
+        skipped: true,
+        domMs: cycleExtractMs,
+        layer: null,
+        layer1Ms: 0, layer2Ms: 0, qwenMs: 0, visionMs: 0, cloudMs: 0,
+        verifyMs: null,
+        verdict: null,
+        outcome: 'skipped',
+      });
+      consecutiveSkipCount += 1;
+      console.log(`[SP:V2:PERF] stage=fingerprint_gate action=skip consecutiveSkipCount=${consecutiveSkipCount} url=${currentFingerprint.url} elementCount=${currentFingerprint.count}`);
+      await new Promise((r) => setTimeout(r, 250));
+      continue;
+    }
+    consecutiveSkipCount = 0; // a real route() call is about to happen this cycle
+
     const tCycleStart = Date.now();
     showStatus("ScreenPilot · Planning…", "planning");
 
@@ -915,6 +998,15 @@ async function _runPlanLoopInternal(tabId, myGen) {
     let screenshotMs = 0;
 
     let planResp;
+    // Phase 7: mirrors of this cycle's routing metrics, hoisted OUTSIDE the
+    // try block below (whose own `const routed`/`layer1Ms`/etc. are block-
+    // scoped and unavailable once it closes) so the outcome sites after it —
+    // STALE_PLAN, ambiguous, blocked, the rejected-completion-claim retry —
+    // can attach real per-cycle numbers to their metrics record instead of
+    // only the always-known domMs. Read-only mirrors; nothing inside the try
+    // block's own logic changes.
+    let cycleRoutedLayer = null;
+    let cycleLayer1Ms = 0, cycleLayer2Ms = 0, cycleQwenMs = 0, cycleCloudMs = 0, cycleVisionMs = 0;
     try {
       // This cycle's single extraction, taken moments ago by the verifier gate
       // above (see its comment). Falls back to extracting here if the gate
@@ -978,6 +1070,15 @@ async function _runPlanLoopInternal(tabId, myGen) {
       const qwenMs      = routed.qwenMs ?? 0;
       const cloudMs     = routed.cloudMs ?? 0;
       const totalPlanningMs = Date.now() - tReqStart;
+      // Phase 7: mirror into the outer, non-block-scoped variables (see their
+      // declaration above) — read-only copies, no change to anything below
+      // that already used the block-scoped originals.
+      cycleRoutedLayer = routed.layer;
+      cycleLayer1Ms    = layer1Ms;
+      cycleLayer2Ms    = layer2Ms;
+      cycleQwenMs      = qwenMs;
+      cycleCloudMs     = cloudMs;
+      cycleVisionMs    = routed.visionMs ?? 0;
 
       console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? 'n/a'}`);
       console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
@@ -1007,12 +1108,17 @@ async function _runPlanLoopInternal(tabId, myGen) {
       if (planController.signal.aborted || err?.name === 'AbortError') {
         console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_aborted_exception`);
         console.log("[SP:V2] Request aborted — replanning");
+        // Gap #2 (Phase 7 audit): the page changed enough mid-request to abort
+        // it — tagged 'stale_plan' (not left unwritten) so the very next cycle
+        // can never become skip-eligible on stale pre-abort provenance.
+        await recordCycleOutcome('stale_plan');
         continue;
       }
       console.error("[SP:V2] Planning failed:", err);
       logError('plan_failed', { reqId, name: err?.name ?? null, message: redactText(err?.message ?? '') });
       applyEvent(TaskEvent.PLAN_FAILED, { reason: "network_error" });
       showStatus(`ScreenPilot: Planning error — ${err.message}`, "error");
+      _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: 'NETWORK_ERROR' });
       await SessionStore.clear(tabId);
       return;
     }
@@ -1024,6 +1130,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
     if (planResp?.errorCode === 'ABORTED') {
       console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_discard`);
       console.log("[SP:V2] Request aborted — replanning");
+      // Gap #2 (Phase 7 audit): server-acknowledged abort — same reasoning as
+      // the exception-path abort above.
+      await recordCycleOutcome('stale_plan');
       continue;
     }
 
@@ -1048,6 +1157,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
       if (!isRepeatOfCompletedStep) {
         console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_snapshot_change`);
         console.log(`[SP:V2] STALE_PLAN discarded urlChanged=${urlChanged} domChanged=${domChanged} preUrl=${preSnap.url} postUrl=${postSnap.url} preDomHash=${preSnap.domHash} postDomHash=${postSnap.domHash} reqMs=${reqMs}ms`);
+        await recordCycleOutcome('stale_plan', {
+          layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+        });
         continue;
       }
       console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=stale_snapshot_matches_completed_step_deferred_to_dedup_guard`);
@@ -1094,6 +1206,13 @@ async function _runPlanLoopInternal(tabId, myGen) {
           // Reject the claim and loop back for another planning pass. The existing
           // planner-attempt budget check (top of this same loop, above) already
           // bounds total retries for the whole task — no new counter is introduced.
+          // Phase 7: the planner's own completion claim was rejected — this
+          // cycle verified nothing trustworthy, so tag it 'stale_plan' rather
+          // than leaving lastCycleOutcome unwritten (found during
+          // implementation; same class of risk as the audited Gap #2 sites).
+          await recordCycleOutcome('stale_plan', {
+            layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+          });
           continue;
         }
       }
@@ -1106,6 +1225,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
         steps: freshSession.completedSteps.length,
         startedAt: _taskStartedAt
       });
+      _emitTaskMetrics(freshSession, { outcome: 'complete' });
       await SessionStore.clear(tabId);
       return;
     }
@@ -1115,6 +1235,13 @@ async function _runPlanLoopInternal(tabId, myGen) {
       await SessionStore.patchSession(tabId, { pauseReason: "blocked" });
       await SessionStore.setPhase(tabId, "PAUSED");
       applyEvent(TaskEvent.WORKFLOW_PAUSED);
+      // Phase 7: a blocked outcome means the router still needs another
+      // reasoning cycle — writing this now (rather than leaving
+      // lastCycleOutcome at whatever it was before) prevents an immediate
+      // false-skip on the very first cycle after the user resumes from PAUSED.
+      await recordCycleOutcome('blocked', {
+        layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+      });
       await SessionStore.refreshExpiry(tabId);
       const paused = await SessionStore.load(tabId);
       if (paused) showPausedBanner(paused);
@@ -1125,6 +1252,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
     if (isStuck) {
       applyEvent(TaskEvent.PLAN_FAILED, { reason: "ambiguous_limit_reached" });
       showStatus(reason ? `ScreenPilot: Cannot determine next step — ${reason}` : "ScreenPilot: Cannot determine next step — goal is too ambiguous", "error");
+      _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: 'AMBIGUOUS_LIMIT' });
       await SessionStore.clear(tabId);
       return;
     }
@@ -1134,6 +1262,10 @@ async function _runPlanLoopInternal(tabId, myGen) {
       });
       await SessionStore.setPhase(tabId, "PAUSED");
       applyEvent(TaskEvent.AMBIGUOUS_RECEIVED);
+      // Phase 7: same reasoning as the 'blocked' write above.
+      await recordCycleOutcome('ambiguous', {
+        layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+      });
       await SessionStore.refreshExpiry(tabId);
       const paused = await SessionStore.load(tabId);
       if (paused) showAmbiguousBanner(paused);
@@ -1149,6 +1281,9 @@ async function _runPlanLoopInternal(tabId, myGen) {
         const backoffMs = 1000 * Math.pow(2, planRetryCount - 1);
         console.warn(`[SP:V2] [${ts()}] Retryable plan failure (${errorCode}) — retry ${planRetryCount}/${MAX_PLAN_RETRIES} in ${backoffMs}ms (session preserved)`);
         showStatus("ScreenPilot · Reconnecting…", "planning");
+        await recordCycleOutcome('retryable_error', {
+          layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+        });
         await new Promise((r) => setTimeout(r, backoffMs));
         continue;
       }
@@ -1157,8 +1292,10 @@ async function _runPlanLoopInternal(tabId, myGen) {
         // B5: retries exhausted — surface the error but PRESERVE the session so the
         // user can resume once connectivity returns. Do NOT clear.
         showStatus(`ScreenPilot: ${planResp.error ?? "Connection problem — please try again"}`, "error");
+        _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: errorCode === 'NETWORK_ERROR' ? 'NETWORK_ERROR' : errorCode === 'REQUEST_TIMEOUT' ? 'REQUEST_TIMEOUT' : 'HTTP_ERROR' });
       } else {
         showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
+        _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: null });
         await SessionStore.clear(tabId);
       }
       return;
@@ -1168,6 +1305,14 @@ async function _runPlanLoopInternal(tabId, myGen) {
     const plannerStep = planResp.plan.steps[0];
     if (!plannerStep) {
       console.warn("[SP:V2] state=planned but steps is empty — treating as ambiguous");
+      // Phase 7: found during implementation (not one of the originally
+      // audited sites) — another silent continue that left lastCycleOutcome
+      // unwritten. Tagged 'stale_plan': nothing trustworthy resolved this
+      // cycle, so the next cycle must not become skip-eligible on stale
+      // pre-existing provenance, same reasoning as the audited Gap #2 sites.
+      await recordCycleOutcome('stale_plan', {
+        layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+      });
       continue;
     }
     // Correct expectedPageState.urlChanges/region from ground truth before anything
@@ -1222,9 +1367,13 @@ async function _runPlanLoopInternal(tabId, myGen) {
           if (isStuck) {
             applyEvent(TaskEvent.PLAN_FAILED, { reason });
             showStatus(`ScreenPilot: ${reason}`, "error");
+            _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: 'STEP_ATTEMPTS_EXCEEDED' });
             await SessionStore.clear(tabId);
             return;
           }
+          await recordCycleOutcome('dedup_repeat', {
+            layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+          });
           await new Promise((r) => setTimeout(r, 200));
           continue;
         } else {
@@ -1254,6 +1403,13 @@ async function _runPlanLoopInternal(tabId, myGen) {
     // during EXECUTING/AWAITING_USER. The instruction/highlight UI takes over on element:ready.
     hideStatus();
     await SessionStore.setPhase(tabId, "EXECUTING");
+    // Gap #1 (Phase 7 audit): _executeStep() resolves to the SAME string
+    // "completed" for both a genuine successful step (completeStep() ran) and
+    // a fill-verification failure (completeStep() deliberately did NOT run).
+    // Capturing the count here, before the call, lets the fallthrough below
+    // tell the two apart by comparing against a fresh read afterwards —
+    // without changing _executeStep()'s own return contract at all.
+    const completedStepsCountBeforeExecute = freshSession.completedSteps.length;
     const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
     // Phase 4: record the last executor outcome so it survives navigation/
     // reload (a page-scoped `result` local otherwise vanishes). No-ops
@@ -1261,6 +1417,18 @@ async function _runPlanLoopInternal(tabId, myGen) {
     // (the "goal_complete" path) — patchSession() already tolerates that.
     await SessionStore.patchSession(tabId, { lastActionResult: result, lastActionAt: Date.now() });
     if (result === "navigated" || result === "aborted") {
+      // Phase 7: neither path has completeStep() run in THIS content-script
+      // lifetime (a navigated step's completeStep() runs later, in the fresh
+      // page's own _bootstrapSession; an aborted step ran no action at all) —
+      // tag 'stale_plan' so a resumed/superseded session can never inherit a
+      // stale 'step_completed' from before this cycle and become
+      // false-skip-eligible. Cheap defense-in-depth: for "navigated" the URL
+      // change alone would already block a skip via the fingerprint's own url
+      // comparison, but this also covers "aborted", where the URL may not
+      // have changed at all.
+      await recordCycleOutcome('stale_plan', {
+        layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+      });
       if (result === "navigated") {
         // Phase 26B — soft-navigation resume bridge. The progression contract used
         // to be "a navigated step destroys the document; the fresh content script
@@ -1286,12 +1454,16 @@ async function _runPlanLoopInternal(tabId, myGen) {
       if (isStuck) {
         applyEvent(TaskEvent.PLAN_FAILED, { reason });
         showStatus(`ScreenPilot: ${reason}`, "error");
+        _emitTaskMetrics(freshSession, { outcome: 'failed', outcomeReason: 'STEP_ATTEMPTS_EXCEEDED' });
         await SessionStore.clear(tabId);
         return;
       }
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
       await SessionStore.incrementReplanCount(tabId);
+      await recordCycleOutcome('element_not_found', {
+        layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+      });
       await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
       await new Promise((r) => setTimeout(r, 500));
       continue;
@@ -1299,6 +1471,21 @@ async function _runPlanLoopInternal(tabId, myGen) {
     await SessionStore.setPhase(tabId, "PLANNING");
     applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
     await SessionStore.incrementReplanCount(tabId);
+    // Gap #1 (Phase 7 audit): `result === "completed"` here is REACHED BOTH
+    // by a genuine successful step (SessionStore.completeStep() ran inside
+    // _executeStep's user:acted handler) AND by a fill-verification failure
+    // (completeStep() deliberately did NOT run, but _executeStep still
+    // resolves "completed" — see its own comment). Disambiguate with a fresh
+    // read rather than trusting the shared result string: if completedSteps
+    // genuinely grew, this was a real success; if not, it was the
+    // fill-verification-failure path, and MUST NOT be tagged 'step_completed'
+    // (doing so would make the very next cycle wrongly skip-eligible after a
+    // failure — exactly the invariant the fingerprint gate must never violate).
+    const postExecuteSession = await SessionStore.load(tabId);
+    const stepGenuinelyCompleted = (postExecuteSession?.completedSteps?.length ?? completedStepsCountBeforeExecute) > completedStepsCountBeforeExecute;
+    await recordCycleOutcome(stepGenuinelyCompleted ? 'step_completed' : 'fill_verification_failed', {
+      layer: cycleRoutedLayer, layer1Ms: cycleLayer1Ms, layer2Ms: cycleLayer2Ms, qwenMs: cycleQwenMs, cloudMs: cycleCloudMs, visionMs: cycleVisionMs
+    });
     await _shadowGoalVerify(tabId, "REPLAN", false); // Phase 23C shadow trigger
   }
 }
@@ -1702,6 +1889,10 @@ async function _handleStop() {
   // "this task was cancelled" leaves no trace at all (SessionStore.clear()
   // looks identical whether the task completed, failed, or was cancelled).
   logEvent('task_progress_snapshot', deriveTaskProgress(await SessionStore.load(_tabId), { aborted: true }));
+  // Phase 7: a second, independent load — deliberately not sharing the read
+  // above, which an existing characterization test
+  // (v2-task-progress-wiring.test.mjs) pins to this exact literal shape.
+  _emitTaskMetrics(await SessionStore.load(_tabId), { outcome: 'aborted', outcomeReason: 'USER_CANCELLED' });
   await SessionStore.clear(_tabId);
   _state = TaskState.PAUSED;
   applyEvent(TaskEvent.CANCEL_CLICKED);
@@ -1720,6 +1911,7 @@ async function _startNewTask(goal) {
   _state = TaskState.IDLE;
   _taskContext = { goal, steps: [], startedAt: Date.now() };
   _taskStartedAt = Date.now();
+  _cycleRecords = []; // Phase 7 — fresh metrics accumulation for the new task
   console.log("[SP:V2] ─────────────────────────────────────────");
   console.log(`[SP:V2] [${ts()}] New task: "${redactText(goal)}"`);
   console.log(`[SP:V2] [${ts()}] Page: ${window.location.href}`);
@@ -1746,6 +1938,10 @@ function _abortTask() {
     // (window.__SP_V2_ABORT = _abortTask) and its existing clear().catch() style.
     SessionStore.load(tabIdSnapshot)
       .then((s) => logEvent('task_progress_snapshot', deriveTaskProgress(s, { aborted: true })))
+      .catch(() => {});
+    // Phase 7: a second, independent load — same reasoning as _handleStop's own.
+    SessionStore.load(tabIdSnapshot)
+      .then((s) => _emitTaskMetrics(s, { outcome: 'aborted', outcomeReason: 'USER_CANCELLED' }))
       .catch(() => {});
     SessionStore.clear(tabIdSnapshot).catch(() => {
     });

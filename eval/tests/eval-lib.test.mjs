@@ -6,6 +6,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   summarize, iou, confusion, parseStateEvents, parseDecisions, parsePerf, phaseBreakdown, LOCAL_MECHANISMS,
+  parseSpEvents, parseTaskMetrics, successRate, averageTotalLatencyMs, replanRate,
+  localReasoningRate, visionEscalationRate, cloudEscalationRate, pctCompletedWithoutCloud,
 } from '../lib/metrics.mjs';
 import { toIntervals, aggregate } from '../lib/resource-monitor.mjs';
 import { casePath, visualCasePages, loadJson } from '../lib/fixtures.mjs';
@@ -157,4 +159,74 @@ test('page probe: the V1 detector is sliced verbatim from content.js (never re-i
   assert.match(src, /function getSensitiveScreenshotRegions\(\)/);
   assert.match(src, /function getScreenshotPrivacyContext\(\)/);
   assert.match(src, /const SP_SENSITIVE_INPUT_TYPES/);
+});
+
+// ── Phase 7 — task_metrics parsing + evaluation ratios ──────────────────────
+
+function taskMetricsLine(fields) {
+  return `[SP:EVENT] ${JSON.stringify({ event: 'task_metrics', level: 'info', ts: 1, ...fields })}`;
+}
+
+test('parseSpEvents: only well-formed [SP:EVENT] lines are parsed; other lines and malformed JSON are skipped', () => {
+  const lines = [
+    'some unrelated console line',
+    taskMetricsLine({ outcome: 'complete' }),
+    '[SP:EVENT] not valid json',
+    '[SP:V2:PERF] domMs=5 layer1Ms=0',
+  ];
+  const out = parseSpEvents(lines);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].event, 'task_metrics');
+});
+
+test('parseTaskMetrics: extracts only task_metrics events, in order, ignoring other [SP:EVENT] events', () => {
+  const lines = [
+    `[SP:EVENT] ${JSON.stringify({ event: 'layer3_qwen_ok', level: 'info', ts: 1 })}`,
+    taskMetricsLine({ outcome: 'complete', cycles: { total: 2, routed: 2, skipped: 0 } }),
+    taskMetricsLine({ outcome: 'failed', cycles: { total: 1, routed: 1, skipped: 0 } }),
+  ];
+  const out = parseTaskMetrics(lines);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].outcome, 'complete');
+  assert.equal(out[1].outcome, 'failed');
+});
+
+test('successRate: fraction of tasks with outcome==="complete"; null when no tasks', () => {
+  assert.equal(successRate([]), null);
+  assert.equal(successRate([{ outcome: 'complete' }, { outcome: 'failed' }, { outcome: 'complete' }]), 2 / 3);
+});
+
+test('averageTotalLatencyMs: mean over tasks that have a numeric totalLatencyMs; null when none do', () => {
+  assert.equal(averageTotalLatencyMs([{ totalLatencyMs: null }]), null);
+  assert.equal(averageTotalLatencyMs([{ totalLatencyMs: 100 }, { totalLatencyMs: 300 }]), 200);
+});
+
+test('replanRate: pooled replans-per-completed-action across the run set, not averaged per task first', () => {
+  const runs = [
+    { replans: { total: 2 }, actions: { completed: 2 } },
+    { replans: { total: 4 }, actions: { completed: 8 } },
+  ];
+  // pooled: (2+4) / (2+8) = 0.6 — NOT the average of 1.0 and 0.5 (0.75)
+  assert.equal(replanRate(runs), 0.6);
+  assert.equal(replanRate([{ replans: { total: 0 }, actions: { completed: 0 } }]), null);
+});
+
+test('local/vision/cloud escalation rates are shares of ROUTED cycles, and localReasoningRate combines qwen+vision', () => {
+  const runs = [
+    { cycles: { routed: 10 }, layerCounts: { deterministic: 4, mlGrounding: 3, localQwen: 2, localVision: 1, cloud: 0 } },
+  ];
+  assert.equal(localReasoningRate(runs), 0.3);
+  assert.equal(visionEscalationRate(runs), 0.1);
+  assert.equal(cloudEscalationRate(runs), 0);
+  assert.equal(localReasoningRate([]), null);
+});
+
+test('pctCompletedWithoutCloud: of completed tasks only, the share that made zero cloud calls', () => {
+  const runs = [
+    { outcome: 'complete', layerCounts: { cloud: 0 } },
+    { outcome: 'complete', layerCounts: { cloud: 1 } },
+    { outcome: 'failed', layerCounts: { cloud: 0 } }, // excluded — not completed
+  ];
+  assert.equal(pctCompletedWithoutCloud(runs), 0.5);
+  assert.equal(pctCompletedWithoutCloud([{ outcome: 'failed', layerCounts: { cloud: 0 } }]), null);
 });

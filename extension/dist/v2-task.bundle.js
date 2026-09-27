@@ -1,5 +1,221 @@
 "use strict";
 (() => {
+  // extension/lib/pii-detector.js
+  var SensitiveType = Object.freeze({
+    PASSWORD: "password",
+    OTP: "otp",
+    EMAIL: "email",
+    PHONE: "phone",
+    CREDIT_CARD: "credit_card",
+    SSN: "ssn",
+    BANK_ACCOUNT: "bank_account",
+    ADDRESS: "address",
+    DATE_OF_BIRTH: "date_of_birth",
+    JWT: "jwt",
+    API_KEY: "api_key",
+    SECRET: "secret"
+  });
+  var T = SensitiveType;
+  var INPUT_TYPE_MAP = {
+    password: T.PASSWORD,
+    email: T.EMAIL,
+    tel: T.PHONE
+  };
+  var AUTOCOMPLETE_MAP = {
+    "current-password": T.PASSWORD,
+    "new-password": T.PASSWORD,
+    "one-time-code": T.OTP,
+    "cc-number": T.CREDIT_CARD,
+    "cc-csc": T.CREDIT_CARD,
+    "cc-exp": T.CREDIT_CARD,
+    "cc-exp-month": T.CREDIT_CARD,
+    "cc-exp-year": T.CREDIT_CARD,
+    "cc-name": T.CREDIT_CARD,
+    "email": T.EMAIL,
+    "tel": T.PHONE,
+    "tel-national": T.PHONE,
+    "street-address": T.ADDRESS,
+    "address-line1": T.ADDRESS,
+    "address-line2": T.ADDRESS,
+    "postal-code": T.ADDRESS,
+    "bday": T.DATE_OF_BIRTH,
+    "ssn": T.SSN
+  };
+  var LABEL_RULES = [
+    [/\b(?:password|passcode)\b/i, T.PASSWORD],
+    [/\b(?:otp|one[- ]time[- ]code)\b/i, T.OTP],
+    [/\b(?:cvv|cvc|security\s*code|card\s*number|credit\s*card|debit\s*card)\b/i, T.CREDIT_CARD],
+    [/\b(?:ssn|social\s*security)\b/i, T.SSN],
+    [/\b(?:routing\s*number|account\s*number|iban)\b/i, T.BANK_ACCOUNT],
+    [/\b(?:api\s*key|secret\s*key|private\s*key|client\s*secret)\b/i, T.API_KEY],
+    [/\b(?:auth\s*token|access\s*token|pin\s*code)\b/i, T.SECRET]
+  ];
+  function byInputType(type) {
+    return INPUT_TYPE_MAP[String(type || "").toLowerCase()] ?? null;
+  }
+  function byAutocomplete(autocomplete) {
+    return AUTOCOMPLETE_MAP[String(autocomplete || "").toLowerCase()] ?? null;
+  }
+  function byLabel(...strings) {
+    for (const raw of strings) {
+      if (typeof raw !== "string" || !raw) continue;
+      const s = raw.replace(/[_-]+/g, " ");
+      for (const [re, type] of LABEL_RULES) {
+        if (re.test(s)) return type;
+      }
+    }
+    return null;
+  }
+  var JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
+  var API_KEY_RES = [
+    /\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/g,
+    // OpenAI / OpenRouter / Anthropic style
+    /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    // Google API key
+    /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
+    // GitHub tokens
+    /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+    /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+    // Slack
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    // AWS access key id
+    /\bglpat-[A-Za-z0-9_-]{20,}/g,
+    // GitLab
+    /\bnpm_[A-Za-z0-9]{36}\b/g,
+    // npm
+    /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/g
+    // Authorization header value
+  ];
+  var PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+  var ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|(?:access|auth|refresh|id)[_-]?token|token)\b\s*[:=]\s*["']?([^\s"'&;,<>]{6,})/gid;
+  var SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
+  var CARD_RE = /\b\d(?:[ -]?\d){12,18}\b/g;
+  var SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+  var EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  var PHONE_RES = [
+    /(?<![\w])(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}(?!\d)/g,
+    /(?<![\w])\+\d[\d ()-]{7,15}\d(?!\d)/g
+  ];
+  function isLuhnValid(digits) {
+    const s = String(digits).replace(/\D/g, "");
+    if (s.length < 13 || s.length > 19) return false;
+    let sum = 0;
+    let dbl = false;
+    for (let i = s.length - 1; i >= 0; i--) {
+      let n = s.charCodeAt(i) - 48;
+      if (dbl) {
+        n *= 2;
+        if (n > 9) n -= 9;
+      }
+      sum += n;
+      dbl = !dbl;
+    }
+    return sum % 10 === 0;
+  }
+  function assignmentType(keyName) {
+    if (/pass|pwd/i.test(keyName)) return T.PASSWORD;
+    if (/key/i.test(keyName)) return T.API_KEY;
+    return T.SECRET;
+  }
+  function findPII(text) {
+    if (typeof text !== "string" || !text) return [];
+    const spans = [];
+    const overlaps = (s, e) => spans.some((x) => s < x.end && e > x.start);
+    const add = (type, start, end) => {
+      if (end > start && !overlaps(start, end)) spans.push({ type, start, end });
+    };
+    const scan = (re, type, accept) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (!accept || accept(m[0])) add(type, m.index, m.index + m[0].length);
+        if (m[0].length === 0) re.lastIndex++;
+      }
+    };
+    const scanAssignments = (re, typeOf) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const [start, end] = m.indices[2];
+        add(typeOf(m[1]), start, end);
+      }
+    };
+    scan(PRIVATE_KEY_RE, T.SECRET);
+    scan(JWT_RE, T.JWT);
+    API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
+    scanAssignments(ASSIGNMENT_RE, assignmentType);
+    scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
+    scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
+    scan(SSN_RE, T.SSN);
+    scan(EMAIL_RE, T.EMAIL);
+    PHONE_RES.forEach((re) => scan(re, T.PHONE));
+    return spans.sort((a, b) => a.start - b.start);
+  }
+  function detectType(text) {
+    const spans = findPII(text);
+    return spans.length ? spans[0].type : null;
+  }
+  function redactText(text, replacement = "[REDACTED]") {
+    if (typeof text !== "string" || !text) return text;
+    const spans = findPII(text);
+    if (!spans.length) return text;
+    let out = "";
+    let last = 0;
+    for (const s of spans) {
+      out += text.slice(last, s.start) + replacement;
+      last = s.end;
+    }
+    return out + text.slice(last);
+  }
+  function classifyElement(el) {
+    if (!el) return null;
+    return byInputType(el.type) || byAutocomplete(el.autocomplete) || byLabel(el.placeholder, el.ariaLabel, el.name, el.id, el.label) || detectType(el.value) || detectType(el.text) || null;
+  }
+  var SENSITIVE_PARAM_RE = /^(?:token|access[_-]?token|id[_-]?token|refresh[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|pwd|auth|authorization|session|session[_-]?id|sessionid|sid|code|otp|signature|sig|jwt|bearer|ticket|email|e-?mail|phone|mobile|tel)$/i;
+  var SENSITIVE_KEY_RE = /^(?:password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|bearer|jwt|private[_-]?key|client[_-]?secret)$/i;
+  function isSensitiveParamName(name) {
+    return SENSITIVE_PARAM_RE.test(String(name || ""));
+  }
+  function isSensitiveKeyName(name) {
+    return SENSITIVE_KEY_RE.test(String(name || ""));
+  }
+
+  // extension/lib/privacy-sanitizer.js
+  var REDACTED = "[REDACTED]";
+  function isSensitiveElement(el) {
+    return classifyElement(el) !== null;
+  }
+  function sanitizeElement(el) {
+    const sensitiveType = classifyElement(el);
+    if (!sensitiveType) return el;
+    return {
+      ...el,
+      text: el.text ? REDACTED : el.text,
+      value: el.value ? REDACTED : el.value,
+      sensitive: true,
+      sensitiveType
+    };
+  }
+  function sanitizeElements(elements) {
+    if (!Array.isArray(elements)) return elements;
+    return elements.map(sanitizeElement);
+  }
+  function getSensitiveRegions(elements) {
+    if (!Array.isArray(elements)) return [];
+    return elements.filter(isSensitiveElement).map((el) => el.bbox).filter((bbox) => bbox && bbox.width > 0 && bbox.height > 0);
+  }
+  var PrivacySanitizer = {
+    REDACTED,
+    isSensitiveElement,
+    getSensitiveType: classifyElement,
+    sanitizeElement,
+    sanitizeElements,
+    getSensitiveRegions
+  };
+  if (typeof globalThis !== "undefined" && globalThis.module) {
+    globalThis.module.exports = PrivacySanitizer;
+  }
+
   // extension/lib/page-snapshot.js
   function capturePageSnapshot(highlightedElementText = "") {
     return {
@@ -36,6 +252,46 @@
       hash = hash * 16777619 >>> 0;
     }
     return hash.toString(16).padStart(8, "0");
+  }
+  var FINGERPRINT_LABEL_MAX_LEN = 60;
+  function _fingerprintLabel(el) {
+    const sensitiveType = PrivacySanitizer.getSensitiveType(el);
+    if (sensitiveType) {
+      const label = el.placeholder || el.ariaLabel || "";
+      return label ? label.slice(0, FINGERPRINT_LABEL_MAX_LEN) : PrivacySanitizer.REDACTED;
+    }
+    const raw = el.text || el.placeholder || el.ariaLabel || "";
+    return raw.slice(0, FINGERPRINT_LABEL_MAX_LEN);
+  }
+  function computeRelevantStateFingerprint(pageState) {
+    const elements = Array.isArray(pageState?.elements) ? pageState.elements : [];
+    const projected = [];
+    for (const el of elements) {
+      if (!el || el.visible === false || el.enabled === false) continue;
+      projected.push({
+        role: el.role || "",
+        label: _fingerprintLabel(el),
+        // The one "relevant structural relationship" already available without
+        // extra cost — the native <form> association PageStateService already
+        // resolves (resolveFormId), surfaced here as-is.
+        formId: el.formId ?? null,
+        // Boolean only — never the raw value, even for a non-sensitive field.
+        valuePresent: !!(el.value && el.value.trim())
+      });
+    }
+    projected.sort((a, b) => {
+      const af = a.formId ?? "", bf = b.formId ?? "";
+      if (af !== bf) return af < bf ? -1 : 1;
+      if (a.role !== b.role) return a.role < b.role ? -1 : 1;
+      if (a.label !== b.label) return a.label < b.label ? -1 : 1;
+      if (a.valuePresent !== b.valuePresent) return a.valuePresent ? 1 : -1;
+      return 0;
+    });
+    return {
+      url: pageState?.url ?? "",
+      count: projected.length,
+      hash: _fnv32a(JSON.stringify(projected))
+    };
   }
 
   // extension/shared/types/index.js
@@ -1000,222 +1256,6 @@ ${lines.join("\n")}`);
       };
     }
   };
-
-  // extension/lib/pii-detector.js
-  var SensitiveType = Object.freeze({
-    PASSWORD: "password",
-    OTP: "otp",
-    EMAIL: "email",
-    PHONE: "phone",
-    CREDIT_CARD: "credit_card",
-    SSN: "ssn",
-    BANK_ACCOUNT: "bank_account",
-    ADDRESS: "address",
-    DATE_OF_BIRTH: "date_of_birth",
-    JWT: "jwt",
-    API_KEY: "api_key",
-    SECRET: "secret"
-  });
-  var T = SensitiveType;
-  var INPUT_TYPE_MAP = {
-    password: T.PASSWORD,
-    email: T.EMAIL,
-    tel: T.PHONE
-  };
-  var AUTOCOMPLETE_MAP = {
-    "current-password": T.PASSWORD,
-    "new-password": T.PASSWORD,
-    "one-time-code": T.OTP,
-    "cc-number": T.CREDIT_CARD,
-    "cc-csc": T.CREDIT_CARD,
-    "cc-exp": T.CREDIT_CARD,
-    "cc-exp-month": T.CREDIT_CARD,
-    "cc-exp-year": T.CREDIT_CARD,
-    "cc-name": T.CREDIT_CARD,
-    "email": T.EMAIL,
-    "tel": T.PHONE,
-    "tel-national": T.PHONE,
-    "street-address": T.ADDRESS,
-    "address-line1": T.ADDRESS,
-    "address-line2": T.ADDRESS,
-    "postal-code": T.ADDRESS,
-    "bday": T.DATE_OF_BIRTH,
-    "ssn": T.SSN
-  };
-  var LABEL_RULES = [
-    [/\b(?:password|passcode)\b/i, T.PASSWORD],
-    [/\b(?:otp|one[- ]time[- ]code)\b/i, T.OTP],
-    [/\b(?:cvv|cvc|security\s*code|card\s*number|credit\s*card|debit\s*card)\b/i, T.CREDIT_CARD],
-    [/\b(?:ssn|social\s*security)\b/i, T.SSN],
-    [/\b(?:routing\s*number|account\s*number|iban)\b/i, T.BANK_ACCOUNT],
-    [/\b(?:api\s*key|secret\s*key|private\s*key|client\s*secret)\b/i, T.API_KEY],
-    [/\b(?:auth\s*token|access\s*token|pin\s*code)\b/i, T.SECRET]
-  ];
-  function byInputType(type) {
-    return INPUT_TYPE_MAP[String(type || "").toLowerCase()] ?? null;
-  }
-  function byAutocomplete(autocomplete) {
-    return AUTOCOMPLETE_MAP[String(autocomplete || "").toLowerCase()] ?? null;
-  }
-  function byLabel(...strings) {
-    for (const raw of strings) {
-      if (typeof raw !== "string" || !raw) continue;
-      const s = raw.replace(/[_-]+/g, " ");
-      for (const [re, type] of LABEL_RULES) {
-        if (re.test(s)) return type;
-      }
-    }
-    return null;
-  }
-  var JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
-  var API_KEY_RES = [
-    /\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}/g,
-    // OpenAI / OpenRouter / Anthropic style
-    /\bAIza[0-9A-Za-z_-]{35}\b/g,
-    // Google API key
-    /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
-    // GitHub tokens
-    /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
-    /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
-    // Slack
-    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-    // AWS access key id
-    /\bglpat-[A-Za-z0-9_-]{20,}/g,
-    // GitLab
-    /\bnpm_[A-Za-z0-9]{36}\b/g,
-    // npm
-    /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/g
-    // Authorization header value
-  ];
-  var PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
-  var ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|(?:access|auth|refresh|id)[_-]?token|token)\b\s*[:=]\s*["']?([^\s"'&;,<>]{6,})/gid;
-  var SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
-  var CARD_RE = /\b\d(?:[ -]?\d){12,18}\b/g;
-  var SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
-  var EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-  var PHONE_RES = [
-    /(?<![\w])(?:\+?\d{1,2}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}(?!\d)/g,
-    /(?<![\w])\+\d[\d ()-]{7,15}\d(?!\d)/g
-  ];
-  function isLuhnValid(digits) {
-    const s = String(digits).replace(/\D/g, "");
-    if (s.length < 13 || s.length > 19) return false;
-    let sum = 0;
-    let dbl = false;
-    for (let i = s.length - 1; i >= 0; i--) {
-      let n = s.charCodeAt(i) - 48;
-      if (dbl) {
-        n *= 2;
-        if (n > 9) n -= 9;
-      }
-      sum += n;
-      dbl = !dbl;
-    }
-    return sum % 10 === 0;
-  }
-  function assignmentType(keyName) {
-    if (/pass|pwd/i.test(keyName)) return T.PASSWORD;
-    if (/key/i.test(keyName)) return T.API_KEY;
-    return T.SECRET;
-  }
-  function findPII(text) {
-    if (typeof text !== "string" || !text) return [];
-    const spans = [];
-    const overlaps = (s, e) => spans.some((x) => s < x.end && e > x.start);
-    const add = (type, start, end) => {
-      if (end > start && !overlaps(start, end)) spans.push({ type, start, end });
-    };
-    const scan = (re, type, accept) => {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        if (!accept || accept(m[0])) add(type, m.index, m.index + m[0].length);
-        if (m[0].length === 0) re.lastIndex++;
-      }
-    };
-    const scanAssignments = (re, typeOf) => {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        const [start, end] = m.indices[2];
-        add(typeOf(m[1]), start, end);
-      }
-    };
-    scan(PRIVATE_KEY_RE, T.SECRET);
-    scan(JWT_RE, T.JWT);
-    API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
-    scanAssignments(ASSIGNMENT_RE, assignmentType);
-    scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
-    scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
-    scan(SSN_RE, T.SSN);
-    scan(EMAIL_RE, T.EMAIL);
-    PHONE_RES.forEach((re) => scan(re, T.PHONE));
-    return spans.sort((a, b) => a.start - b.start);
-  }
-  function detectType(text) {
-    const spans = findPII(text);
-    return spans.length ? spans[0].type : null;
-  }
-  function redactText(text, replacement = "[REDACTED]") {
-    if (typeof text !== "string" || !text) return text;
-    const spans = findPII(text);
-    if (!spans.length) return text;
-    let out = "";
-    let last = 0;
-    for (const s of spans) {
-      out += text.slice(last, s.start) + replacement;
-      last = s.end;
-    }
-    return out + text.slice(last);
-  }
-  function classifyElement(el) {
-    if (!el) return null;
-    return byInputType(el.type) || byAutocomplete(el.autocomplete) || byLabel(el.placeholder, el.ariaLabel, el.name, el.id, el.label) || detectType(el.value) || detectType(el.text) || null;
-  }
-  var SENSITIVE_PARAM_RE = /^(?:token|access[_-]?token|id[_-]?token|refresh[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|pwd|auth|authorization|session|session[_-]?id|sessionid|sid|code|otp|signature|sig|jwt|bearer|ticket|email|e-?mail|phone|mobile|tel)$/i;
-  var SENSITIVE_KEY_RE = /^(?:password|passwd|pwd|secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|authorization|bearer|jwt|private[_-]?key|client[_-]?secret)$/i;
-  function isSensitiveParamName(name) {
-    return SENSITIVE_PARAM_RE.test(String(name || ""));
-  }
-  function isSensitiveKeyName(name) {
-    return SENSITIVE_KEY_RE.test(String(name || ""));
-  }
-
-  // extension/lib/privacy-sanitizer.js
-  var REDACTED = "[REDACTED]";
-  function isSensitiveElement(el) {
-    return classifyElement(el) !== null;
-  }
-  function sanitizeElement(el) {
-    const sensitiveType = classifyElement(el);
-    if (!sensitiveType) return el;
-    return {
-      ...el,
-      text: el.text ? REDACTED : el.text,
-      value: el.value ? REDACTED : el.value,
-      sensitive: true,
-      sensitiveType
-    };
-  }
-  function sanitizeElements(elements) {
-    if (!Array.isArray(elements)) return elements;
-    return elements.map(sanitizeElement);
-  }
-  function getSensitiveRegions(elements) {
-    if (!Array.isArray(elements)) return [];
-    return elements.filter(isSensitiveElement).map((el) => el.bbox).filter((bbox) => bbox && bbox.width > 0 && bbox.height > 0);
-  }
-  var PrivacySanitizer = {
-    REDACTED,
-    isSensitiveElement,
-    getSensitiveType: classifyElement,
-    sanitizeElement,
-    sanitizeElements,
-    getSensitiveRegions
-  };
-  if (typeof globalThis !== "undefined" && globalThis.module) {
-    globalThis.module.exports = PrivacySanitizer;
-  }
 
   // extension/services/page-state-service.js
   var PageStateService = (() => {
@@ -3840,6 +3880,18 @@ Return JSON ONLY:
         replanCount: 0,
         lastActionResult: null,
         lastActionAt: null,
+        // Phase 7 (fingerprint optimization): additive, optional fields — same
+        // pattern as the Phase 4 fields above. NOT a schema bump. lastFingerprint
+        // is a {url, count, hash} object from page-snapshot.js's
+        // computeRelevantStateFingerprint(), or null before the first real
+        // planning cycle. lastCycleOutcome is one of 'step_completed' |
+        // 'element_not_found' | 'fill_verification_failed' | 'dedup_repeat' |
+        // 'stale_plan' | 'retryable_error' | 'ambiguous' | 'blocked' | null —
+        // see v2-task.js's plan loop for exactly where each is written. Both are
+        // read-and-written only via the existing generic patchSession(); no new
+        // SessionStore method is introduced for them.
+        lastFingerprint: null,
+        lastCycleOutcome: null,
         phase: "PLANNING",
         createdAt: t,
         updatedAt: t,
@@ -4389,6 +4441,108 @@ Return JSON ONLY:
     };
   }
 
+  // extension/lib/task-metrics.js
+  var ROUTER_LAYER_TO_BUCKET = Object.freeze({
+    deterministic: "deterministic",
+    ml_grounding: "mlGrounding",
+    local_qwen: "localQwen",
+    local_vision: "localVision",
+    cloud: "cloud"
+  });
+  var REPLAN_OUTCOME_TO_BUCKET = Object.freeze({
+    element_not_found: "elementNotFound",
+    fill_verification_failed: "fillVerificationFailed",
+    dedup_repeat: "dedupRepeat",
+    stale_plan: "stalePlan",
+    retryable_error: "retryableError",
+    step_completed: "ordinaryProgression"
+  });
+  var MODEL_LAYERS = /* @__PURE__ */ new Set(["local_qwen", "local_vision", "cloud"]);
+  function emptyLatencyBucket() {
+    return { totalMs: 0, avgMs: 0, count: 0 };
+  }
+  function latencyBucket(records, field) {
+    const values = [];
+    for (const r of records) {
+      const v = r?.[field];
+      if (typeof v === "number" && v > 0) values.push(v);
+    }
+    if (!values.length) return emptyLatencyBucket();
+    const totalMs = values.reduce((a, b) => a + b, 0);
+    return { totalMs, avgMs: Math.round(totalMs / values.length), count: values.length };
+  }
+  function deriveTaskMetrics(cycleRecords, sessionSnapshot, { outcome = null, outcomeReason = null } = {}) {
+    const records = Array.isArray(cycleRecords) ? cycleRecords : [];
+    const routedRecords = records.filter((r) => r && !r.skipped);
+    const skippedRecords = records.filter((r) => r && r.skipped);
+    const layerCounts = { deterministic: 0, mlGrounding: 0, localQwen: 0, localVision: 0, cloud: 0 };
+    for (const r of routedRecords) {
+      const bucket = ROUTER_LAYER_TO_BUCKET[r.layer];
+      if (bucket) layerCounts[bucket] += 1;
+    }
+    const replansByOutcome = { elementNotFound: 0, fillVerificationFailed: 0, dedupRepeat: 0, stalePlan: 0, retryableError: 0, ordinaryProgression: 0 };
+    for (const r of routedRecords) {
+      const bucket = REPLAN_OUTCOME_TO_BUCKET[r.outcome];
+      if (bucket) replansByOutcome[bucket] += 1;
+    }
+    const replansTotal = Object.values(replansByOutcome).reduce((a, b) => a + b, 0);
+    const verificationOutcomes = { passed: 0, inconclusive: 0, fillNotSatisfied: 0 };
+    for (const r of routedRecords) {
+      if (r.verdict === "PASSED") verificationOutcomes.passed += 1;
+      else if (r.verdict === "INCONCLUSIVE") verificationOutcomes.inconclusive += 1;
+      if (r.outcome === "fill_verification_failed") verificationOutcomes.fillNotSatisfied += 1;
+    }
+    const completed = Array.isArray(sessionSnapshot?.completedSteps) ? sessionSnapshot.completedSteps.length : replansByOutcome.ordinaryProgression + (outcome === "complete" ? 1 : 0);
+    let modelCallsAvoidedEstimate = 0;
+    let lastRoutedLayer = null;
+    for (const r of records) {
+      if (!r) continue;
+      if (r.skipped) {
+        if (MODEL_LAYERS.has(lastRoutedLayer)) modelCallsAvoidedEstimate += 1;
+      } else {
+        lastRoutedLayer = r.layer ?? null;
+      }
+    }
+    const startedAt = typeof sessionSnapshot?.createdAt === "number" ? sessionSnapshot.createdAt : null;
+    const endedAt = Date.now();
+    return {
+      schemaVersion: "1",
+      taskId: sessionSnapshot?.sessionId ?? null,
+      startedAt,
+      endedAt,
+      totalLatencyMs: startedAt != null ? endedAt - startedAt : null,
+      cycles: {
+        total: records.length,
+        routed: routedRecords.length,
+        skipped: skippedRecords.length
+      },
+      layerCounts,
+      layerLatencyMs: {
+        stateExtraction: latencyBucket(records, "domMs"),
+        l1: latencyBucket(routedRecords, "layer1Ms"),
+        l2: latencyBucket(routedRecords, "layer2Ms"),
+        localQwen: latencyBucket(routedRecords, "qwenMs"),
+        localVision: latencyBucket(routedRecords, "visionMs"),
+        cloud: latencyBucket(routedRecords, "cloudMs"),
+        postActionVerify: latencyBucket(routedRecords, "verifyMs")
+      },
+      actions: {
+        completed,
+        verificationOutcomes
+      },
+      replans: {
+        total: replansTotal,
+        byOutcome: replansByOutcome
+      },
+      fingerprintOptimization: {
+        skipsAttempted: skippedRecords.length,
+        modelCallsAvoidedEstimate
+      },
+      outcome,
+      outcomeReason
+    };
+  }
+
   // extension/v2-task.js
   var _state = TaskState.IDLE;
   function ts() {
@@ -4413,6 +4567,7 @@ Return JSON ONLY:
   var _taskStartedAt = null;
   var _lastUserActedAtMs = null;
   var _lastUserActedIntent = null;
+  var _cycleRecords = [];
   var MAX_CLARIFICATIONS = 5;
   var RETRYABLE_PLAN_ERRORS = /* @__PURE__ */ new Set(["NETWORK_ERROR", "REQUEST_TIMEOUT", "HTTP_ERROR"]);
   var MAX_PLAN_RETRIES = 2;
@@ -4915,6 +5070,13 @@ Return JSON ONLY:
   function isTerminalStep(step) {
     return step?.completionCondition === "final";
   }
+  function _emitTaskMetrics(session, { outcome, outcomeReason = null } = {}) {
+    try {
+      logEvent("task_metrics", deriveTaskMetrics(_cycleRecords, session, { outcome, outcomeReason }));
+    } catch (err) {
+      console.warn("[SP:V2] task_metrics emission failed (ignored):", err);
+    }
+  }
   async function _showGoalCompleteCard(tabId, goal) {
     const s = await SessionStore.load(tabId);
     showCompletionCard({
@@ -4922,6 +5084,7 @@ Return JSON ONLY:
       steps: s?.completedSteps.length ?? 0,
       startedAt: _taskStartedAt
     });
+    _emitTaskMetrics(s, { outcome: "complete" });
     await SessionStore.clear(tabId);
   }
   var _activePlanPromise = null;
@@ -4960,6 +5123,7 @@ Return JSON ONLY:
     const decisionRouter = new DecisionRouter({ executionMode, localQwenAdapter, localVisionAdapter, cloudAdapter });
     let planRetryCount = 0;
     let localPageState = null;
+    let consecutiveSkipCount = 0;
     while (true) {
       if (_generation !== myGen) {
         console.log(`[SP:V2] Plan loop gen=${myGen} superseded by gen=${_generation} \u2014 exiting`);
@@ -5031,9 +5195,49 @@ Return JSON ONLY:
       if (budgetExhausted) {
         applyEvent(TaskEvent.PLAN_FAILED, { reason: budgetReason });
         showStatus(`ScreenPilot: ${budgetReason}`, "error");
+        _emitTaskMetrics(session, { outcome: "failed", outcomeReason: "PLANNER_BUDGET_EXCEEDED" });
         await SessionStore.clear(tabId);
         return;
       }
+      const currentFingerprint = computeRelevantStateFingerprint(cyclePageState);
+      const canSkipRouting = session.lastCycleOutcome === "step_completed" && !!session.lastFingerprint && session.lastFingerprint.url === currentFingerprint.url && session.lastFingerprint.hash === currentFingerprint.hash && consecutiveSkipCount < 1;
+      async function recordCycleOutcome(outcome2, extra = {}) {
+        _cycleRecords.push({
+          skipped: false,
+          domMs: cycleExtractMs,
+          layer: null,
+          layer1Ms: 0,
+          layer2Ms: 0,
+          qwenMs: 0,
+          visionMs: 0,
+          cloudMs: 0,
+          verifyMs: null,
+          verdict: null,
+          outcome: outcome2,
+          ...extra
+        });
+        await SessionStore.patchSession(tabId, { lastCycleOutcome: outcome2, lastFingerprint: currentFingerprint });
+      }
+      if (canSkipRouting) {
+        _cycleRecords.push({
+          skipped: true,
+          domMs: cycleExtractMs,
+          layer: null,
+          layer1Ms: 0,
+          layer2Ms: 0,
+          qwenMs: 0,
+          visionMs: 0,
+          cloudMs: 0,
+          verifyMs: null,
+          verdict: null,
+          outcome: "skipped"
+        });
+        consecutiveSkipCount += 1;
+        console.log(`[SP:V2:PERF] stage=fingerprint_gate action=skip consecutiveSkipCount=${consecutiveSkipCount} url=${currentFingerprint.url} elementCount=${currentFingerprint.count}`);
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
+      consecutiveSkipCount = 0;
       const tCycleStart = Date.now();
       showStatus("ScreenPilot \xB7 Planning\u2026", "planning");
       const freshSession = session;
@@ -5068,6 +5272,8 @@ Return JSON ONLY:
       console.log(`[SP:V2] [${ts()}] executionMode=${executionMode} step=${freshSession.completedSteps.length + 1} url=${window.location.href} clarifications=${nClarifications} pageControls=${pageControls.length} reqId=${reqId}`);
       let screenshotMs = 0;
       let planResp;
+      let cycleRoutedLayer = null;
+      let cycleLayer1Ms = 0, cycleLayer2Ms = 0, cycleQwenMs = 0, cycleCloudMs = 0, cycleVisionMs = 0;
       try {
         const tDomStart = Date.now();
         const pageState = cyclePageState ?? PageStateService.extractPageState();
@@ -5118,6 +5324,12 @@ Return JSON ONLY:
         const qwenMs = routed.qwenMs ?? 0;
         const cloudMs = routed.cloudMs ?? 0;
         const totalPlanningMs = Date.now() - tReqStart;
+        cycleRoutedLayer = routed.layer;
+        cycleLayer1Ms = layer1Ms;
+        cycleLayer2Ms = layer2Ms;
+        cycleQwenMs = qwenMs;
+        cycleCloudMs = cloudMs;
+        cycleVisionMs = routed.visionMs ?? 0;
         console.log(`[SP:V2:TRACE] layer result layer=${routed.layer} confidence=${planResp.confidence} qwenFailureReason=${routed.qwenFailureReason ?? "n/a"}`);
         console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=${layer1Ms} layer2Ms=${layer2Ms} qwenMs=${qwenMs} cloudMs=${cloudMs} screenshotMs=${screenshotMs} postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${totalPlanningMs} l3Layer=${routed.layer}`);
         console.log(`[SP:V2:PERF] stage=routing routeMs=${layer1Ms + layer2Ms + qwenMs + cloudMs} pageControlsMs=${pageControlsMs} domReused=${cyclePageState ? "yes" : "no"} goalCheckReused=${cycleGenericCheck ? "yes" : "no"}`);
@@ -5149,12 +5361,14 @@ Return JSON ONLY:
         if (planController.signal.aborted || err?.name === "AbortError") {
           console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_aborted_exception`);
           console.log("[SP:V2] Request aborted \u2014 replanning");
+          await recordCycleOutcome("stale_plan");
           continue;
         }
         console.error("[SP:V2] Planning failed:", err);
         logError("plan_failed", { reqId, name: err?.name ?? null, message: redactText(err?.message ?? "") });
         applyEvent(TaskEvent.PLAN_FAILED, { reason: "network_error" });
         showStatus(`ScreenPilot: Planning error \u2014 ${err.message}`, "error");
+        _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: "NETWORK_ERROR" });
         await SessionStore.clear(tabId);
         return;
       }
@@ -5165,6 +5379,7 @@ Return JSON ONLY:
       if (planResp?.errorCode === "ABORTED") {
         console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_discard`);
         console.log("[SP:V2] Request aborted \u2014 replanning");
+        await recordCycleOutcome("stale_plan");
         continue;
       }
       const postSnap = capturePageSnapshot("");
@@ -5181,6 +5396,14 @@ Return JSON ONLY:
         if (!isRepeatOfCompletedStep) {
           console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=replan_stale_snapshot_change`);
           console.log(`[SP:V2] STALE_PLAN discarded urlChanged=${urlChanged} domChanged=${domChanged} preUrl=${preSnap.url} postUrl=${postSnap.url} preDomHash=${preSnap.domHash} postDomHash=${postSnap.domHash} reqMs=${reqMs}ms`);
+          await recordCycleOutcome("stale_plan", {
+            layer: cycleRoutedLayer,
+            layer1Ms: cycleLayer1Ms,
+            layer2Ms: cycleLayer2Ms,
+            qwenMs: cycleQwenMs,
+            cloudMs: cycleCloudMs,
+            visionMs: cycleVisionMs
+          });
           continue;
         }
         console.log(`[SP:V2:DEBUG] replan_lifecycle reqId=${reqId} action=stale_snapshot_matches_completed_step_deferred_to_dedup_guard`);
@@ -5219,6 +5442,14 @@ Return JSON ONLY:
               accepted: false,
               reason: gate.reason
             });
+            await recordCycleOutcome("stale_plan", {
+              layer: cycleRoutedLayer,
+              layer1Ms: cycleLayer1Ms,
+              layer2Ms: cycleLayer2Ms,
+              qwenMs: cycleQwenMs,
+              cloudMs: cycleCloudMs,
+              visionMs: cycleVisionMs
+            });
             continue;
           }
         }
@@ -5229,6 +5460,7 @@ Return JSON ONLY:
           steps: freshSession.completedSteps.length,
           startedAt: _taskStartedAt
         });
+        _emitTaskMetrics(freshSession, { outcome: "complete" });
         await SessionStore.clear(tabId);
         return;
       }
@@ -5238,6 +5470,14 @@ Return JSON ONLY:
         await SessionStore.patchSession(tabId, { pauseReason: "blocked" });
         await SessionStore.setPhase(tabId, "PAUSED");
         applyEvent(TaskEvent.WORKFLOW_PAUSED);
+        await recordCycleOutcome("blocked", {
+          layer: cycleRoutedLayer,
+          layer1Ms: cycleLayer1Ms,
+          layer2Ms: cycleLayer2Ms,
+          qwenMs: cycleQwenMs,
+          cloudMs: cycleCloudMs,
+          visionMs: cycleVisionMs
+        });
         await SessionStore.refreshExpiry(tabId);
         const paused = await SessionStore.load(tabId);
         if (paused) showPausedBanner(paused);
@@ -5248,6 +5488,7 @@ Return JSON ONLY:
         if (isStuck) {
           applyEvent(TaskEvent.PLAN_FAILED, { reason: "ambiguous_limit_reached" });
           showStatus(reason ? `ScreenPilot: Cannot determine next step \u2014 ${reason}` : "ScreenPilot: Cannot determine next step \u2014 goal is too ambiguous", "error");
+          _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: "AMBIGUOUS_LIMIT" });
           await SessionStore.clear(tabId);
           return;
         }
@@ -5257,6 +5498,14 @@ Return JSON ONLY:
         });
         await SessionStore.setPhase(tabId, "PAUSED");
         applyEvent(TaskEvent.AMBIGUOUS_RECEIVED);
+        await recordCycleOutcome("ambiguous", {
+          layer: cycleRoutedLayer,
+          layer1Ms: cycleLayer1Ms,
+          layer2Ms: cycleLayer2Ms,
+          qwenMs: cycleQwenMs,
+          cloudMs: cycleCloudMs,
+          visionMs: cycleVisionMs
+        });
         await SessionStore.refreshExpiry(tabId);
         const paused = await SessionStore.load(tabId);
         if (paused) showAmbiguousBanner(paused);
@@ -5270,14 +5519,24 @@ Return JSON ONLY:
           const backoffMs = 1e3 * Math.pow(2, planRetryCount - 1);
           console.warn(`[SP:V2] [${ts()}] Retryable plan failure (${errorCode}) \u2014 retry ${planRetryCount}/${MAX_PLAN_RETRIES} in ${backoffMs}ms (session preserved)`);
           showStatus("ScreenPilot \xB7 Reconnecting\u2026", "planning");
+          await recordCycleOutcome("retryable_error", {
+            layer: cycleRoutedLayer,
+            layer1Ms: cycleLayer1Ms,
+            layer2Ms: cycleLayer2Ms,
+            qwenMs: cycleQwenMs,
+            cloudMs: cycleCloudMs,
+            visionMs: cycleVisionMs
+          });
           await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         applyEvent(TaskEvent.PLAN_FAILED, { reason: errorCode });
         if (retryable) {
           showStatus(`ScreenPilot: ${planResp.error ?? "Connection problem \u2014 please try again"}`, "error");
+          _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: errorCode === "NETWORK_ERROR" ? "NETWORK_ERROR" : errorCode === "REQUEST_TIMEOUT" ? "REQUEST_TIMEOUT" : "HTTP_ERROR" });
         } else {
           showStatus(`ScreenPilot: ${planResp.error ?? "Planning failed"}`, "error");
+          _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: null });
           await SessionStore.clear(tabId);
         }
         return;
@@ -5286,6 +5545,14 @@ Return JSON ONLY:
       const plannerStep = planResp.plan.steps[0];
       if (!plannerStep) {
         console.warn("[SP:V2] state=planned but steps is empty \u2014 treating as ambiguous");
+        await recordCycleOutcome("stale_plan", {
+          layer: cycleRoutedLayer,
+          layer1Ms: cycleLayer1Ms,
+          layer2Ms: cycleLayer2Ms,
+          qwenMs: cycleQwenMs,
+          cloudMs: cycleCloudMs,
+          visionMs: cycleVisionMs
+        });
         continue;
       }
       enrichStepFromPageState(plannerStep, localPageState);
@@ -5305,9 +5572,18 @@ Return JSON ONLY:
             if (isStuck) {
               applyEvent(TaskEvent.PLAN_FAILED, { reason });
               showStatus(`ScreenPilot: ${reason}`, "error");
+              _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: "STEP_ATTEMPTS_EXCEEDED" });
               await SessionStore.clear(tabId);
               return;
             }
+            await recordCycleOutcome("dedup_repeat", {
+              layer: cycleRoutedLayer,
+              layer1Ms: cycleLayer1Ms,
+              layer2Ms: cycleLayer2Ms,
+              qwenMs: cycleQwenMs,
+              cloudMs: cycleCloudMs,
+              visionMs: cycleVisionMs
+            });
             await new Promise((r) => setTimeout(r, 200));
             continue;
           } else {
@@ -5329,9 +5605,18 @@ Return JSON ONLY:
       await _shadowGoalVerify(tabId, "PLAN_RECEIVED", false);
       hideStatus();
       await SessionStore.setPhase(tabId, "EXECUTING");
+      const completedStepsCountBeforeExecute = freshSession.completedSteps.length;
       const result = await _executeStep(tabId, plannerStep, freshSession.goal, myGen);
       await SessionStore.patchSession(tabId, { lastActionResult: result, lastActionAt: Date.now() });
       if (result === "navigated" || result === "aborted") {
+        await recordCycleOutcome("stale_plan", {
+          layer: cycleRoutedLayer,
+          layer1Ms: cycleLayer1Ms,
+          layer2Ms: cycleLayer2Ms,
+          qwenMs: cycleQwenMs,
+          cloudMs: cycleCloudMs,
+          visionMs: cycleVisionMs
+        });
         if (result === "navigated") {
           setTimeout(() => {
             _bootstrapSession(tabId);
@@ -5347,12 +5632,21 @@ Return JSON ONLY:
         if (isStuck) {
           applyEvent(TaskEvent.PLAN_FAILED, { reason });
           showStatus(`ScreenPilot: ${reason}`, "error");
+          _emitTaskMetrics(freshSession, { outcome: "failed", outcomeReason: "STEP_ATTEMPTS_EXCEEDED" });
           await SessionStore.clear(tabId);
           return;
         }
         await SessionStore.setPhase(tabId, "PLANNING");
         applyEvent(TaskEvent.REPLAN_TRIGGERED, { reason: "element_not_found" });
         await SessionStore.incrementReplanCount(tabId);
+        await recordCycleOutcome("element_not_found", {
+          layer: cycleRoutedLayer,
+          layer1Ms: cycleLayer1Ms,
+          layer2Ms: cycleLayer2Ms,
+          qwenMs: cycleQwenMs,
+          cloudMs: cycleCloudMs,
+          visionMs: cycleVisionMs
+        });
         await _shadowGoalVerify(tabId, "REPLAN", false);
         await new Promise((r) => setTimeout(r, 500));
         continue;
@@ -5360,6 +5654,16 @@ Return JSON ONLY:
       await SessionStore.setPhase(tabId, "PLANNING");
       applyEvent(TaskEvent.REPLAN_TRIGGERED, { intent: plannerStep.intent });
       await SessionStore.incrementReplanCount(tabId);
+      const postExecuteSession = await SessionStore.load(tabId);
+      const stepGenuinelyCompleted = (postExecuteSession?.completedSteps?.length ?? completedStepsCountBeforeExecute) > completedStepsCountBeforeExecute;
+      await recordCycleOutcome(stepGenuinelyCompleted ? "step_completed" : "fill_verification_failed", {
+        layer: cycleRoutedLayer,
+        layer1Ms: cycleLayer1Ms,
+        layer2Ms: cycleLayer2Ms,
+        qwenMs: cycleQwenMs,
+        cloudMs: cycleCloudMs,
+        visionMs: cycleVisionMs
+      });
       await _shadowGoalVerify(tabId, "REPLAN", false);
     }
   }
@@ -5697,6 +6001,7 @@ Return JSON ONLY:
     _executor = null;
     ++_generation;
     logEvent("task_progress_snapshot", deriveTaskProgress(await SessionStore.load(_tabId), { aborted: true }));
+    _emitTaskMetrics(await SessionStore.load(_tabId), { outcome: "aborted", outcomeReason: "USER_CANCELLED" });
     await SessionStore.clear(_tabId);
     _state = TaskState.PAUSED;
     applyEvent(TaskEvent.CANCEL_CLICKED);
@@ -5715,6 +6020,7 @@ Return JSON ONLY:
     _state = TaskState.IDLE;
     _taskContext = { goal, steps: [], startedAt: Date.now() };
     _taskStartedAt = Date.now();
+    _cycleRecords = [];
     console.log("[SP:V2] \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
     console.log(`[SP:V2] [${ts()}] New task: "${redactText(goal)}"`);
     console.log(`[SP:V2] [${ts()}] Page: ${window.location.href}`);
@@ -5737,6 +6043,8 @@ Return JSON ONLY:
     if (_tabId) {
       const tabIdSnapshot = _tabId;
       SessionStore.load(tabIdSnapshot).then((s) => logEvent("task_progress_snapshot", deriveTaskProgress(s, { aborted: true }))).catch(() => {
+      });
+      SessionStore.load(tabIdSnapshot).then((s) => _emitTaskMetrics(s, { outcome: "aborted", outcomeReason: "USER_CANCELLED" })).catch(() => {
       });
       SessionStore.clear(tabIdSnapshot).catch(() => {
       });

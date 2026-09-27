@@ -82,6 +82,23 @@ test('completeStep() still resets exactly stepAttemptCount/consecutiveFinalCount
   assert.equal(s.plannerAttemptCount, 2);
 });
 
+// ── Phase 7 additive defaults ────────────────────────────────────────────────
+
+test('create() includes the Phase 7 additive defaults: lastFingerprint=null, lastCycleOutcome=null', async () => {
+  const s = await SessionStore.create(1, 'g');
+  assert.equal(s.lastFingerprint, null);
+  assert.equal(s.lastCycleOutcome, null);
+});
+
+test('patchSession() round-trips lastFingerprint/lastCycleOutcome — no dedicated method is needed for them', async () => {
+  await SessionStore.create(1, 'g');
+  const fp = { url: 'https://example.com/', count: 3, hash: 'abcd1234' };
+  await SessionStore.patchSession(1, { lastFingerprint: fp, lastCycleOutcome: 'step_completed' });
+  const s = await SessionStore.load(1);
+  assert.deepEqual(s.lastFingerprint, fp);
+  assert.equal(s.lastCycleOutcome, 'step_completed');
+});
+
 test('the dynamic planner budget formula is unchanged: 10 + 2*completedSteps, capped at 40', async () => {
   const s0 = await SessionStore.create(1, 'g');
   assert.equal(maxPlannerCalls(s0), 10);

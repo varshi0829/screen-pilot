@@ -103,6 +103,18 @@ export const SessionStore = {
       replanCount:               0,
       lastActionResult:          null,
       lastActionAt:              null,
+      // Phase 7 (fingerprint optimization): additive, optional fields — same
+      // pattern as the Phase 4 fields above. NOT a schema bump. lastFingerprint
+      // is a {url, count, hash} object from page-snapshot.js's
+      // computeRelevantStateFingerprint(), or null before the first real
+      // planning cycle. lastCycleOutcome is one of 'step_completed' |
+      // 'element_not_found' | 'fill_verification_failed' | 'dedup_repeat' |
+      // 'stale_plan' | 'retryable_error' | 'ambiguous' | 'blocked' | null —
+      // see v2-task.js's plan loop for exactly where each is written. Both are
+      // read-and-written only via the existing generic patchSession(); no new
+      // SessionStore method is introduced for them.
+      lastFingerprint:           null,
+      lastCycleOutcome:          null,
       phase:                     'PLANNING',
       createdAt:                 t,
       updatedAt:                 t,

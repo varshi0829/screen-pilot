@@ -1466,6 +1466,68 @@ test('C: STALE_PLAN for a response unrelated to any completed step is discarded 
   }
 });
 
+// ── C2 (Phase 7): a real STALE_PLAN discard writes lastCycleOutcome='stale_plan' ─
+//
+// Same trigger as test C above (an unrelated navigation mid-flight) — verifies
+// the fingerprint-optimization bookkeeping this discard site now performs:
+// the session must come out of it tagged 'stale_plan', so a later cycle can
+// never treat this as an ordinary, skip-eligible 'step_completed'.
+
+test('C2: a real STALE_PLAN discard records lastCycleOutcome=stale_plan on the session', async () => {
+  clearStore();
+  setUrl('https://example.com');
+  __resetState();
+
+  setDomHash(['Explore', 'Marketplace', 'Pricing']);
+  const domHashBefore = currentDomHash();
+  setDomHash(['Explore', 'Marketplace', 'Pricing', 'New repository', 'New gist']);
+  const domHashAfter = currentDomHash();
+
+  const origRoute = DecisionRouter.prototype.route;
+  DecisionRouter.prototype.route = async () => {
+    setUrl('https://example.com/settings'); // navigation mid-flight, as in test C
+    return {
+      layer: 'deterministic', layer1Ms: 0, layer2Ms: 0, qwenMs: 0, cloudMs: 0,
+      planResponse: {
+        result: 'OK', state: 'planned', confidence: 0.9,
+        plan: { goalType: 'action', confidence: 0.9, steps: [{
+          id: 1, description: 'Click Save preferences',
+          intent: 'save_preferences', completionCondition: 'dom_change',
+          targetElement: { text: 'Save', type: 'button' },
+          expectedPageState: { urlChanges: false },
+        }] },
+      },
+    };
+  };
+
+  try {
+    await SessionStore.create(TAB, 'how to create a new repo');
+    await SessionStore.completeStep(TAB, {
+      description: 'Click the + button in the top navigation', intent: 'open_create_menu',
+      completionCondition: 'dom_change',
+      urlBefore: 'https://example.com', domHashBefore,
+      urlAfter: 'https://example.com', domHashAfter,
+      completedAt: Date.now() - 500,
+    });
+    // Pre-seed as if a prior cycle had genuinely succeeded — this is exactly
+    // the state the Phase 7 gate must NOT still see as skip-eligible once the
+    // STALE_PLAN discard below has run.
+    await SessionStore.patchSession(TAB, {
+      lastCycleOutcome: 'step_completed',
+      lastFingerprint: { url: 'https://example.com', count: 1, hash: 'deadbeef' },
+    });
+
+    const restore = stubLoad(2);
+    await _bootstrapSession(TAB);
+    restore();
+
+    const after = await SessionStore.load(TAB);
+    assert.equal(after.lastCycleOutcome, 'stale_plan', 'the discard must overwrite the stale step_completed provenance');
+  } finally {
+    DecisionRouter.prototype.route = origRoute;
+  }
+});
+
 // ── D: matchesCompletedStep must compare against the completed step's own
 // destination (urlAfter), not its starting point (urlBefore) ─────────────────
 //
