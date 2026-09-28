@@ -1219,6 +1219,105 @@ test('a resolved UNLABELED element preserves its elementId and bbox through the 
   assert.equal(step.description, "Click 'Click the button with the icon'");
 });
 
+// ── Unsatisfied-requirement gate on structural continuation ─────────────────
+//
+// Routing-quality fix: structural continuation (above) is correct about WHAT
+// DOM action is locally plausible (a filled field's own form submit) but has
+// no way to know whether that action is APPROPRIATE for the goal's own
+// declared requirements. options.unsatisfiedRequirements carries the goal's
+// own not-yet-historically-satisfied successSignals (computed by the caller
+// in v2-task.js from goalCompletionCriteria + requirementProgress — this
+// file never reads either). The gate ranks each unsatisfied signal's own
+// `text` against the currently unaddressed candidates using the exact same
+// UIGroundingService.rankElements L1/L2 already use — no form, field-name,
+// action-type, or site vocabulary of any kind. Fixtures here are
+// deliberately generic (Widget A/B/C, not any real site or form) to prove
+// the mechanism generalizes.
+
+function widgetFormEls() {
+  return [
+    { id: 'el_1', role: 'textbox', tag: 'input', ariaLabel: 'Widget name', value: 'demo', visible: true, enabled: true, formId: 'wf0' },
+    { id: 'el_2', role: 'radio',   tag: 'input', ariaLabel: 'Widget Color Alpha', value: '', visible: true, enabled: true, formId: 'wf0' },
+    { id: 'el_3', role: 'textbox', tag: 'textarea', ariaLabel: 'Widget Notes', value: '', visible: true, enabled: true, formId: 'wf0' },
+    { id: 'el_9', role: 'button', tag: 'button', text: 'Submit', type: 'submit', visible: true, enabled: true, formId: 'wf0' },
+  ];
+}
+const widgetSettled = [
+  { intent: "fill_Widget name", description: "Fill 'Widget name'", completionCondition: 'dom_change' },
+];
+
+test('unsatisfied-requirement gate: empty unsatisfiedRequirements leaves continuation unchanged (byte-for-byte)', async () => {
+  const router = new DecisionRouter();
+  const withoutMeta = await router.route('Widget name demo', { url: 'https://example.com', title: 'Test', elements: widgetFormEls() },
+    { completedSteps: widgetSettled, settledSteps: widgetSettled, cloudContext: {} });
+  const withEmptyMeta = await router.route('Widget name demo', { url: 'https://example.com', title: 'Test', elements: widgetFormEls() },
+    { completedSteps: widgetSettled, settledSteps: widgetSettled, cloudContext: {}, unsatisfiedRequirements: [] });
+  const withUndefinedMeta = await router.route('Widget name demo', { url: 'https://example.com', title: 'Test', elements: widgetFormEls() },
+    { completedSteps: widgetSettled, settledSteps: widgetSettled, cloudContext: {}, unsatisfiedRequirements: undefined });
+
+  for (const result of [withoutMeta, withEmptyMeta, withUndefinedMeta]) {
+    assert.equal(result.planResponse.plan.steps[0].targetElement.elementId, 'el_9', 'must still advance to the submit control');
+    assert.equal(result.planResponse.plan.steps[0].completionCondition, 'final', 'a genuinely final continuation is unaffected');
+  }
+});
+
+test('unsatisfied-requirement gate: a matching unaddressed candidate is chosen instead of submit', async () => {
+  const router = new DecisionRouter();
+  const result = await router.route('Widget name demo', { url: 'https://example.com', title: 'Test', elements: widgetFormEls() }, {
+    completedSteps: widgetSettled, settledSteps: widgetSettled, cloudContext: {},
+    unsatisfiedRequirements: [
+      { type: 'text_present', text: 'Widget Color Alpha' },
+      { type: 'text_present', text: 'Widget Notes' },
+    ],
+  });
+
+  const step = result.planResponse.plan.steps[0];
+  assert.notEqual(step.targetElement.elementId, 'el_9', 'must NOT submit while an unsatisfied requirement matches an unaddressed candidate');
+  assert.ok(['el_2', 'el_3'].includes(step.targetElement.elementId), `must redirect to the matching unaddressed candidate, got ${step.targetElement.elementId}`);
+  assert.notEqual(step.completionCondition, 'final', 'a redirected step is not the terminal action');
+});
+
+test('unsatisfied-requirement gate: no matching candidate still lets submit continuation happen', async () => {
+  const router = new DecisionRouter();
+  const result = await router.route('Widget name demo', { url: 'https://example.com', title: 'Test', elements: widgetFormEls() }, {
+    completedSteps: widgetSettled, settledSteps: widgetSettled, cloudContext: {},
+    // Describes evidence with no vocabulary overlap with anything left unaddressed
+    // on this page (e.g. a post-submission URL/text check) — nothing here for
+    // the generic ranker to redirect to, so the existing behavior must stand.
+    unsatisfiedRequirements: [{ type: 'url_matches', urlPattern: '/done' }],
+  });
+
+  const step = result.planResponse.plan.steps[0];
+  assert.equal(step.targetElement.elementId, 'el_9', 'with no matching candidate, submit continuation must still happen');
+  assert.equal(step.completionCondition, 'final');
+});
+
+test('unsatisfied-requirement gate: a url_matches-only requirement (no .text) never blocks continuation on its own', async () => {
+  const router = new DecisionRouter();
+  const redirect = router._resolveUnsatisfiedRequirementCandidate(
+    widgetFormEls(), widgetSettled, 'el_9', [{ type: 'url_matches', urlPattern: '/done' }]
+  );
+  assert.equal(redirect, null, 'a signal with no .text has nothing generic to rank against and must be skipped, not treated as a block');
+});
+
+test('unsatisfied-requirement gate: the excluded (submit) element itself is never offered back as its own redirect target', async () => {
+  const router = new DecisionRouter();
+  const redirect = router._resolveUnsatisfiedRequirementCandidate(
+    widgetFormEls(), widgetSettled, 'el_9', [{ type: 'text_present', text: 'Submit' }]
+  );
+  assert.ok(!redirect || redirect.plan.steps[0].targetElement.elementId !== 'el_9');
+});
+
+test('unsatisfied-requirement gate: an already-settled candidate is not offered as a redirect target', async () => {
+  const router = new DecisionRouter();
+  // el_1 (Widget name) is settled — even if a signal's text happened to
+  // overlap with it, it must not be re-offered.
+  const redirect = router._resolveUnsatisfiedRequirementCandidate(
+    widgetFormEls(), widgetSettled, 'el_9', [{ type: 'text_present', text: 'Widget name' }]
+  );
+  assert.ok(!redirect || redirect.plan.steps[0].targetElement.elementId !== 'el_1');
+});
+
 // ── _buildPlanFromElement: role-aware fill classification ───────────────────
 //
 // Root-cause fix for a dead zone found via real-browser testing: a native

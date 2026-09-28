@@ -1218,11 +1218,31 @@ async function _runPlanLoopInternal(tabId, myGen) {
         ...pageControls.length && { pageControls }
       };
 
+      // Routing-quality fix (structural-continuation gate): the goal's own
+      // declared, not-yet-historically-satisfied successSignals — same
+      // shape as successSignals, computed entirely from data this file
+      // already owns (goalCompletionCriteria + requirementProgress; see
+      // isRequirementSetComplete's identical filtering logic above). Passed
+      // through as opt-in metadata; decision-router.js only ever consults it
+      // to avoid treating a form's submit control as the next action while
+      // the goal itself still needs something else on the same page — see
+      // DecisionRouter._resolveUnsatisfiedRequirementCandidate's own doc
+      // comment. undefined (not an empty array) when there is no applicable
+      // requiresEffect contract, so an ordinary criteria-less goal's routing
+      // is byte-for-byte unchanged.
+      const unsatisfiedRequirements =
+        freshSession.goalCompletionCriteria?.requiresEffect === true
+          ? freshSession.goalCompletionCriteria.successSignals.filter(
+              (_, i) => freshSession.requirementProgress?.[i] !== true
+            )
+          : undefined;
+
       const routed = await decisionRouter.route(freshSession.goal, pageState, {
         signal: planController.signal,
         cloudContext,
         completedSteps: freshSession.completedSteps,
-        settledSteps
+        settledSteps,
+        unsatisfiedRequirements
       });
 
       planResp     = routed.planResponse;

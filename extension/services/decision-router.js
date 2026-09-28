@@ -215,6 +215,15 @@ export class DecisionRouter {
    *   the TASK PROGRESS note on the class above). Supplied by the caller, which
    *   owns the session and the page snapshot; derived fresh every cycle and
    *   never persisted, so it cannot go stale.
+   * @param {object[]} [options.unsatisfiedRequirements] - The goal's own
+   *   goalCompletionCriteria.successSignals entries not yet historically
+   *   satisfied (per the caller's requirementProgress) — same shape as
+   *   successSignals ({type, text} or {type, urlPattern}), computed entirely
+   *   by the caller. Optional and additive: omitted, this router behaves
+   *   exactly as before. Consulted only by structural continuation (see
+   *   _resolveActionContinuation) to avoid treating a form's submit control
+   *   as the next action while the goal itself still needs something else on
+   *   the same page — see that method's own doc comment.
    * @returns {Promise<{ layer: 'deterministic'|'ml_grounding'|'local_qwen'|'cloud', planResponse: object, layer1Ms: number, layer2Ms: number, qwenMs: number, cloudMs: number, qwenFailureReason: string|null }>}
    */
   async route(goal, pageState, options = {}) {
@@ -335,7 +344,7 @@ export class DecisionRouter {
     // understanding the page's wording at all (see _resolveActionContinuation).
     // Placed after L2 deliberately — a confident lexical match is still the
     // better answer when one exists, and this must never pre-empt it.
-    const continuation = this._resolveActionContinuation(elements, settledSteps);
+    const continuation = this._resolveActionContinuation(elements, settledSteps, options.unsatisfiedRequirements);
     if (continuation) {
       console.log(`[SP:DecisionRouter] Structural continuation of settled action -> elementId=${continuation.plan.steps[0].targetElement.elementId} (no model invoked)`);
       return { layer: 'ml_grounding', planResponse: continuation, layer1Ms, layer2Ms, qwenMs: 0, cloudMs: 0, qwenFailureReason: null };
@@ -832,9 +841,12 @@ export class DecisionRouter {
    *
    * @param {object[]} elements - This cycle's full pageState.elements.
    * @param {object[]} settledSteps - Steps whose effect is the current state.
+   * @param {object[]} [unsatisfiedRequirements] - See route()'s own doc
+   *   comment. Checked immediately before this method would otherwise commit
+   *   to the submit control — see _resolveUnsatisfiedRequirementCandidate.
    * @returns {object|null} A ready plan response, or null to fall through.
    */
-  _resolveActionContinuation(elements, settledSteps) {
+  _resolveActionContinuation(elements, settledSteps, unsatisfiedRequirements) {
     if (!settledSteps?.length) return null;
 
     // The settled action's own target, located in the CURRENT state.
@@ -860,10 +872,71 @@ export class DecisionRouter {
       (submitCandidates.length === 1 ? submitCandidates[0] : null);
     if (!target) return null;
 
+    // Goal-requirement gate — checked BEFORE this method commits to the
+    // submit control. Mirrors _resolveRequiredFieldGate's own established
+    // pattern (defer a locally-plausible match to a different, more-relevant
+    // UNADDRESSED candidate) generalized from the HTML `required` attribute
+    // to the goal's own declared, not-yet-satisfied successSignals. See that
+    // method's own call sites (L1/L2 above) for the precedent this follows.
+    const requirementRedirect = this._resolveUnsatisfiedRequirementCandidate(
+      elements, settledSteps, target.id, unsatisfiedRequirements
+    );
+    if (requirementRedirect) return requirementRedirect;
+
     const candidateLabel = (candidate.text || candidate.placeholder || candidate.ariaLabel || '').trim();
     const plan = this._buildPlanFromElement(candidateLabel, target, 0.9, 'ml_grounding');
     plan.plan.steps[0].completionCondition = 'final';
     return plan;
+  }
+
+  /**
+   * Before structural continuation trusts a settled field's own submit
+   * control, check whether the GOAL ITSELF — via its own declared,
+   * not-yet-historically-satisfied successSignals (see v2-task.js's
+   * requirementProgress model) — still needs something ELSE on this same
+   * page. Purely generic: ranks each unsatisfied signal's own `text` against
+   * the currently unaddressed candidates using the exact same lexical
+   * ranking L1/L2 already use (UIGroundingService.rankElements) — no form,
+   * field-name, action-type, or site-specific vocabulary of any kind, and no
+   * awareness of what "submit" or "final" mean. A `url_matches` signal
+   * describes the URL, not any one control, so it has nothing to rank
+   * against here and is skipped, not treated as satisfied or unsatisfied.
+   *
+   * Returns null (preserving the existing submit continuation byte-for-byte)
+   * whenever unsatisfiedRequirements is empty/absent, or no unsatisfied
+   * signal's text ranks above rankElements' own relevance floor against any
+   * currently unaddressed candidate — including the common case where the
+   * goal has exactly one requirement and submitting IS what satisfies it.
+   *
+   * @param {object[]} elements - This cycle's full pageState.elements.
+   * @param {object[]} settledSteps - Steps whose effect is the current state.
+   * @param {string} excludeElementId - The submit control continuation was
+   *   about to choose; never itself offered as an "other" candidate.
+   * @param {object[]} [unsatisfiedRequirements] - successSignal-shaped
+   *   {type, text} | {type, urlPattern} entries, in the goal's own declared
+   *   order.
+   * @returns {object|null} A ready plan response targeting the first
+   *   matching unaddressed candidate, or null to fall through unchanged.
+   */
+  _resolveUnsatisfiedRequirementCandidate(elements, settledSteps, excludeElementId, unsatisfiedRequirements) {
+    if (!Array.isArray(unsatisfiedRequirements) || !unsatisfiedRequirements.length) return null;
+
+    const unaddressed = (elements || []).filter((el) =>
+      el.id !== excludeElementId &&
+      el.visible && el.enabled !== false &&
+      !this._isSettledTarget(el, settledSteps)
+    );
+    if (!unaddressed.length) return null;
+
+    for (const signal of unsatisfiedRequirements) {
+      if (!signal?.text) continue;
+      const ranked = UIGroundingService.rankElements(signal.text, unaddressed);
+      if (ranked.length) {
+        console.log(`[SP:DecisionRouter] Structural continuation deferred — unsatisfied requirement "${signal.text}" matches unaddressed elementId=${ranked[0].element.id} (score=${ranked[0].score.toFixed(3)})`);
+        return this._buildPlanFromElement(signal.text, ranked[0].element, ranked[0].score, 'ml_grounding');
+      }
+    }
+    return null;
   }
 
   _evalFastPath(goal, elements) {
