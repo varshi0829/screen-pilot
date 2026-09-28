@@ -115,6 +115,19 @@ export const SessionStore = {
       // SessionStore method is introduced for them.
       lastFingerprint:           null,
       lastCycleOutcome:          null,
+      // Dynamic requirement-progress model (false-early-completion redesign):
+      // additive, optional — same pattern as the fields above. null until the
+      // first cycle that actually evaluates a goalCompletionCriteria with
+      // successSignals; from then on, a boolean array parallel to
+      // criteria.successSignals BY ARRAY POSITION (the criteria is set once
+      // per task and never mutated, so position is already a stable
+      // requirement identity — no separate requirement-ID field is needed).
+      // Monotonic: once an entry is observed true on any cycle, it stays
+      // true for the rest of the task, even if that signal's live-DOM
+      // evidence is no longer visible on a later page — see
+      // updateRequirementProgress() in v2-task.js. Read-and-written only via
+      // the existing generic patchSession(); no new SessionStore method.
+      requirementProgress:       null,
       phase:                     'PLANNING',
       createdAt:                 t,
       updatedAt:                 t,

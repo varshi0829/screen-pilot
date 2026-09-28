@@ -99,6 +99,32 @@ test('patchSession() round-trips lastFingerprint/lastCycleOutcome — no dedicat
   assert.equal(s.lastCycleOutcome, 'step_completed');
 });
 
+// ── Dynamic requirement-progress model additive default ────────────────────
+
+test('create() includes requirementProgress=null (a genuinely new task starts with no requirement history)', async () => {
+  const s = await SessionStore.create(1, 'g');
+  assert.equal(s.requirementProgress, null);
+});
+
+test('patchSession() round-trips requirementProgress, and it is NOT shared between two different tabIds', async () => {
+  await SessionStore.create(1, 'goal A');
+  await SessionStore.create(2, 'goal B');
+  await SessionStore.patchSession(1, { requirementProgress: [true, false, false] });
+  const s1 = await SessionStore.load(1);
+  const s2 = await SessionStore.load(2);
+  assert.deepEqual(s1.requirementProgress, [true, false, false]);
+  assert.equal(s2.requirementProgress, null, 'a different tab\'s session must not see tab 1\'s requirement progress');
+});
+
+test('create() for a NEW task on the same tabId overwrites any prior requirementProgress — no stale carryover', async () => {
+  await SessionStore.create(1, 'goal A');
+  await SessionStore.patchSession(1, { requirementProgress: [true, true, true] });
+  // A brand new task starting on the same tab (SessionStore.create() always
+  // overwrites the existing session for that tabId).
+  const fresh = await SessionStore.create(1, 'goal B');
+  assert.equal(fresh.requirementProgress, null, 'a new task must not inherit the previous task\'s satisfied requirements');
+});
+
 test('the dynamic planner budget formula is unchanged: 10 + 2*completedSteps, capped at 40', async () => {
   const s0 = await SessionStore.create(1, 'g');
   assert.equal(maxPlannerCalls(s0), 10);

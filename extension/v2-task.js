@@ -710,6 +710,157 @@ function resolveOutcome(planResp) {
 function isTerminalStep(step) {
   return step?.completionCondition === "final";
 }
+
+// ── Dynamic requirement-progress model (false-early-completion redesign) ────
+//
+// goalCompletionCriteria.successSignals is treated as the set of the goal's
+// own distinct explicit requirements (see route.ts's prompt instructions).
+// GoalVerifier.evaluate()/shouldComplete() are NOT modified — they already
+// expose, on every call, which INDIVIDUAL signal passed THIS cycle
+// (verdict.details: one {type,target,passed} entry per signal, in
+// successSignals' own order — already computed today, just not consumed
+// past matchedSignals/totalSignals). What was missing was memory:
+// evaluate() is deliberately stateless, re-deriving `passed` fresh from the
+// live page on every call, so a requirement whose evidence was only visible
+// on an EARLIER page (a multi-page flow, not one atomic submit) would read
+// false again once the page moved on, even though the real-world action
+// genuinely happened.
+//
+// session.requirementProgress (session-store.js, additive) accumulates this
+// across cycles, monotonically — once a signal is OBSERVED true on any
+// cycle, it stays true for the rest of the task, mirroring the same
+// "effect can outlive the exact snapshot" principle stepEffectStillHolds()/
+// deriveSettledSteps() already use above for step-level tracking. None of
+// this depends on action type, completionCondition, plan length, or which
+// routing layer produced the current step — only on the criteria's own
+// signals and the live page.
+
+/**
+ * Fold one cycle's per-signal evaluation into the session's cross-cycle
+ * requirement history. Pure — never mutates either input, returns a new
+ * array. Safe against length mismatches: the output is at least as long as
+ * whichever input is longer, so a previously-recorded true is never
+ * silently dropped.
+ *
+ * @param {Array<boolean>|null} previousProgress - session.requirementProgress,
+ *   or null before any evaluation has happened.
+ * @param {Array<{passed: boolean|null}>|undefined} details - this cycle's
+ *   GoalVerifier verdict.details, or undefined when no criteria/signals
+ *   were evaluated this cycle (criteria absent, or doesn't requiresEffect).
+ * @returns {Array<boolean>}
+ */
+function updateRequirementProgress(previousProgress, details) {
+  const list = Array.isArray(details) ? details : [];
+  const prev = Array.isArray(previousProgress) ? previousProgress : [];
+  const length = Math.max(list.length, prev.length);
+  const next = [];
+  for (let i = 0; i < length; i++) {
+    // Monotonic: once true, always true — passed===false never reverts an
+    // existing true. passed===null (could not be evaluated) never changes
+    // anything either direction: uncertainty is neither progress nor loss.
+    next.push(prev[i] === true || list[i]?.passed === true);
+  }
+  return next;
+}
+
+/**
+ * Count of requirements not yet observed satisfied. Pure.
+ *
+ * @param {Array<boolean>|null} progress
+ * @returns {number}
+ */
+function remainingRequirementCount(progress) {
+  return Array.isArray(progress) ? progress.filter((p) => p !== true).length : 0;
+}
+
+/**
+ * Whether the goal's requirement set is complete, using the ACCUMULATED
+ * cross-cycle history rather than only this cycle's live-page snapshot —
+ * this is what relaxes "every signal true SIMULTANEOUSLY on the same page"
+ * into "every signal observed true at SOME point during this task." Mirrors
+ * the SAME requiresEffect/match/confidenceThreshold semantics
+ * GoalVerifier.shouldComplete() already enforces (every branch here
+ * corresponds to one already in shouldComplete() — this does not invent new
+ * completion semantics, it re-applies the existing ones against `progress`
+ * instead of a single evaluate() call).
+ *
+ * Returns null when the requirement-history model does not apply at all (no
+ * criteria, or a criteria that doesn't opt into requiresEffect) — callers
+ * fall back to the existing, unmodified gate.complete for those cases,
+ * preserving current behavior exactly.
+ *
+ * @param {object|null} criteria - session.goalCompletionCriteria
+ * @param {Array<boolean>} progress - the just-updated requirementProgress
+ * @returns {boolean|null}
+ */
+function isRequirementSetComplete(criteria, progress) {
+  if (!criteria || criteria.requiresEffect !== true) return null;
+  const totalSignals = Array.isArray(criteria.successSignals) ? criteria.successSignals.length : 0;
+  if (totalSignals === 0) return false; // mirrors evaluate()'s own "0 signals -> unsatisfied"
+  if (!Array.isArray(progress) || progress.length < totalSignals) return false;
+  const matched = progress.slice(0, totalSignals).filter((p) => p === true).length;
+  const satisfiedByMatch = criteria.match === 'any' ? matched >= 1 : matched === totalSignals;
+  if (!satisfiedByMatch) return false;
+  if (typeof criteria.confidenceThreshold === 'number' && (matched / totalSignals) < criteria.confidenceThreshold) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Shared by all three GoalVerifier.shouldComplete() consultation sites below:
+ * folds this cycle's evidence into the session's requirement history,
+ * persists it (only when there was new evidence to fold — patchSession is
+ * skipped entirely otherwise, so a cycle with no applicable criteria costs
+ * nothing extra), and returns the accumulated completion decision, falling
+ * back to gate.complete when the requirement-history model doesn't apply.
+ * Not pure (performs the SessionStore write) — kept here only to avoid
+ * repeating the fold+persist+decide sequence three times.
+ *
+ * @param {number} tabId
+ * @param {object|null} criteria
+ * @param {Array<boolean>|null} previousProgress
+ * @param {object} gate - a GoalVerifier.shouldComplete() result
+ * @returns {Promise<{ complete: boolean, progress: Array<boolean>, usedRequirementHistory: boolean }>}
+ */
+async function applyRequirementProgress(tabId, criteria, previousProgress, gate) {
+  const updated = updateRequirementProgress(previousProgress, gate.verdict?.details);
+  if (gate.verdict?.details) {
+    await SessionStore.patchSession(tabId, { requirementProgress: updated });
+  }
+  const requirementSetComplete = isRequirementSetComplete(criteria, updated);
+  return {
+    complete: requirementSetComplete === null ? gate.complete : requirementSetComplete,
+    progress: updated,
+    usedRequirementHistory: requirementSetComplete !== null,
+  };
+}
+
+/**
+ * Veto gate for the OTHER, heuristic-driven completion triggers
+ * (isGoalConsumed, the pre-L3 isGoalSatisfied check, and every
+ * isTerminalStep()/completionCondition==="final" branch). Those heuristics
+ * are legitimate signals that SOMETHING finished — they say nothing about
+ * whether the task's OWN declared goalCompletionCriteria has actually been
+ * met. This is deliberately NOT a new completion mechanism: it never
+ * *grants* completion on its own (a criteria-less goal always passes
+ * through unchanged), it only *vetoes* a heuristic's yes when a
+ * requiresEffect contract exists and the accumulated requirementProgress
+ * (see applyRequirementProgress above) says the goal's requirements are not
+ * all historically satisfied yet. Reasons only from goalCompletionCriteria +
+ * requirementProgress — no action type, form shape, step count, or site.
+ *
+ * @param {number} tabId
+ * @param {object|null} session - the session whose criteria/progress to check
+ * @returns {Promise<boolean>} true = the calling heuristic's completion claim may stand
+ */
+async function _requirementGateAllowsCompletion(tabId, session) {
+  const criteria = session?.goalCompletionCriteria;
+  if (!criteria || criteria.requiresEffect !== true) return true;
+  const gate = GoalVerifier.shouldComplete(criteria);
+  const { complete } = await applyRequirementProgress(tabId, criteria, session.requirementProgress, gate);
+  return complete;
+}
 // Phase 7 — emit exactly one task_metrics event for this task, from whatever
 // per-cycle records this content-script lifetime actually accumulated (see
 // _cycleRecords above). PII-safe: deriveTaskMetrics() never reads goal text,
@@ -854,11 +1005,20 @@ async function _runPlanLoopInternal(tabId, myGen) {
       console.log(`[SP:V2:TRACE] verify END complete=${gate.complete} reason=${gate.reason}`);
       console.log(`[SP:V2:PERF] stage=verifier_gate extractMs=${cycleExtractMs} goalVerifyMs=${goalVerifyMs} elements=${pageState.elements.length}`);
 
-      if (gate.complete) {
+      // Dynamic requirement-progress model — see its own comment block above
+      // for the full explanation. GoalVerifier itself is untouched; this
+      // folds today's per-signal evidence into cross-cycle history before
+      // deciding completion.
+      const {
+        complete: verifierGateComplete,
+        usedRequirementHistory: verifierGateUsedHistory
+      } = await applyRequirementProgress(tabId, session.goalCompletionCriteria, session.requirementProgress, gate);
+
+      if (verifierGateComplete) {
         console.log("[SP:GoalCompletion]", {
           source: "verifier",
           satisfied: true,
-          reason: gate.reason
+          reason: verifierGateUsedHistory ? 'requirements_satisfied' : gate.reason
         });
         console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_already_satisfied`);
         applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
@@ -887,7 +1047,8 @@ async function _runPlanLoopInternal(tabId, myGen) {
       // (e.g. a purely visual question with no page target) is unaffected and
       // still reaches visual perception.
       {
-        if (isGoalConsumed(session, pageState, settledSteps, decisionRouter)) {
+        if (isGoalConsumed(session, pageState, settledSteps, decisionRouter) &&
+            await _requirementGateAllowsCompletion(tabId, session)) {
           console.log("[SP:GoalCompletion]", { source: "verifier", satisfied: true, reason: "goal_consumed", settledActions: settledSteps.length });
           console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_consumed`);
           applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
@@ -1024,7 +1185,7 @@ async function _runPlanLoopInternal(tabId, myGen) {
       // Reuses the gate's own result when it computed one this cycle: same
       // goal, same page state, same live document, microseconds apart.
       const preL3Check = cycleGenericCheck ?? GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
-      if (preL3Check.satisfied) {
+      if (preL3Check.satisfied && await _requirementGateAllowsCompletion(tabId, freshSession)) {
         window.removeEventListener('popstate', onNavCheck);
         console.log(`[SP:V2:TRACE] plan END reqId=${reqId} outcome=goal_already_satisfied`);
         console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=0 layer2Ms=0 qwenMs=0 cloudMs=0 postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${Date.now() - tReqStart} l3=SKIPPED reason=goal_already_satisfied`);
@@ -1192,16 +1353,29 @@ async function _runPlanLoopInternal(tabId, myGen) {
       const criteria = freshSession.goalCompletionCriteria;
       if (criteria?.requiresEffect === true) {
         const gate = GoalVerifier.shouldComplete(criteria);
+        // Dynamic requirement-progress model (found during implementation —
+        // this is a THIRD GoalVerifier.shouldComplete() consultation site,
+        // distinct from the two named in the approved design; see the report
+        // for why it must use the same mechanism: without it, a planner
+        // claim that is genuinely correct — every requirement historically
+        // satisfied, just not all simultaneously visible on THIS cycle's
+        // page — would be wrongly rejected here and looped on forever
+        // (bounded only by the existing planner-attempt budget).
+        const {
+          complete: gateComplete27,
+          usedRequirementHistory: usedHistory27
+        } = await applyRequirementProgress(tabId, criteria, freshSession.requirementProgress, gate);
         // Diagnostic only — logs the gate's inputs/outputs before the accept/reject
         // decision below is made. No control flow depends on this log.
         console.log("[SP:GoalCompletionGate]", {
           requiresEffect:  criteria.requiresEffect,
-          verifierComplete: gate.complete,
-          verifierReason:   gate.reason
+          verifierComplete: gateComplete27,
+          verifierReason:   usedHistory27 ? (gateComplete27 ? 'requirements_satisfied' : 'requirements_remaining') : gate.reason
         });
-        if (!gate.complete) {
+        if (!gateComplete27) {
           console.log("[SP:GoalCompletion]", {
-            source: "planner", state: "complete", accepted: false, reason: gate.reason
+            source: "planner", state: "complete", accepted: false,
+            reason: usedHistory27 ? 'requirements_remaining' : gate.reason
           });
           // Reject the claim and loop back for another planning pass. The existing
           // planner-attempt budget check (top of this same loop, above) already
@@ -1686,11 +1860,21 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
       {
         const s26 = await SessionStore.load(tabId);
         const gate = GoalVerifier.shouldComplete(s26?.goalCompletionCriteria);
-        if (gate.complete) {
+        // Dynamic requirement-progress model — same mechanism as the
+        // top-of-loop verifier gate; see its own comment block for the full
+        // explanation.
+        const {
+          complete: gate26Complete,
+          progress: progress26,
+          usedRequirementHistory: used26
+        } = await applyRequirementProgress(tabId, s26?.goalCompletionCriteria, s26?.requirementProgress, gate);
+        if (gate26Complete) {
           console.log("[SP:GoalCompletion]", {
             source: "verifier",
             satisfied: true,
-            signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+            signalsMatched: used26
+              ? `${progress26.filter(Boolean).length}/${progress26.length}`
+              : `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
           });
           applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict, source: "verifier" });
           if (_taskContext) { _taskContext.steps.push({ description: step.description }); _taskContext.currentStep = null; }
@@ -1699,7 +1883,8 @@ async function _executeStep(tabId, plannerStep, goal, myGen) {
           return;
         }
       }
-      if (isTerminalStep(plannerStep)) {
+      if (isTerminalStep(plannerStep) &&
+          await _requirementGateAllowsCompletion(tabId, await SessionStore.load(tabId))) {
         // Terminal step confirmed locally. Use the state machine's purpose-built
         // VALIDATING → COMPLETE transition (FINAL_STEP_COMPLETE) and finish now —
         // no replan, no waiting for a planner state=complete round-trip.
@@ -1753,7 +1938,8 @@ export async function _bootstrapSession(tabId) {
         await SessionStore.completeStep(tabId, buildStepRecord(session.pendingStep));
         if (_generation !== myGen) return;
         applyEvent(TaskEvent.SESSION_RESUME);
-        if (isTerminalStep(session.pendingStep)) {
+        if (isTerminalStep(session.pendingStep) &&
+            await _requirementGateAllowsCompletion(tabId, session)) {
           // The step that triggered this navigation was the terminal step — the goal
           // is complete on arrival. PLANNING → COMPLETE without a planner round-trip.
           applyEvent(TaskEvent.PLAN_COMPLETE);
@@ -1785,7 +1971,8 @@ export async function _bootstrapSession(tabId) {
             await SessionStore.completeStep(tabId, buildStepRecord(pendingStep));
             if (_generation !== myGen) return;
             applyEvent(TaskEvent.SESSION_RESUME);
-            if (isTerminalStep(pendingStep)) {
+            if (isTerminalStep(pendingStep) &&
+                await _requirementGateAllowsCompletion(tabId, session)) {
               applyEvent(TaskEvent.PLAN_COMPLETE);
               await _showGoalCompleteCard(tabId, session.goal);
               return;
@@ -2034,6 +2221,12 @@ export function __setTabId(id) {
 export { computeExpectedNavigationFromElement as __computeExpectedNavigationFromElement };
 export { deriveSettledSteps as __deriveSettledSteps, stepEffectStillHolds as __stepEffectStillHolds };
 export { isGoalConsumed as __isGoalConsumed };
+export {
+  updateRequirementProgress as __updateRequirementProgress,
+  remainingRequirementCount as __remainingRequirementCount,
+  isRequirementSetComplete as __isRequirementSetComplete,
+  _requirementGateAllowsCompletion as __requirementGateAllowsCompletion,
+};
 export {
   _handleClarification as __handleClarification,
   _handleResume as __handleResume,

@@ -3597,7 +3597,7 @@ Return JSON ONLY:
       return null;
     }
     _buildPlanFromElement(goal, element, confidence, layer) {
-      const isInput = ["textbox", "combobox", "search"].includes(element.role) || ["input", "textarea"].includes(element.tag);
+      const isInput = ["textbox", "combobox", "search"].includes(element.role) || ["input", "textarea"].includes(element.tag) && !["checkbox", "radio", "switch"].includes(element.role);
       const elementOwnLabel = element.text || element.placeholder || element.ariaLabel || "";
       const displayLabel = elementOwnLabel || goal;
       const value = isInput ? extractRequestedValue(goal, displayLabel) : "";
@@ -3892,6 +3892,19 @@ Return JSON ONLY:
         // SessionStore method is introduced for them.
         lastFingerprint: null,
         lastCycleOutcome: null,
+        // Dynamic requirement-progress model (false-early-completion redesign):
+        // additive, optional — same pattern as the fields above. null until the
+        // first cycle that actually evaluates a goalCompletionCriteria with
+        // successSignals; from then on, a boolean array parallel to
+        // criteria.successSignals BY ARRAY POSITION (the criteria is set once
+        // per task and never mutated, so position is already a stable
+        // requirement identity — no separate requirement-ID field is needed).
+        // Monotonic: once an entry is observed true on any cycle, it stays
+        // true for the rest of the task, even if that signal's live-DOM
+        // evidence is no longer visible on a later page — see
+        // updateRequirementProgress() in v2-task.js. Read-and-written only via
+        // the existing generic patchSession(); no new SessionStore method.
+        requirementProgress: null,
         phase: "PLANNING",
         createdAt: t,
         updatedAt: t,
@@ -5070,6 +5083,51 @@ Return JSON ONLY:
   function isTerminalStep(step) {
     return step?.completionCondition === "final";
   }
+  function updateRequirementProgress(previousProgress, details) {
+    const list = Array.isArray(details) ? details : [];
+    const prev = Array.isArray(previousProgress) ? previousProgress : [];
+    const length = Math.max(list.length, prev.length);
+    const next = [];
+    for (let i = 0; i < length; i++) {
+      next.push(prev[i] === true || list[i]?.passed === true);
+    }
+    return next;
+  }
+  function remainingRequirementCount(progress) {
+    return Array.isArray(progress) ? progress.filter((p) => p !== true).length : 0;
+  }
+  function isRequirementSetComplete(criteria, progress) {
+    if (!criteria || criteria.requiresEffect !== true) return null;
+    const totalSignals = Array.isArray(criteria.successSignals) ? criteria.successSignals.length : 0;
+    if (totalSignals === 0) return false;
+    if (!Array.isArray(progress) || progress.length < totalSignals) return false;
+    const matched = progress.slice(0, totalSignals).filter((p) => p === true).length;
+    const satisfiedByMatch = criteria.match === "any" ? matched >= 1 : matched === totalSignals;
+    if (!satisfiedByMatch) return false;
+    if (typeof criteria.confidenceThreshold === "number" && matched / totalSignals < criteria.confidenceThreshold) {
+      return false;
+    }
+    return true;
+  }
+  async function applyRequirementProgress(tabId, criteria, previousProgress, gate) {
+    const updated = updateRequirementProgress(previousProgress, gate.verdict?.details);
+    if (gate.verdict?.details) {
+      await SessionStore.patchSession(tabId, { requirementProgress: updated });
+    }
+    const requirementSetComplete = isRequirementSetComplete(criteria, updated);
+    return {
+      complete: requirementSetComplete === null ? gate.complete : requirementSetComplete,
+      progress: updated,
+      usedRequirementHistory: requirementSetComplete !== null
+    };
+  }
+  async function _requirementGateAllowsCompletion(tabId, session) {
+    const criteria = session?.goalCompletionCriteria;
+    if (!criteria || criteria.requiresEffect !== true) return true;
+    const gate = GoalVerifier.shouldComplete(criteria);
+    const { complete } = await applyRequirementProgress(tabId, criteria, session.requirementProgress, gate);
+    return complete;
+  }
   function _emitTaskMetrics(session, { outcome, outcomeReason = null } = {}) {
     try {
       logEvent("task_metrics", deriveTaskMetrics(_cycleRecords, session, { outcome, outcomeReason }));
@@ -5170,11 +5228,15 @@ Return JSON ONLY:
         const goalVerifyMs = Date.now() - tGoalStart;
         console.log(`[SP:V2:TRACE] verify END complete=${gate.complete} reason=${gate.reason}`);
         console.log(`[SP:V2:PERF] stage=verifier_gate extractMs=${cycleExtractMs} goalVerifyMs=${goalVerifyMs} elements=${pageState.elements.length}`);
-        if (gate.complete) {
+        const {
+          complete: verifierGateComplete,
+          usedRequirementHistory: verifierGateUsedHistory
+        } = await applyRequirementProgress(tabId, session.goalCompletionCriteria, session.requirementProgress, gate);
+        if (verifierGateComplete) {
           console.log("[SP:GoalCompletion]", {
             source: "verifier",
             satisfied: true,
-            reason: gate.reason
+            reason: verifierGateUsedHistory ? "requirements_satisfied" : gate.reason
           });
           console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_already_satisfied`);
           applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
@@ -5182,7 +5244,7 @@ Return JSON ONLY:
           return;
         }
         {
-          if (isGoalConsumed(session, pageState, settledSteps, decisionRouter)) {
+          if (isGoalConsumed(session, pageState, settledSteps, decisionRouter) && await _requirementGateAllowsCompletion(tabId, session)) {
             console.log("[SP:GoalCompletion]", { source: "verifier", satisfied: true, reason: "goal_consumed", settledActions: settledSteps.length });
             console.log(`[SP:V2:PERF] goalVerifyMs=${goalVerifyMs} totalPlanningMs=${goalVerifyMs} qwen=SKIPPED reason=goal_consumed`);
             applyEvent(TaskEvent.PLAN_COMPLETE, { source: "verifier" });
@@ -5281,7 +5343,7 @@ Return JSON ONLY:
         const domMs = cyclePageState ? cycleExtractMs : Date.now() - tDomStart;
         logEvent("compact_state_built", { reqId, ...estimateCompactionSavings(pageState) });
         const preL3Check = cycleGenericCheck ?? GoalVerifier.isGoalSatisfied(freshSession.goal, pageState);
-        if (preL3Check.satisfied) {
+        if (preL3Check.satisfied && await _requirementGateAllowsCompletion(tabId, freshSession)) {
           window.removeEventListener("popstate", onNavCheck);
           console.log(`[SP:V2:TRACE] plan END reqId=${reqId} outcome=goal_already_satisfied`);
           console.log(`[SP:V2:PERF] domMs=${domMs} goalVerifyMs=${preL3Check.latencyMs} layer1Ms=0 layer2Ms=0 qwenMs=0 cloudMs=0 postActionVerifyMs=0 navigationWaitMs=0 totalPlanningMs=${Date.now() - tReqStart} l3=SKIPPED reason=goal_already_satisfied`);
@@ -5430,17 +5492,21 @@ Return JSON ONLY:
         const criteria = freshSession.goalCompletionCriteria;
         if (criteria?.requiresEffect === true) {
           const gate = GoalVerifier.shouldComplete(criteria);
+          const {
+            complete: gateComplete27,
+            usedRequirementHistory: usedHistory27
+          } = await applyRequirementProgress(tabId, criteria, freshSession.requirementProgress, gate);
           console.log("[SP:GoalCompletionGate]", {
             requiresEffect: criteria.requiresEffect,
-            verifierComplete: gate.complete,
-            verifierReason: gate.reason
+            verifierComplete: gateComplete27,
+            verifierReason: usedHistory27 ? gateComplete27 ? "requirements_satisfied" : "requirements_remaining" : gate.reason
           });
-          if (!gate.complete) {
+          if (!gateComplete27) {
             console.log("[SP:GoalCompletion]", {
               source: "planner",
               state: "complete",
               accepted: false,
-              reason: gate.reason
+              reason: usedHistory27 ? "requirements_remaining" : gate.reason
             });
             await recordCycleOutcome("stale_plan", {
               layer: cycleRoutedLayer,
@@ -5811,11 +5877,16 @@ Return JSON ONLY:
         {
           const s26 = await SessionStore.load(tabId);
           const gate = GoalVerifier.shouldComplete(s26?.goalCompletionCriteria);
-          if (gate.complete) {
+          const {
+            complete: gate26Complete,
+            progress: progress26,
+            usedRequirementHistory: used26
+          } = await applyRequirementProgress(tabId, s26?.goalCompletionCriteria, s26?.requirementProgress, gate);
+          if (gate26Complete) {
             console.log("[SP:GoalCompletion]", {
               source: "verifier",
               satisfied: true,
-              signalsMatched: `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
+              signalsMatched: used26 ? `${progress26.filter(Boolean).length}/${progress26.length}` : `${gate.verdict.matchedSignals}/${gate.verdict.totalSignals}`
             });
             applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict, source: "verifier" });
             if (_taskContext) {
@@ -5827,7 +5898,7 @@ Return JSON ONLY:
             return;
           }
         }
-        if (isTerminalStep(plannerStep)) {
+        if (isTerminalStep(plannerStep) && await _requirementGateAllowsCompletion(tabId, await SessionStore.load(tabId))) {
           console.log("[SP:GoalCompletion]", { source: "planner", state: "final_step" });
           applyEvent(TaskEvent.FINAL_STEP_COMPLETE, { verdict });
           if (_taskContext) {
@@ -5884,7 +5955,7 @@ Return JSON ONLY:
           await SessionStore.completeStep(tabId, buildStepRecord(session.pendingStep));
           if (_generation !== myGen) return;
           applyEvent(TaskEvent.SESSION_RESUME);
-          if (isTerminalStep(session.pendingStep)) {
+          if (isTerminalStep(session.pendingStep) && await _requirementGateAllowsCompletion(tabId, session)) {
             applyEvent(TaskEvent.PLAN_COMPLETE);
             await _showGoalCompleteCard(tabId, session.goal);
             return;
@@ -5901,7 +5972,7 @@ Return JSON ONLY:
               await SessionStore.completeStep(tabId, buildStepRecord(pendingStep));
               if (_generation !== myGen) return;
               applyEvent(TaskEvent.SESSION_RESUME);
-              if (isTerminalStep(pendingStep)) {
+              if (isTerminalStep(pendingStep) && await _requirementGateAllowsCompletion(tabId, session)) {
                 applyEvent(TaskEvent.PLAN_COMPLETE);
                 await _showGoalCompleteCard(tabId, session.goal);
                 return;
