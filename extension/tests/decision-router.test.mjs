@@ -1218,3 +1218,67 @@ test('a resolved UNLABELED element preserves its elementId and bbox through the 
   assert.equal(step.targetElement.intent, 'Click the button with the icon');
   assert.equal(step.description, "Click 'Click the button with the icon'");
 });
+
+// ── _buildPlanFromElement: role-aware fill classification ───────────────────
+//
+// Root-cause fix for a dead zone found via real-browser testing: a native
+// <input> tag alone was treated as evidence of a TEXT-ENTRY field, so a
+// checkbox/radio/switch (also tag 'input', but a distinct, already-computed
+// role) was tagged phase:'fill_form' — which executor-engine.js's fill
+// detection explicitly excludes by design (checkboxes complete via a click,
+// never typed input), while ALSO disabling its own click-detection path for
+// any fill_form-phase step. Net effect: such a step could never be recognized
+// as complete. The fix consults the element's own `role` (already generic,
+// already computed by page-state-service.js) before falling back to the tag.
+// Fixtures here are deliberately generic (Widget/Toggle/Field, never a real
+// form, site, or field name) to prove the classification is role-driven, not
+// tied to any one control's label.
+
+function classify(router, role, tag = 'input') {
+  const element = { id: 'el_x', role, tag, text: '', placeholder: '', ariaLabel: '', value: '' };
+  return router._buildPlanFromElement('Interact with Widget', element, 0.9, 'ml_grounding').plan.steps[0];
+}
+
+test('classification: role=textbox -> fill_form', () => {
+  const step = classify(new DecisionRouter(), 'textbox');
+  assert.equal(step.phase, 'fill_form');
+});
+
+test('classification: tag=textarea -> fill_form', () => {
+  const step = classify(new DecisionRouter(), '', 'textarea');
+  assert.equal(step.phase, 'fill_form');
+});
+
+test('classification: role=combobox -> fill_form', () => {
+  const step = classify(new DecisionRouter(), 'combobox');
+  assert.equal(step.phase, 'fill_form');
+});
+
+test('classification: role=search -> fill_form', () => {
+  const step = classify(new DecisionRouter(), 'search');
+  assert.equal(step.phase, 'fill_form');
+});
+
+test('classification: role=checkbox -> NOT fill_form (navigate)', () => {
+  const step = classify(new DecisionRouter(), 'checkbox');
+  assert.equal(step.phase, 'navigate');
+  assert.equal(step.completionCondition, 'dom_change', 'a checkbox step must not carry input_filled-style completion');
+});
+
+test('classification: role=radio -> NOT fill_form (navigate)', () => {
+  const step = classify(new DecisionRouter(), 'radio');
+  assert.equal(step.phase, 'navigate');
+});
+
+test('classification: role=switch -> NOT fill_form (navigate)', () => {
+  const step = classify(new DecisionRouter(), 'switch');
+  assert.equal(step.phase, 'navigate');
+});
+
+test('classification: a generic <input> with no semantic role preserves existing behavior (fill_form)', () => {
+  // A role-less native input (e.g. type="text" with no ARIA role assigned)
+  // must still be treated as fillable, exactly as before this fix — only
+  // checkbox/radio/switch are newly excluded, nothing else regresses.
+  const step = classify(new DecisionRouter(), '');
+  assert.equal(step.phase, 'fill_form');
+});

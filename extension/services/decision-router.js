@@ -899,7 +899,24 @@ export class DecisionRouter {
   }
 
   _buildPlanFromElement(goal, element, confidence, layer) {
-    const isInput = ['textbox', 'combobox', 'search'].includes(element.role) || ['input', 'textarea'].includes(element.tag);
+    // A native <input> tag is not on its own evidence of a TEXT-ENTRY field —
+    // checkbox/radio/switch are also tag 'input' but hold a distinct,
+    // already-computed semantic role (page-state-service.js's getRole()).
+    // Checking the tag before the role classified any checkbox/radio as
+    // fillable, tagging its step phase:'fill_form' — which then fell into a
+    // dead zone downstream: executor-engine.js's fill-detection explicitly
+    // excludes checkbox/radio/switch by design (they complete via a click,
+    // never via typed input), and disables its own click-detection path for
+    // any fill_form-phase step, so the interaction could never be recognized
+    // as complete regardless of how it was actually acted on. Consulting the
+    // role first — the same role this file's own candidate search above
+    // already uses — routes a checkbox/radio to the 'navigate' branch below,
+    // whose completion the executor's existing click handler already
+    // recognizes generically. No new taxonomy: 'switch' is included for the
+    // same reason role-classified toggles exist at all elsewhere in this
+    // file (see _resolveRequiredFieldGate's sibling checks).
+    const isInput = ['textbox', 'combobox', 'search'].includes(element.role) ||
+      (['input', 'textarea'].includes(element.tag) && !['checkbox', 'radio', 'switch'].includes(element.role));
     // The element's OWN accessible name ONLY — never falls back to the goal.
     // This is deliberately kept separate from `displayLabel` below: it is the
     // exact field the executor's DOMMatcher searches the live DOM by
