@@ -48,6 +48,16 @@ const QWEN_GENERATE_TIMEOUT_MS      = 45_000;
 const VALID_ACTIONS = new Set(['click', 'fill', 'select', 'navigate', 'finish']);
 const QWEN_AVAILABILITY_TIMEOUT_MS  = 2_500;
 
+// Output is kept to one short line: on CPU each generated token costs ~150ms, so
+// the old pretty-printed {action,elementId,value:null,confidence} answer (~35
+// tokens) was ~6s by itself. "value" is only asked for on fill, and confidence
+// is optional (the adapter falls back to its 0.85 default when omitted).
+const QWEN_NUM_PREDICT       = 48;
+const MAX_ELEMENT_TEXT_CHARS = 80;
+const QWEN_INSTRUCTIONS = `Choose the single next UI action for the goal. Reply with one-line JSON only, e.g.
+{"action":"click","elementId":"e3"}
+action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text), never invented. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
+
 export class LocalQwenAdapter extends BackendAdapter {
   /**
    * @param {object} [options]
@@ -106,7 +116,7 @@ export class LocalQwenAdapter extends BackendAdapter {
       keep_alive: this._keepAlive,
       options: {
         temperature: 0,
-        num_predict: 128
+        num_predict: QWEN_NUM_PREDICT
       }
     };
 
@@ -390,35 +400,23 @@ export class LocalQwenAdapter extends BackendAdapter {
     // toCompactElement() is the single definition of what a model is shown about
     // an element: a sensitive element contributes only its static label (never
     // text/value) and is flagged so the model knows not to propose a value.
-    const compactElements = elements.slice(0, 25).map((e) => {
+    // One "id|role|text" line per element: on CPU, prompt evaluation is paid per
+    // token, and the JSON-object form spent ~2x the tokens on the same facts.
+    const lines = elements.slice(0, 25).map((e) => {
       const c = toCompactElement(e);
-      return c.sensitive
-        ? { id: c.id, role: c.role, text: c.name, sensitive: true }
-        : { id: c.id, role: c.role, text: e.text || e.ariaLabel || e.placeholder || '' };
+      const text = String(c.sensitive ? c.name : (e.text || e.ariaLabel || e.placeholder || '')).replace(/\s+/g, ' ').slice(0, MAX_ELEMENT_TEXT_CHARS);
+      return `${c.id}|${c.role}|${text}${c.sensitive ? ' [sensitive]' : ''}`;
     });
 
-    return `Goal: "${request.goal}"
+    // The static instructions come FIRST and the per-call data LAST, so Ollama's
+    // prompt-prefix cache reuses the evaluated instruction tokens on every call
+    // instead of re-evaluating them each time.
+    return `${QWEN_INSTRUCTIONS}
+Goal: "${request.goal}"
 Page: ${page.title || ''} (${page.url || ''})
-${history.length ? `History: ${history.map(h => h.description).join(' -> ')}` : ''}
-
-Elements:
-${JSON.stringify(compactElements)}
-
-Select the single next action.
-
-Distinguish two different things:
-- TARGET: which element (by id, from the list above) to act on. An
-  element's own text/placeholder/label is metadata describing that control —
-  it is never something the user typed.
-- VALUE: only when the action is "fill" — the actual content the user wants
-  entered, understood from the goal's own meaning. It is never the target
-  element's own label, and never the goal sentence itself. For any other
-  action (click/select/navigate/finish), value must be null. Never give a
-  value for an element marked "sensitive": true — use null.
-- "elementId" MUST be copied exactly from the list above. Never invent one.
-
-Return JSON ONLY:
-{"action":"click"|"fill"|"select"|"navigate"|"finish","elementId":"el_1","value":null,"confidence":0.95}`;
+${history.length ? `History: ${history.map(h => h.description).join(' -> ')}\n` : ''}Elements:
+${lines.join('\n')}
+`;
   }
 
   _formatPlanResponse(request, qwenOutput, latencyMs) {

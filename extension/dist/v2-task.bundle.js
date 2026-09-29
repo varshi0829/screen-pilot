@@ -1603,6 +1603,11 @@ ${lines.join("\n")}`);
   var QWEN_GENERATE_TIMEOUT_MS = 45e3;
   var VALID_ACTIONS = /* @__PURE__ */ new Set(["click", "fill", "select", "navigate", "finish"]);
   var QWEN_AVAILABILITY_TIMEOUT_MS = 2500;
+  var QWEN_NUM_PREDICT = 48;
+  var MAX_ELEMENT_TEXT_CHARS = 80;
+  var QWEN_INSTRUCTIONS = `Choose the single next UI action for the goal. Reply with one-line JSON only, e.g.
+{"action":"click","elementId":"e3"}
+action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text), never invented. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
   var LocalQwenAdapter = class extends BackendAdapter {
     /**
      * @param {object} [options]
@@ -1649,7 +1654,7 @@ ${lines.join("\n")}`);
         keep_alive: this._keepAlive,
         options: {
           temperature: 0,
-          num_predict: 128
+          num_predict: QWEN_NUM_PREDICT
         }
       };
       console.log(`[SP:V2:DEBUG] LocalQwenAdapter request start reqId=${reqId} url=${targetUrl} method=POST startMs=${t0} callerAborted=${callerSignal?.aborted ?? false}`);
@@ -1867,32 +1872,18 @@ ${lines.join("\n")}`);
       const page = request.page ?? {};
       const history2 = request.executionHistory?.completedSteps ?? [];
       const elements = request.elements ?? [];
-      const compactElements = elements.slice(0, 25).map((e) => {
+      const lines = elements.slice(0, 25).map((e) => {
         const c = toCompactElement(e);
-        return c.sensitive ? { id: c.id, role: c.role, text: c.name, sensitive: true } : { id: c.id, role: c.role, text: e.text || e.ariaLabel || e.placeholder || "" };
+        const text = String(c.sensitive ? c.name : e.text || e.ariaLabel || e.placeholder || "").replace(/\s+/g, " ").slice(0, MAX_ELEMENT_TEXT_CHARS);
+        return `${c.id}|${c.role}|${text}${c.sensitive ? " [sensitive]" : ""}`;
       });
-      return `Goal: "${request.goal}"
+      return `${QWEN_INSTRUCTIONS}
+Goal: "${request.goal}"
 Page: ${page.title || ""} (${page.url || ""})
-${history2.length ? `History: ${history2.map((h) => h.description).join(" -> ")}` : ""}
-
-Elements:
-${JSON.stringify(compactElements)}
-
-Select the single next action.
-
-Distinguish two different things:
-- TARGET: which element (by id, from the list above) to act on. An
-  element's own text/placeholder/label is metadata describing that control \u2014
-  it is never something the user typed.
-- VALUE: only when the action is "fill" \u2014 the actual content the user wants
-  entered, understood from the goal's own meaning. It is never the target
-  element's own label, and never the goal sentence itself. For any other
-  action (click/select/navigate/finish), value must be null. Never give a
-  value for an element marked "sensitive": true \u2014 use null.
-- "elementId" MUST be copied exactly from the list above. Never invent one.
-
-Return JSON ONLY:
-{"action":"click"|"fill"|"select"|"navigate"|"finish","elementId":"el_1","value":null,"confidence":0.95}`;
+${history2.length ? `History: ${history2.map((h) => h.description).join(" -> ")}
+` : ""}Elements:
+${lines.join("\n")}
+`;
     }
     _formatPlanResponse(request, qwenOutput, latencyMs) {
       const rawAction = qwenOutput.action ?? "click";

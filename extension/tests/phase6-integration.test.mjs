@@ -279,17 +279,19 @@ test('the Qwen and vision prompts are built from toCompactElement: a sensitive f
   const leaky = { id: 'el_2', role: 'textbox', tag: 'input', type: 'password', placeholder: 'Password', text: 'hunter2-secret', value: 'hunter2-secret', bbox: { x: 1, y: 1, width: 5, height: 5 } };
   const qwenPrompt = new LocalQwenAdapter()._buildQwenPrompt({ goal: 'log in', page: { url: 'u', title: 't' }, elements: [el('el_1', 'Sign in'), leaky] });
   assert.ok(!qwenPrompt.includes('hunter2-secret'));
-  assert.match(qwenPrompt, /"id":"el_2","role":"textbox","text":"Password","sensitive":true/);
-  assert.match(qwenPrompt, /"id":"el_1","role":"link","text":"Sign in"\}/);
+  assert.match(qwenPrompt, /^el_2\|textbox\|Password \[sensitive\]$/m);
+  assert.match(qwenPrompt, /^el_1\|link\|Sign in$/m);
 
   const visionPrompt = new LocalVisionAdapter()._buildVisionPrompt({ goal: 'log in', page: { url: 'u', title: 't' }, elements: [leaky] });
   assert.ok(!visionPrompt.includes('hunter2-secret'));
   assert.match(visionPrompt, /"text":"Password"/);
 });
 
-test('the Qwen prompt asks for the structured schema: fill verb, value null, no overloaded "text" answer field', () => {
+test('the Qwen prompt asks for the structured schema: fill verb, value only for fill, no overloaded "text" answer field', () => {
   const prompt = new LocalQwenAdapter()._buildQwenPrompt({ goal: 'g', page: {}, elements: [el('el_1', 'A')] });
-  assert.match(prompt, /\{"action":"click"\|"fill"\|"select"\|"navigate"\|"finish","elementId":"el_1","value":null,"confidence":0\.95\}/);
+  assert.match(prompt, /\{"action":"click","elementId":"e3"\}/);
+  assert.match(prompt, /action is click\|fill\|select\|navigate\|finish/);
+  assert.match(prompt, /Only for "fill", add "value"/);
   assert.ok(!/"text":"label"/.test(prompt));
 });
 

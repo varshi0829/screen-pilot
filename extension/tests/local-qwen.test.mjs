@@ -123,9 +123,9 @@ test('_buildQwenPrompt asks Qwen to distinguish TARGET from VALUE generically, w
     elements: [{ id: 'el_1', role: 'textbox', text: 'Some Field' }]
   });
 
-  assert.match(prompt, /TARGET/);
-  assert.match(prompt, /VALUE/);
-  assert.match(prompt, /"value"/);
+  assert.match(prompt, /elementId must be copied exactly from Elements/);
+  assert.match(prompt, /"value": the text to enter/);
+  assert.match(prompt, /never an element's own label/);
   // The schema must no longer contain the old overloaded "text" output field.
   assert.ok(!prompt.includes('"text":"label"'), 'the old ambiguous text/label schema field must be gone');
 });
