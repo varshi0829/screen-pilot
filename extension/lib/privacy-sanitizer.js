@@ -50,6 +50,9 @@ function sanitizeElement(el) {
     ...el,
     text:  el.text  ? REDACTED : el.text,
     value: el.value ? REDACTED : el.value,
+    // Surrounding-row text is dropped outright for a sensitive field — it can
+    // name or contain the very value that field holds.
+    ...(el.context ? { context: '' } : {}),
     sensitive: true,
     sensitiveType
   };

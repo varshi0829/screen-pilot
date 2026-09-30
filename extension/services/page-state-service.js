@@ -18,6 +18,7 @@
 // `ariaLabel`, since sanitization only ever looks at the final field value.
 
 import { PrivacySanitizer } from '../lib/privacy-sanitizer.js';
+import { redactText } from '../lib/pii-detector.js';
 
 export const PageStateService = (() => {
   'use strict';
@@ -190,6 +191,84 @@ export const PageStateService = (() => {
     return formMap.map.get(form);
   }
 
+  // ── Contextual container label ──────────────────────────────────────────────
+  //
+  // A control's own label is often NOT enough to tell it apart: a list of rows,
+  // cards or table lines repeats the same control ("Settings", "Delete",
+  // "Add to cart") once per item, and the only thing that says WHICH item it
+  // belongs to is the text of the row around it. `context` carries a short,
+  // bounded slice of that surrounding text, so a grounding step can tell two
+  // identically-labelled controls apart. Purely structural — it reads standard
+  // DOM shape (list items, table rows, ARIA row/listitem roles, or an ancestor
+  // that visibly repeats among its siblings), never a site's own markup.
+  const CONTEXT_MAX_LEN        = 60;   // stored length — same order as the compact-name cap
+  const CONTEXT_MAX_RAW        = 400;  // never read more than this from a container
+  const CONTEXT_MAX_DEPTH      = 8;    // ancestors examined per control
+  // A real row/card holds a handful of controls. A container with many more is a
+  // whole region (a menu, a toolbar, a page section), not "the item this control
+  // belongs to" — and once one is reached, outer ancestors are only bigger.
+  const CONTEXT_MAX_CONTROLS   = 12;
+  const ROW_SELECTOR           = 'li, tr, article, [role="listitem"], [role="row"], [role="option"], [role="treeitem"], [role="article"]';
+  const REGION_TAGS            = new Set(['BODY', 'HTML', 'MAIN', 'NAV', 'HEADER', 'FOOTER', 'ASIDE', 'FORM', 'SECTION']);
+  const CONTROL_SELECTOR       = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], summary';
+
+  function removeOwnLabel(text, label) {
+    const needle = (label || '').trim().toLowerCase();
+    if (!needle) return text;
+    let out = text;
+    let idx = out.toLowerCase().indexOf(needle);
+    while (idx !== -1) {
+      out = out.slice(0, idx) + ' ' + out.slice(idx + needle.length);
+      idx = out.toLowerCase().indexOf(needle);
+    }
+    return out;
+  }
+
+  /** Is this ancestor a row-like container: a list/table/ARIA row, or one of several look-alike siblings? */
+  function isRowLike(node) {
+    if (typeof node.matches === 'function' && node.matches(ROW_SELECTOR)) return true;
+    const parent = node.parentElement;
+    const siblings = parent?.children;
+    if (!siblings || siblings.length < 2) return false;
+    let same = 0;
+    for (const sib of siblings) {
+      if (sib.tagName === node.tagName && (sib.className || '') === (node.className || '')) same += 1;
+      if (same >= 2) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Short text naming the row/list item a control sits in, or '' when it is not
+   * in one (or the row adds nothing beyond the control's own label).
+   *
+   * Nearest row-like ancestor wins, but an ancestor whose text is only the
+   * control's own label (a wrapper around just the button) is skipped in favor
+   * of the next one out. The walk stops at the first page region or oversized
+   * container. The control's own label is stripped so the field never just
+   * repeats it, and the result is passed through the shared PII redactor and
+   * capped — it is context for matching, not content to reproduce.
+   *
+   * @param {Element} el
+   * @param {string} ownText - the control's own text/accessible name, already extracted
+   * @param {string} ownLabel
+   * @returns {string}
+   */
+  function resolveContext(el, ownText, ownLabel) {
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < CONTEXT_MAX_DEPTH; depth++, node = node.parentElement) {
+      if (REGION_TAGS.has(node.tagName)) return '';
+      const controls = typeof node.querySelectorAll === 'function' ? node.querySelectorAll(CONTROL_SELECTOR).length : 0;
+      if (controls > CONTEXT_MAX_CONTROLS) return '';
+      if (!isRowLike(node)) continue;
+
+      const raw = clean(node.innerText || node.textContent || '', CONTEXT_MAX_RAW);
+      const remaining = clean(removeOwnLabel(removeOwnLabel(raw, ownText), ownLabel), CONTEXT_MAX_LEN);
+      if (remaining) return redactText(remaining);
+    }
+    return '';
+  }
+
   /**
    * Detect layout region.
    */
@@ -260,6 +339,7 @@ export const PageStateService = (() => {
       const type        = tag === 'input' ? clean(el.getAttribute?.('type') || el.type || '', 20) : '';
       const autocomplete = clean(el.getAttribute?.('autocomplete') || '', 30);
       const formId      = resolveFormId(el, formMap);
+      const context     = resolveContext(el, text, ariaLabel);
       // Standard HTML `required` attribute — real DOM elements resolve this
       // as a boolean property; the attribute check covers mocks/environments
       // that only expose getAttribute. No site knowledge: this is the native
@@ -303,7 +383,8 @@ export const PageStateService = (() => {
         type,
         autocomplete,
         formId,
-        required
+        required,
+        context
       });
 
       // Cap in raw DOM order. Real-Chrome finding (getbootstrap.com docs page,

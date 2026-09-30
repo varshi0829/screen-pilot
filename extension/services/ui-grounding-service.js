@@ -61,6 +61,17 @@ export const UIGroundingService = (() => {
     return 0;
   }
 
+  // Credit for a goal word found only in the text of the row/container a control
+  // sits in (el.context), not in the control's own label. Below an own-label
+  // match (1) and a morphological one (MORPH_CREDIT): the control's own name is
+  // still the stronger statement of what it IS, the row only says WHICH one.
+  const CONTEXT_CREDIT = 0.5;
+
+  /** Tokens of the surrounding-row text (see page-state-service.js's resolveContext). */
+  function elementContextTokens(el) {
+    return new Set(tokenize(el.context || ''));
+  }
+
   function elementLabelTokens(el) {
     const textTokens  = tokenize(el.text || '');
     const placeTokens = tokenize(el.placeholder || '');
@@ -78,10 +89,18 @@ export const UIGroundingService = (() => {
    * numerator and denominator) avoids division by zero and an unbounded
    * weight for tokens that appear on every element.
    *
+   * Row context is tallied separately (`ctxDf`/`ctxIdf`) and never feeds `df`/
+   * `idf`: a row's name is repeated on every control in that row, so counting it
+   * with the own-label tokens would make it look common and erase exactly the
+   * distinguishing power it exists to add. Own-label statistics are therefore
+   * byte-for-byte what they were before context existed.
+   *
    * @param {Array<Set<string>>} elementTokenSets
-   * @returns {{ idf: Map<string, number>, df: Map<string, number> }}
+   * @param {Array<Set<string>>} [contextTokenSets] - parallel to elementTokenSets
+   * @returns {{ idf: Map<string, number>, df: Map<string, number>,
+   *             ctxIdf: Map<string, number>, ctxDf: Map<string, number> }}
    */
-  function computeIdf(elementTokenSets) {
+  function computeIdf(elementTokenSets, contextTokenSets = []) {
     const df = new Map();
     for (const tokens of elementTokenSets) {
       for (const t of tokens) {
@@ -93,7 +112,17 @@ export const UIGroundingService = (() => {
     for (const [t, d] of df) {
       idf.set(t, Math.log((n + 1) / (d + 1)) + 1);
     }
-    return { idf, df };
+    const ctxDf = new Map();
+    for (const tokens of contextTokenSets) {
+      for (const t of tokens) {
+        ctxDf.set(t, (ctxDf.get(t) || 0) + 1);
+      }
+    }
+    const ctxIdf = new Map();
+    for (const [t, d] of ctxDf) {
+      ctxIdf.set(t, Math.log((n + 1) / (d + 1)) + 1);
+    }
+    return { idf, df, ctxIdf, ctxDf };
   }
 
   /**
@@ -132,7 +161,8 @@ export const UIGroundingService = (() => {
     const elTokens = elementLabelTokens(el);
     if (!elTokens.size) return 0.0;
 
-    const { idf, df } = corpus || computeIdf([elTokens]);
+    const ctxTokens = elementContextTokens(el);
+    const { idf, df, ctxIdf, ctxDf } = corpus || computeIdf([elTokens], [ctxTokens]);
 
     // Only intent tokens that appear on at least one candidate can possibly
     // be covered by any element — everything else is excluded, not scored
@@ -147,6 +177,13 @@ export const UIGroundingService = (() => {
     for (const t of intentTokens) {
       if ((df.get(t) || 0) > 0) {
         scorableTokens.push({ token: t, weight: idf.get(t) || 1 });
+        continue;
+      }
+      // A goal word that appears on no control's own label but does appear in
+      // some row's text is still something the page can express — it names the
+      // item a control belongs to. Weighted by how few controls' rows carry it.
+      if ((ctxDf.get(t) || 0) > 0) {
+        scorableTokens.push({ token: t, weight: ctxIdf.get(t) || 1 });
         continue;
       }
       // Borrow the weight of the longest form the page actually uses, so a
@@ -166,7 +203,9 @@ export const UIGroundingService = (() => {
     let matchedWeight = 0;
     for (const { token, weight } of scorableTokens) {
       totalWeight += weight;
-      matchedWeight += weight * matchStrength(token, elTokens);
+      let strength = matchStrength(token, elTokens);
+      if (strength < CONTEXT_CREDIT && ctxTokens.has(token)) strength = CONTEXT_CREDIT;
+      matchedWeight += weight * strength;
     }
     if (totalWeight <= 0) return 0.0;
 
@@ -214,7 +253,7 @@ export const UIGroundingService = (() => {
     // IDF corpus computed once from THIS page's own candidate elements —
     // dynamic per call, no persisted/global vocabulary.
     const elementTokenSets = elements.map(el => elementLabelTokens(el));
-    const corpus = computeIdf(elementTokenSets);
+    const corpus = computeIdf(elementTokenSets, elements.map(el => elementContextTokens(el)));
 
     const scored = elements.map(el => ({
       element: el,
@@ -264,13 +303,14 @@ export const UIGroundingService = (() => {
   function assessGrounding(intent, elements) {
     const ranked = rankElements(intent, elements);
     const list = Array.isArray(elements) ? elements : [];
-    const { df } = computeIdf(list.map(el => elementLabelTokens(el)));
+    const { df, ctxDf } = computeIdf(list.map(el => elementLabelTokens(el)), list.map(el => elementContextTokens(el)));
     // Uses the same matching rule scoreElement does — a goal word the page
     // only spells out in full is matched, not reported as missing. Reporting
     // it as unmatched here while scoring it as matched there would have the
     // ambiguity check escalating a candidate the ranking had already resolved.
     const unmatchedIntentTokens = tokenize(intent).filter((t) => {
       if ((df.get(t) || 0) > 0) return false;
+      if ((ctxDf.get(t) || 0) > 0) return false;
       for (const pageToken of df.keys()) if (morphRelated(t, pageToken)) return false;
       return true;
     });

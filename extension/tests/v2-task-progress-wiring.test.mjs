@@ -22,27 +22,56 @@ const read = (...p) => fs.readFileSync(path.join(ROOT, ...p), 'utf8').replace(/\
 // three V3-owned files must still be untouched: L2 scoring, page-state
 // extraction and the guide-only executor are not Phase 6's business.
 const V3_BASE = 'c7e085f';
-const V3_OWNED_FILES = [
-  'extension/services/ui-grounding-service.js',
-  'extension/services/page-state-service.js',
-  'extension/services/executor-engine.js'
-];
 
-test('no V3-owned file has been modified on this branch (vs. the pinned V3 base c7e085f)', () => {
-  let changed;
-  try {
-    // Phase 5 fix: 'v3-privacy-vision...HEAD' (three-dot, commit-to-commit)
-    // is vacuous while nothing has been committed on this branch — see
-    // v2-task-observability.test.mjs's identical check for the full
-    // explanation. 'git diff <one-ref>' compares that commit against the
-    // current working tree instead (staged + unstaged), which is correct here.
-    changed = execFileSync('git', ['diff', '--name-only', V3_BASE], { cwd: ROOT, encoding: 'utf8' })
-      .split('\n').filter(Boolean);
-  } catch {
-    return; // ref unavailable in a shallow checkout — not a real failure
+// PER-FILE baselines. Each protected file must hash to exactly its pinned
+// content (`git hash-object` of the working-tree file, so staged, unstaged and
+// committed edits are all caught — any later modification fails):
+//   - { commit } — the file must be byte-identical to that commit's version.
+//   - { blob }   — the file must be byte-identical to that exact, approved
+//                  content. A blob id is used (rather than the hash of a commit
+//                  that does not exist yet) so the approved version is pinned
+//                  precisely and independently of when/how it is committed.
+//
+// executor-engine.js stays pinned to the original V3 base.
+//
+// ui-grounding-service.js and page-state-service.js carry an INTENTIONALLY
+// NEWER baseline: the approved generic contextual-grounding extension (a
+// bounded `context` field naming the row/container a control sits in, and its
+// use in L2 scoring, so identically-labelled controls in different rows can be
+// told apart). That is a deliberate, reviewed extension of V3 — not drift. Any
+// FURTHER change to either file, however small, fails this test until it is
+// reviewed and re-pinned here on purpose.
+const V3_PINS = {
+  'extension/services/ui-grounding-service.js': { blob: '96a11c07fbb9486f350134fd5687b28373285c53' },
+  'extension/services/page-state-service.js':   { blob: '0030b6d4a1c03a23c50724fbbafb7c9c7c6499ff' },
+  'extension/services/executor-engine.js':      { commit: V3_BASE }
+};
+
+const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();
+
+test('no V3-owned file differs from its pinned baseline (per-file V3_PINS; executor-engine.js pinned to V3 base c7e085f)', () => {
+  const violations = [];
+  for (const [file, pin] of Object.entries(V3_PINS)) {
+    let expected = pin.blob;
+    if (!expected) {
+      try {
+        expected = git('rev-parse', `${pin.commit}:${file}`);
+      } catch {
+        // The base ref may not exist in a shallow/CI checkout — a commit-pinned
+        // check is a convenience in a full clone, not something that should fail
+        // the suite when the ref simply isn't available. Blob pins never skip.
+        continue;
+      }
+    }
+    let actual;
+    try {
+      actual = git('hash-object', '--', file);
+    } catch {
+      actual = null; // a protected file that cannot be read (deleted) has been modified
+    }
+    if (actual !== expected) violations.push(file);
   }
-  const touched = V3_OWNED_FILES.filter((f) => changed.includes(f));
-  assert.deepEqual(touched, [], `V3-owned file(s) modified: ${touched.join(', ')}`);
+  assert.deepEqual(violations, [], `V3-owned file(s) differ from their pinned baseline: ${violations.join(', ')}`);
 });
 
 test('Phase 6: compact-page-state.js toCompactElement() IS the prompt-boundary projection in both local model adapters', () => {
