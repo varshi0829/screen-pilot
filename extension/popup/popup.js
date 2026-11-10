@@ -1,7 +1,8 @@
 // ScreenPilot - Popup Script
 
+import { DEFAULT_BACKEND_URL, BACKEND_URL_STORAGE_KEY, normalizeBackendUrl } from '../lib/backend-config.js';
+
 document.addEventListener('DOMContentLoaded', () => {
-  const DEFAULT_BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
 
   // Phase 2: BYOK removed — provider keys are server-side only now. Purge any
   // key a previous version of the popup may have stored in plaintext.
@@ -161,13 +162,14 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     try {
-      const url = new URL(value);
-      if (!/^https?:$/.test(url.protocol)) throw new Error('Backend URL must use http or https');
-      await chrome.storage.local.set({ screenPilotBackendUrl: url.toString().replace(/\/$/, '') });
+      const checked = normalizeBackendUrl(value);
+      if (!checked.ok) throw new Error(checked.error);
+      await chrome.storage.local.set({ [BACKEND_URL_STORAGE_KEY]: checked.url });
+      inputEl.value = checked.url;
       statusEl.textContent = 'Backend URL saved';
       statusEl.className = 'sp-key-status saved';
-    } catch {
-      statusEl.textContent = 'Enter a valid http(s) URL';
+    } catch (err) {
+      statusEl.textContent = err?.message || 'Enter a valid http(s) URL';
       statusEl.className = 'sp-key-status error';
     }
   });

@@ -293,10 +293,11 @@
     <div class="sp-setting-group">
       <label class="sp-setting-label">Backend URL</label>
       <p class="sp-setting-hint">
-        Leave this blank to use the deployed demo backend. Set a local URL to point
-        the extension at your own Next.js server during development.
+        Leave this blank to use the deployed demo backend. Set a base URL such as
+        http://localhost:3000 to point the extension at your own Next.js server
+        (http is accepted for localhost only; no rebuild needed).
       </p>
-      <input type="url" id="backend-url-input" placeholder="https://screen-pilot-j1az.vercel.app/api/analyze" class="sp-key-input" autocomplete="off" />
+      <input type="url" id="backend-url-input" placeholder="https://screen-pilot-j1az.vercel.app" class="sp-key-input" autocomplete="off" />
       <div class="sp-setting-actions">
         <button class="sp-btn-small" id="save-backend-btn">Save URL</button>
         <button class="sp-btn-small outline" id="clear-backend-btn">Clear</button>
@@ -324,6 +325,6 @@
     </div>
   </div>
 
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>

@@ -3,11 +3,11 @@
 
 import { ScreenContextService } from './screen-context.js';
 import { TokenVault, sanitizeDeep, restoreDeep } from '../lib/pii-vault.js';
+import { resolveBackendBaseUrl } from '../lib/backend-config.js';
 
 export const VisionService = (() => {
   'use strict';
 
-  const DEFAULT_BACKEND_URL = 'https://screen-pilot-j1az.vercel.app/api/analyze';
   const REQUEST_TIMEOUT_MS = 28000;
   const MAX_ATTEMPTS       = 3;
 
@@ -162,9 +162,7 @@ export const VisionService = (() => {
   }
 
   async function resolveBackendUrl() {
-    const stored = await chrome.storage.local.get('screenPilotBackendUrl');
-    const override = typeof stored.screenPilotBackendUrl === 'string' ? stored.screenPilotBackendUrl.trim() : '';
-    return override || DEFAULT_BACKEND_URL;
+    return `${await resolveBackendBaseUrl(chrome.storage.local)}/api/analyze`;
   }
 
   // ─── RESPONSE PARSERS ──────────────────────────────────────────────────────

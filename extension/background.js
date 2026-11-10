@@ -9,6 +9,7 @@ import { NavigationPlanner }  from './services/navigation-planner.js';
 import { handleOllamaGenerate, handleOllamaCheck, handleOllamaCancel } from './services/ollama-proxy.js';
 import { sendWithRetry } from './services/message-retry.js';
 import { redactSecrets } from './lib/sensitive-policy.js';
+import { handleBackendRequest, handleBackendCancel } from './services/backend-proxy.js';
 
 const DEBUG = false;
 
@@ -56,6 +57,8 @@ async function handleMessage(message, sender) {
     case 'OLLAMA_GENERATE':          return handleOllamaGenerate(message);
     case 'OLLAMA_CHECK':             return handleOllamaCheck(message);
     case 'OLLAMA_CANCEL':            return handleOllamaCancel(message);
+    case 'BACKEND_REQUEST':          return handleBackendRequest(message, sender);
+    case 'BACKEND_CANCEL':           return handleBackendCancel(message);
     default:
       return { success: false, error: `Unknown message type: ${message.type}` };
   }

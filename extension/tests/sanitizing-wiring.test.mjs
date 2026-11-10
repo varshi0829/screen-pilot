@@ -156,7 +156,7 @@ const rel = (f) => path.relative(ext(), f).split(path.sep).join('/');
 
 // Every source file that performs a network call, and why that is acceptable.
 const EGRESS_ALLOWLIST = {
-  'providers/vercel-backend-adapter.js': 'cloud adapter — always wrapped by SanitizingAdapter in v2-task.js',
+  'services/backend-proxy.js':          'cloud planner transport — used only by VercelBackendAdapter, which is always wrapped by SanitizingAdapter in v2-task.js',
   'services/vision-service.js':          'legacy /api/analyze — payload sanitized before fetch (tested above)',
   'providers/local-qwen-adapter.js':     'local Ollama (127.0.0.1) — never leaves the device',
   'providers/local-vision-adapter.js':   'local Ollama (127.0.0.1) — never leaves the device',

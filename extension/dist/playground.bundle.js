@@ -1385,20 +1385,107 @@ ${lines.join("\n")}`);
     }
   };
 
+  // extension/lib/backend-config.js
+  var DEFAULT_BACKEND_URL = "https://screen-pilot-j1az.vercel.app";
+  var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]"]);
+  var ENDPOINT_SUFFIX = /\/api\/(analyze|plan|recover)\/?$/;
+  function normalizeBackendUrl(value) {
+    if (typeof value !== "string" || !value.trim()) return { ok: false, error: "Backend URL is empty" };
+    let u;
+    try {
+      u = new URL(value.trim());
+    } catch {
+      return { ok: false, error: "Enter a valid http(s) URL" };
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") return { ok: false, error: "Backend URL must use http or https" };
+    if (u.username || u.password) return { ok: false, error: "Backend URL must not contain credentials" };
+    if (u.search || u.hash) return { ok: false, error: "Backend URL must not contain a query string or fragment" };
+    if (u.protocol === "http:" && !LOOPBACK_HOSTS.has(u.hostname)) {
+      return { ok: false, error: "Plain http is only allowed for localhost; use https" };
+    }
+    const path = u.pathname.replace(ENDPOINT_SUFFIX, "").replace(/\/+$/, "");
+    return { ok: true, url: `${u.origin}${path}` };
+  }
+
+  // extension/services/backend-proxy.js
+  var BACKEND_PATHS = Object.freeze(["/api/plan", "/api/recover", "/api/analyze"]);
+  var FORWARDED_HEADERS = Object.freeze(["content-type", "x-session-id"]);
+  var DEFAULT_BACKEND_TIMEOUT_MS = 3e4;
+  var MAX_BODY_CHARS = 16 * 1024 * 1024;
+  function fail(errorCode, message, extra = {}) {
+    return { networkError: true, errorCode, message, ...extra };
+  }
+  async function backendRequest({ baseUrl, path, body, headers = {}, timeoutMs, signal }) {
+    const base = normalizeBackendUrl(baseUrl);
+    if (!base.ok) return fail("INVALID_REQUEST", `Invalid backend URL: ${base.error}`);
+    if (!BACKEND_PATHS.includes(path)) return fail("INVALID_REQUEST", `Unsupported backend path: ${String(path).slice(0, 40)}`);
+    if (!body || typeof body !== "object" || Array.isArray(body)) return fail("INVALID_REQUEST", "Request body must be a JSON object");
+    let payload;
+    try {
+      payload = JSON.stringify(body);
+    } catch {
+      return fail("INVALID_REQUEST", "Request body is not serialisable");
+    }
+    if (payload.length > MAX_BODY_CHARS) return fail("INVALID_REQUEST", "Request body too large");
+    const safeHeaders = {};
+    for (const [k, v] of Object.entries(headers || {})) {
+      if (FORWARDED_HEADERS.includes(String(k).toLowerCase()) && typeof v === "string") safeHeaders[k] = v;
+    }
+    const ms = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_BACKEND_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("backend_timeout"), ms);
+    if (signal) {
+      if (signal.aborted) controller.abort("caller_cancelled");
+      else signal.addEventListener("abort", () => controller.abort("caller_cancelled"), { once: true });
+    }
+    let response;
+    try {
+      response = await fetch(`${base.url}${path}`, {
+        method: "POST",
+        headers: safeHeaders,
+        body: payload,
+        signal: controller.signal,
+        credentials: "omit"
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      const cancelled = controller.signal.reason === "caller_cancelled";
+      const timedOut = !cancelled && err?.name === "AbortError";
+      return fail(
+        cancelled ? "ABORTED" : timedOut ? "REQUEST_TIMEOUT" : "NETWORK_ERROR",
+        cancelled ? `Request to ${path} was aborted` : timedOut ? `Request to ${path} timed out after ${Math.round(ms / 1e3)}s` : err?.message || String(err)
+      );
+    }
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      clearTimeout(timer);
+      return { parseError: true, status: response.status };
+    }
+    clearTimeout(timer);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return { parseError: true, status: response.status };
+    return { ok: response.ok, status: response.status, data };
+  }
+
   // extension/providers/vercel-backend-adapter.js
-  var DEFAULT_BASE_URL = "https://screen-pilot-j1az.vercel.app";
   var USD_PER_INPUT_TOKEN = 25e-8;
   var USD_PER_OUTPUT_TOKEN = 75e-8;
   var VercelBackendAdapter = class extends BackendAdapter {
     /**
      * @param {object} [options]
-     * @param {string} [options.baseUrl]    - Backend base URL (defaults to Vercel deployment)
+     * @param {string} [options.baseUrl]    - Backend base URL, used only when running outside the extension (inside it,
+     *                                        the service worker resolves the configured URL itself). Defaults to production; throws if invalid.
+     * @param {Function} [options.transport] - Test seam: replaces the default transport
      * @param {string} [options.sessionId]  - Session identifier for rate limiting and telemetry
      */
-    constructor({ baseUrl = DEFAULT_BASE_URL, sessionId } = {}) {
+    constructor({ baseUrl = DEFAULT_BACKEND_URL, sessionId, transport } = {}) {
       super();
-      this._baseUrl = baseUrl.replace(/\/$/, "");
+      const checked = normalizeBackendUrl(baseUrl);
+      if (!checked.ok) throw new Error(`Invalid backend URL: ${checked.error}`);
+      this._baseUrl = checked.url;
       this._sessionId = sessionId ?? crypto.randomUUID().slice(0, 16);
+      this._transport = typeof transport === "function" ? transport : (req) => this._defaultTransport(req);
     }
     get name() {
       return "VercelBackendAdapter";
@@ -1502,48 +1589,69 @@ ${lines.join("\n")}`);
         "Content-Type": "application/json",
         "X-Session-ID": this._sessionId
       };
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3e4);
       const callerSignal = options?.signal;
-      if (callerSignal) {
-        if (callerSignal.aborted) {
-          controller.abort(callerSignal.reason);
-        } else {
-          callerSignal.addEventListener("abort", () => controller.abort(callerSignal.reason), { once: true });
-        }
+      if (callerSignal?.aborted) {
+        return this._networkFailure(`Request to ${path} was aborted`, "ABORTED");
       }
-      let response;
-      try {
-        response = await fetch(`${this._baseUrl}${path}`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-      } catch (err) {
-        clearTimeout(timeoutId);
-        const isCallerAborted = callerSignal?.aborted;
-        const isTimeout = err instanceof Error && err.name === "AbortError" && !isCallerAborted;
-        const message = isCallerAborted ? `Request to ${path} was aborted` : isTimeout ? `Request to ${path} timed out after 30s` : err instanceof Error ? err.message : String(err);
-        const errorCode = isCallerAborted ? "ABORTED" : isTimeout ? "REQUEST_TIMEOUT" : "NETWORK_ERROR";
-        console.error(`[VercelBackendAdapter] ${isCallerAborted ? "Aborted" : isTimeout ? "Timeout" : "Network error"} on ${path}:`, message);
-        return this._networkFailure(message, errorCode);
+      const result = await this._transport({ path, body, headers, timeoutMs: DEFAULT_BACKEND_TIMEOUT_MS, signal: callerSignal });
+      if (result.networkError) {
+        console.error(`[VercelBackendAdapter] ${result.errorCode} on ${path}:`, result.message);
+        return this._networkFailure(result.message, result.errorCode);
       }
-      let data;
-      try {
-        data = await response.json();
-      } catch {
-        console.error(`[VercelBackendAdapter] Non-JSON response from ${path} (status ${response.status})`);
+      if (result.parseError) {
+        console.error(`[VercelBackendAdapter] Non-JSON response from ${path} (status ${result.status})`);
         return this._networkFailure(`Non-JSON response from ${path}`, "PARSE_ERROR");
       }
-      if (!response.ok) {
-        const error = data?.error ?? `HTTP ${response.status}`;
+      const { ok, status, data } = result;
+      if (!ok) {
+        const error = data?.error ?? `HTTP ${status}`;
         const errorCode = data?.errorCode ?? "HTTP_ERROR";
-        console.error(`[VercelBackendAdapter] ${path} \u2192 ${response.status}:`, error);
+        console.error(`[VercelBackendAdapter] ${path} \u2192 ${status}:`, error);
         return { blockers: [], confidence: 0, ...data, result: "FAILED", error, errorCode };
       }
       return data;
+    }
+    /**
+     * Default transport. Inside the extension (content script) the request is sent
+     * to the service worker (services/backend-proxy.js), which resolves the
+     * destination from the one configured backend URL itself — this adapter never
+     * chooses where the request goes, and a page-origin fetch is never made, so
+     * Chrome's loopback restrictions for https pages do not apply. Outside the
+     * extension (unit tests, Node) the same backendRequest() runs directly.
+     * There is no second HTTP implementation here.
+     */
+    async _defaultTransport({ path, body, headers, timeoutMs, signal }) {
+      const rt = typeof chrome !== "undefined" ? chrome?.runtime : null;
+      if (!rt?.sendMessage || !rt.id) {
+        return backendRequest({ baseUrl: this._baseUrl, path, body, headers, timeoutMs, signal });
+      }
+      const reqId = `req_be_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const onAbort = () => {
+        try {
+          rt.sendMessage({ type: "BACKEND_CANCEL", reqId });
+        } catch {
+        }
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const resp = await new Promise((resolve) => {
+          try {
+            rt.sendMessage({ type: "BACKEND_REQUEST", reqId, path, body, headers, timeoutMs }, (r) => {
+              if (rt.lastError) resolve({ networkError: true, errorCode: "NETWORK_ERROR", message: rt.lastError.message });
+              else resolve(r);
+            });
+          } catch (err) {
+            resolve({ networkError: true, errorCode: "NETWORK_ERROR", message: err?.message || String(err) });
+          }
+        });
+        if (!resp || typeof resp !== "object") {
+          return { networkError: true, errorCode: "NETWORK_ERROR", message: "No response from background script" };
+        }
+        if (signal?.aborted) return { networkError: true, errorCode: "ABORTED", message: `Request to ${path} was aborted` };
+        return resp;
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
     }
     /**
      * Synthesize a minimal FAILED PlanResponse for network-layer errors.
