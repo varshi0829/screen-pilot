@@ -2,7 +2,7 @@
 
 ScreenPilot is a Chrome extension that guides a user through any web app step by step: it observes the live page, decides the single next action toward a stated goal, highlights the target element, waits for the user to act, and re-observes — a closed control loop rather than a chat interface.
 
-V2's defining change from V1 is **where decisions get made**. V1 sent every screenshot to a cloud LLM. V2 routes each decision through a 3-tier local cascade first, only escalating when a cheaper tier isn't confident, so most actions resolve in single-digit milliseconds with zero API cost.
+V2's defining change from V1 is **where decisions get made**. V1 sent every screenshot to a cloud LLM. V2 routes each decision through a 3-tier local cascade first, only escalating when a cheaper tier isn't confident, so actions the cheaper tiers can resolve need no model call. (Latency is discussed in [Performance](#performance-design-targets-vs-measurements); the figures originally written here were targets, not measurements.)
 
 ## 1. The decision cascade
 
@@ -19,14 +19,16 @@ V2's defining change from V1 is **where decisions get made**. V1 sent every scre
  DecisionRouter.route(goal, pageState)
          │
          ├─ L1  DOMMatcher (dom-matcher.js)         deterministic text/role/region scoring
-         │      confidence ≥ 0.85 ──────────────────────────────────► execute   (<5ms)
+         │      confidence ≥ 0.85 ──────────────────────────────────► execute
          │
          ├─ L2  UIGroundingService                  feature-vector relevance ranking
-         │      confidence ≥ 0.70 ──────────────────────────────────► execute   (<15ms)
+         │      confidence ≥ 0.70 ──────────────────────────────────► execute
          │
-         └─ L3  LocalQwenAdapter → Ollama            qwen2.5-coder:7b, 1-action JSON out
-                (falls back to VercelBackendAdapter   ─────────────────► execute   (~1.5–2.5s)
-                 / cloud only if local is unavailable)
+         └─ L3  reasoning tier — chosen by execution mode (popup "Local AI"):
+                cloud (DEFAULT)  → VercelBackendAdapter → service worker (services/backend-proxy.js)
+                                   → backend gateway → OpenRouter / Gemini
+                local-qwen       → Qwen via Ollama (text candidates) or Moondream (none);
+                                   one retry on the cloud path if local is unavailable/unusable
                              │
                              ▼
                     ExecutorEngine resolves + highlights the target element
@@ -83,14 +85,20 @@ extension/
   providers/                    L3 planner adapters (local Qwen, cloud)
   lib/                          DOM matching + page snapshotting
   shared/                       state machine, shared types
-  tests/                        node:test unit + integration suites (252 tests)
+  tests/                        node:test unit + integration suites (857 at last run)
   dist/                         built content-script bundles (esbuild)
-src/app/api/plan/                Next.js cloud-planning endpoint (L3 fallback)
+src/app/api/{plan,analyze,health}/  Next.js backend gateway (cloud L3)
+eval/                            evaluation harness (see eval/README.md)
 docs/                            active architecture/spec documents
-docs/archive/                    superseded docs, kept for history
-.e2e-scratch/                    Playwright-based real-browser test harness (gitignored)
+docs/archive/                    superseded docs, kept for history (see docs/archive/README.md)
 ```
 
 ## 5. Testing approach
 
-252 tests across `extension/tests/*.test.mjs`, run with Node's built-in test runner (`node --test`) — no test framework dependency. The suite mixes pure unit tests (matcher scoring, classifier logic) with orchestrator-level integration tests that drive the real `_bootstrapSession`/plan-loop code through mocked browser globals (`chrome.storage`, `document`, `window`), so a regression test proves the *actual* control flow, not a reimplementation of it. Several of the safeguards in §3 were only confirmed correct by also reproducing the failure against a real Chromium instance via `.e2e-scratch/` before writing the fix.
+857 tests (at last run) across `extension/tests/*.test.mjs`, run with Node's built-in test runner (`node --test`) — no test framework dependency. The suite mixes pure unit tests (matcher scoring, classifier logic) with orchestrator-level integration tests that drive the real `_bootstrapSession`/plan-loop code through mocked browser globals (`chrome.storage`, `document`, `window`), so a regression test proves the *actual* control flow, not a reimplementation of it. Several of the safeguards in §3 were only confirmed correct by also reproducing the failure against a real Chromium instance via `.e2e-scratch/` before writing the fix.
+
+## Performance: design targets vs. measurements
+
+An earlier version of this document quoted `<5 ms` (L1), `<15 ms` (L2) and `~1.5–2.5 s` (local Qwen). Those were **design targets**, not measurements, and they are not claims about current behaviour.
+
+What has actually been measured is in [docs/METRICS.md](docs/METRICS.md) (harness: [eval/README.md](eval/README.md)), on one Windows machine (i7-13620H, CPU inference) with a small synthetic benchmark: median local Qwen inference ≈ 12.6 s, mean time to first highlight ≈ 8.2 s, 20/26 first-target correct (76.9%; 61.5% without cloud). Per-layer L1/L2 timings are not reported there. Re-run the harness on your own hardware before relying on any number.
