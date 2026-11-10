@@ -27,6 +27,8 @@
 
 import { capturePageSnapshot }      from '../lib/page-snapshot.js';
 import { ElementResolutionThreshold } from '../shared/types/index.js';
+import { PageStateService }        from './page-state-service.js';
+import { resolveRowContext }       from '../lib/row-context.js';
 
 // How long typing must be quiet before a fill with no explicitly requested
 // value is treated as finished. Only reached when the step carries no value to
@@ -56,6 +58,44 @@ export function valueSatisfies(actual, requested) {
   const want = norm(requested);
   if (!want) return norm(actual).length > 0;
   return norm(actual).includes(want);
+}
+
+// Identity-based resolution (see ExecutorEngine._resolveElementByIdentity).
+// The interactive set PageStateService extracts, so "every control" here means
+// exactly the population `labelIndex`/`labelCount` were counted over.
+const IDENTITY_CONTROL_SELECTOR =
+  'button, a, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"]';
+const IDENTITY_SP_SELECTOR = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
+// Slack between a recorded bbox and a live rect — sub-pixel rounding (bbox is
+// rounded to whole pixels), not layout drift; anything more is treated as moved.
+const IDENTITY_RECT_TOLERANCE_PX = 2;
+
+function _normalizeLabel(s) {
+  return typeof s === 'string' ? s.replace(/\s+/g, ' ').trim().toLowerCase() : '';
+}
+
+// Same visibility rule PageStateService applies before it counts an element.
+function _isExtractable(element) {
+  if (element.offsetParent === null && element.tagName !== 'BODY') return false;
+  const r = element.getBoundingClientRect?.();
+  return !r || (r.width > 0 && r.height > 0);
+}
+
+// Does this control carry `label` as its name, by any of the fields page state
+// reads (text, placeholder, aria-label — plus the cheap aria-labelledby/title/
+// img[alt] fallbacks of its accessible name)?
+function _hasLabel(element, label) {
+  const attr = (k) => element.getAttribute?.(k) ?? '';
+  const names = [
+    PageStateService.clean(element.innerText || element.textContent || ''),
+    attr('placeholder'), attr('aria-label'), attr('title'),
+    element.querySelector?.('img[alt]')?.getAttribute?.('alt') ?? '',
+  ];
+  const by = attr('aria-labelledby');
+  if (by && typeof document.getElementById === 'function') {
+    names.push(by.split(/\s+/).map((id) => document.getElementById(id)?.innerText ?? '').join(' '));
+  }
+  return names.some((n) => _normalizeLabel(n) === label);
 }
 
 // ── ExecutorStatus values (string union) ──────────────────────────────────────
@@ -451,6 +491,24 @@ export class ExecutorEngine {
       // "No element matched" failure exactly as it already does.
     }
 
+    // A step the planner/grounding layer resolved to ONE specific page-state
+    // element carries that element's identity (see _resolveElementByIdentity).
+    // Text alone cannot express it: identical labels repeat across a page's rows,
+    // and the text search below just takes the best-ranked match — for a tie, the
+    // first in DOM order, which is often a different row than the one selected.
+    //
+    // Three outcomes: the element is recovered (used, with NO text alternatives —
+    // a same-labelled stand-in is exactly what this exists to avoid); the identity
+    // is genuinely ambiguous or contradicted by the live page (unresolved: fail
+    // closed, never fall back to a first-DOM-match guess — the orchestrator
+    // replans from fresh page state); or the step simply has no usable identity /
+    // its label is not on the page (legacy text matching, unchanged).
+    const identity = this._resolveElementByIdentity(step.targetElement);
+    if (identity?.unresolved) return null;
+    if (identity?.element) {
+      return { element: identity.element, score: 100, alternatives: [], candidates: [] };
+    }
+
     const primary = this._domMatcher.matchElement(step.targetElement);
 
     if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
@@ -532,6 +590,98 @@ export class ExecutorEngine {
     // is nothing to score), set comfortably above ElementResolutionThreshold
     // .PRIMARY so downstream candidate handling treats it as confident.
     return { element, score: 100, alternatives: [], candidates: [] };
+  }
+
+  /**
+   * Recover the live element a step's planner selected, using identity evidence
+   * that survives layout change — not merely where the element was painted.
+   *
+   * A step built from page state carries, beside its label: `context` (the row/
+   * container text page state recorded for the element), `labelIndex`/
+   * `labelCount` (its position among all controls with that same label, in DOM
+   * order, and how many there were) and `bbox` (where it was). `elementId` is a
+   * per-extraction label, not a handle on a live node, so identity has to be
+   * re-established from this evidence.
+   *
+   * Every live control carrying the label is considered — no dependence on
+   * DOMMatcher's top-5. Each piece of evidence that is AVAILABLE must agree:
+   *   - context:   the control's live row context equals the recorded one;
+   *   - ordinal:   the label still occurs `labelCount` times and this is the
+   *                `labelIndex`-th of them (a row added/removed/reordered breaks it);
+   *   - position:  required as corroboration only when duplicates exist and there
+   *                is no row context, and to break a tie between candidates the
+   *                other evidence leaves equal.
+   * Position alone is never enough among duplicates: a layout shift or a scroll
+   * by one row pitch puts a DIFFERENT same-labelled control at the old bbox.
+   *
+   * Returns
+   *   { element }               the one control every available evidence agrees on;
+   *   { unresolved: true, … }   duplicates exist and the evidence is missing,
+   *                             contradicted or ambiguous — the caller must NOT
+   *                             substitute a text match;
+   *   null                      not applicable (no identity on the step, no label,
+   *                             or the label is not on the page): legacy matching.
+   *
+   * Guide-only: reads layout and attributes only; never clicks, focuses,
+   * types or dispatches.
+   *
+   * @param {object} targetElement
+   * @returns {{element: Element}|{unresolved: true, reason: string}|null}
+   */
+  _resolveElementByIdentity(targetElement) {
+    const { elementId, bbox, text, context, labelIndex, labelCount } = targetElement ?? {};
+    if (!elementId || !bbox || !(bbox.width > 0) || !(bbox.height > 0)) return null;
+    const label = _normalizeLabel(text);
+    if (!label) return null; // an unlabeled target is resolved positionally instead (see _resolveElement)
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
+
+    // Every live control with this label, in DOM order — the same population
+    // labelIndex/labelCount were counted over at extraction.
+    const same = [];
+    for (const el of document.querySelectorAll(IDENTITY_CONTROL_SELECTOR)) {
+      if (el.closest?.(IDENTITY_SP_SELECTOR)) continue;
+      if (!_isExtractable(el)) continue;
+      if (_hasLabel(el, label)) same.push(el);
+    }
+    if (!same.length) return null; // label not found live — legacy text matching decides
+
+    const unresolved = (reason) => {
+      console.log(`[SP:Exec] identity UNRESOLVED (${reason}) candidates=${same.length} — failing closed, not guessing`);
+      return { unresolved: true, reason };
+    };
+    const wantContext = _normalizeLabel(context);
+    const hasOrdinal = Number.isInteger(labelIndex) && Number.isInteger(labelCount) && labelIndex >= 0 && labelIndex < labelCount;
+    const duplicates = same.length > 1 || (hasOrdinal && labelCount > 1);
+    if (duplicates && !wantContext && !hasOrdinal) return unresolved('duplicates with no corroborating identity evidence');
+
+    const liveContext = (el) => _normalizeLabel(resolveRowContext(
+      el,
+      PageStateService.clean(el.innerText || el.textContent || ''),
+      PageStateService.resolveAccessibleName(el, document)
+    ));
+    const positionMatches = (el) => {
+      let r;
+      try { r = el.getBoundingClientRect?.(); } catch { r = null; }
+      if (!r) return false;
+      const near = (a, b) => Math.abs((a ?? 0) - (b ?? 0)) <= IDENTITY_RECT_TOLERANCE_PX;
+      return near(r.x ?? r.left, bbox.x) && near(r.y ?? r.top, bbox.y) && near(r.width, bbox.width) && near(r.height, bbox.height);
+    };
+
+    let agreed = same.map((el, index) => ({ el, index }));
+    if (wantContext) agreed = agreed.filter((c) => liveContext(c.el) === wantContext);
+    if (hasOrdinal) agreed = same.length === labelCount ? agreed.filter((c) => c.index === labelIndex) : [];
+    if (!agreed.length) return unresolved('recorded identity evidence no longer matches any candidate');
+
+    if (agreed.length > 1) {
+      agreed = agreed.filter((c) => positionMatches(c.el));
+      if (agreed.length !== 1) return unresolved('evidence leaves several candidates');
+    } else if (duplicates && !wantContext && !positionMatches(agreed[0].el)) {
+      return unresolved('ordinal alone, and the element is no longer where it was recorded');
+    }
+
+    const el = agreed[0].el;
+    if (el.isConnected === false || this._domMatcher.isDisabled?.(el)) return unresolved('identified element is detached or disabled');
+    return { element: el };
   }
 
   /**

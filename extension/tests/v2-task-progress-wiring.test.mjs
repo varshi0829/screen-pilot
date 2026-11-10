@@ -26,31 +26,47 @@ const V3_BASE = 'c7e085f';
 // PER-FILE baselines. Each protected file must hash to exactly its pinned
 // content (`git hash-object` of the working-tree file, so staged, unstaged and
 // committed edits are all caught — any later modification fails):
-//   - { commit } — the file must be byte-identical to that commit's version.
+//   - { commit } — the file must be byte-identical to that commit's version
+//                  (for a file that has NOT been intentionally extended: pin it
+//                  to V3_BASE above).
 //   - { blob }   — the file must be byte-identical to that exact, approved
 //                  content. A blob id is used (rather than the hash of a commit
 //                  that does not exist yet) so the approved version is pinned
 //                  precisely and independently of when/how it is committed.
 //
-// executor-engine.js carries the log-hygiene cleanup (no field values, element text
-// or labels in logs) and is pinned to that approved content.
+// Two V3 extensions have been INTENTIONALLY approved, each after review. They
+// are deliberate extensions of V3, not drift:
 //
-// ui-grounding-service.js and page-state-service.js carry an INTENTIONALLY
-// NEWER baseline: the approved generic contextual-grounding extension (a
-// bounded `context` field naming the row/container a control sits in, and its
-// use in L2 scoring, so identically-labelled controls in different rows can be
-// told apart). That is a deliberate, reviewed extension of V3 — not drift. Any
-// FURTHER change to either file, however small, fails this test until it is
-// reviewed and re-pinned here on purpose.
+//  1. CONTEXTUAL GROUNDING — ui-grounding-service.js and page-state-service.js.
+//     A bounded `context` field naming the row/container a control sits in, and
+//     its use in L2 scoring, so identically-labelled controls in different rows
+//     can be told apart.
+//
+//  2. EXECUTOR IDENTITY RESOLUTION — executor-engine.js, v2-task.js and the new
+//     lib/row-context.js. A step keeps the identity of the specific element the
+//     planner selected (row context + its ordinal among same-labelled controls,
+//     with position as corroboration), and the executor fails closed rather than
+//     highlighting an arbitrary same-labelled control. v2-task.js is pinned
+//     because it carries the enrichment that supplies that identity;
+//     row-context.js is pinned because the executor's parity with page-state
+//     extraction depends on it.
+//
+// No file has been unprotected: every protected file is still pinned, now to its
+// approved content. Any FURTHER change to ANY file below, however small, fails
+// this test until it has been reviewed and re-pinned here on purpose.
 const V3_PINS = {
+  // ── contextual grounding (approved) ──
   'extension/services/ui-grounding-service.js': { blob: '96a11c07fbb9486f350134fd5687b28373285c53' },
   'extension/services/page-state-service.js':   { blob: '0030b6d4a1c03a23c50724fbbafb7c9c7c6499ff' },
-  'extension/services/executor-engine.js':      { blob: '465fad740dae5c8c8bae20ff70ca88b42495fda6' }
+  // ── executor identity resolution (approved) ──
+  'extension/services/executor-engine.js':      { blob: '4447bfd0654ee191ac85f7bc3ee2baa42a94ed01' },
+  'extension/v2-task.js':                       { blob: '06ec6a67cf613404aebf924c4c9da68b4f6a20ed' },
+  'extension/lib/row-context.js':               { blob: '9c0d33b7df9e7604cc00e53a7bda37a2dc415916' }
 };
 
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();
 
-test('no V3-owned file differs from its pinned baseline (per-file V3_PINS; executor-engine.js pinned to V3 base c7e085f)', () => {
+test('no V3-owned file differs from its pinned baseline (per-file V3_PINS: approved contextual-grounding and executor-identity extensions)', () => {
   const violations = [];
   for (const [file, pin] of Object.entries(V3_PINS)) {
     let expected = pin.blob;

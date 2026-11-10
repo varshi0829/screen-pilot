@@ -355,6 +355,258 @@
     // normalized 0–1; only enforced on PRIMARY path (≡ score≥60 at divisor=150)
   });
 
+  // extension/services/page-state-service.js
+  var PageStateService = (() => {
+    "use strict";
+    function clean2(str, maxLen = 80) {
+      if (typeof str !== "string") return "";
+      return str.replace(/\s+/g, " ").trim().slice(0, maxLen);
+    }
+    function getRole(el) {
+      const ariaRole = el.getAttribute?.("role");
+      if (ariaRole) return clean2(ariaRole, 30);
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (tag === "button" || tag === "input" && ["button", "submit", "reset"].includes(el.type)) return "button";
+      if (tag === "a") return "link";
+      if (tag === "input" && ["text", "search", "email", "password", "url", "number", "tel"].includes(el.type || "text")) return "textbox";
+      if (tag === "textarea") return "textbox";
+      if (tag === "select") return "combobox";
+      if (tag === "input" && (el.type === "checkbox" || el.type === "radio")) return el.type;
+      return tag || "generic";
+    }
+    function isVisible(el) {
+      if (!el) return false;
+      if (el.offsetParent === null && el.tagName !== "BODY") return false;
+      if (typeof el.getBoundingClientRect === "function") {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      }
+      return true;
+    }
+    function resolveAriaLabelledBy(el, doc) {
+      const idList = (el.getAttribute?.("aria-labelledby") || "").trim();
+      if (!idList || typeof doc?.getElementById !== "function") return "";
+      return idList.split(/\s+/).map((id) => {
+        const ref = doc.getElementById(id);
+        return ref ? ref.innerText || ref.textContent || "" : "";
+      }).filter(Boolean).join(" ");
+    }
+    function buildLabelForMap(doc) {
+      const map = /* @__PURE__ */ new Map();
+      if (typeof doc?.querySelectorAll !== "function") return map;
+      for (const label of doc.querySelectorAll("label[for]")) {
+        const forId = label.getAttribute?.("for");
+        if (!forId || map.has(forId)) continue;
+        map.set(forId, label.innerText || label.textContent || "");
+      }
+      return map;
+    }
+    function resolveLabelFor(el, labelForMap) {
+      const id = el.id || el.getAttribute?.("id") || "";
+      if (!id || !labelForMap) return "";
+      return labelForMap.get(id) || "";
+    }
+    function resolveAncestorLabel(el) {
+      const label = typeof el.closest === "function" ? el.closest("label") : null;
+      if (!label || label === el) return "";
+      return label.innerText || label.textContent || "";
+    }
+    function resolveAccessibleName(el, doc, labelForMap = null) {
+      const direct = clean2(el.getAttribute?.("aria-label") || "");
+      if (direct) return direct;
+      const labelledBy = clean2(resolveAriaLabelledBy(el, doc));
+      if (labelledBy) return labelledBy;
+      const labelFor = clean2(resolveLabelFor(el, labelForMap ?? buildLabelForMap(doc)));
+      if (labelFor) return labelFor;
+      const ancestorLabel = clean2(resolveAncestorLabel(el));
+      if (ancestorLabel) return ancestorLabel;
+      const title = clean2(el.getAttribute?.("title") || "");
+      if (title) return title;
+      return clean2(el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
+    }
+    function resolveFormId(el, formMap) {
+      const form = el.form ?? (typeof el.closest === "function" ? el.closest("form") : null);
+      if (!form) return null;
+      if (!formMap.map.has(form)) formMap.map.set(form, `form_${formMap.count++}`);
+      return formMap.map.get(form);
+    }
+    const CONTEXT_MAX_LEN2 = 60;
+    const CONTEXT_MAX_RAW2 = 400;
+    const CONTEXT_MAX_DEPTH2 = 8;
+    const CONTEXT_MAX_CONTROLS2 = 12;
+    const ROW_SELECTOR2 = 'li, tr, article, [role="listitem"], [role="row"], [role="option"], [role="treeitem"], [role="article"]';
+    const REGION_TAGS2 = /* @__PURE__ */ new Set(["BODY", "HTML", "MAIN", "NAV", "HEADER", "FOOTER", "ASIDE", "FORM", "SECTION"]);
+    const CONTROL_SELECTOR2 = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], summary';
+    function removeOwnLabel2(text, label) {
+      const needle = (label || "").trim().toLowerCase();
+      if (!needle) return text;
+      let out = text;
+      let idx = out.toLowerCase().indexOf(needle);
+      while (idx !== -1) {
+        out = out.slice(0, idx) + " " + out.slice(idx + needle.length);
+        idx = out.toLowerCase().indexOf(needle);
+      }
+      return out;
+    }
+    function isRowLike2(node) {
+      if (typeof node.matches === "function" && node.matches(ROW_SELECTOR2)) return true;
+      const parent = node.parentElement;
+      const siblings = parent?.children;
+      if (!siblings || siblings.length < 2) return false;
+      let same = 0;
+      for (const sib of siblings) {
+        if (sib.tagName === node.tagName && (sib.className || "") === (node.className || "")) same += 1;
+        if (same >= 2) return true;
+      }
+      return false;
+    }
+    function resolveContext(el, ownText, ownLabel) {
+      let node = el.parentElement;
+      for (let depth = 0; node && depth < CONTEXT_MAX_DEPTH2; depth++, node = node.parentElement) {
+        if (REGION_TAGS2.has(node.tagName)) return "";
+        const controls = typeof node.querySelectorAll === "function" ? node.querySelectorAll(CONTROL_SELECTOR2).length : 0;
+        if (controls > CONTEXT_MAX_CONTROLS2) return "";
+        if (!isRowLike2(node)) continue;
+        const raw = clean2(node.innerText || node.textContent || "", CONTEXT_MAX_RAW2);
+        const remaining = clean2(removeOwnLabel2(removeOwnLabel2(raw, ownText), ownLabel), CONTEXT_MAX_LEN2);
+        if (remaining) return redactText(remaining);
+      }
+      return "";
+    }
+    function getRegion(el) {
+      if (!el || typeof el.closest !== "function") return "main_content";
+      if (el.closest('nav, header, [role="banner"], [role="navigation"]')) return "top_navigation";
+      if (el.closest('aside, [role="complementary"], [role="navigation"].sidebar, .sidebar')) return "side_navigation";
+      if (el.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog')) return "modal";
+      if (el.closest('footer, [role="contentinfo"]')) return "footer";
+      return "main_content";
+    }
+    function extractPageState(env = {}) {
+      const doc = env.doc ?? (typeof document !== "undefined" ? document : null);
+      const loc = env.loc ?? (typeof location !== "undefined" ? location : null);
+      const url = loc?.href ?? "";
+      const title = doc?.title ?? "";
+      const selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"], summary';
+      const rawEls = doc && typeof doc.querySelectorAll === "function" ? Array.from(doc.querySelectorAll(selector)) : [];
+      const SP_SEL = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
+      const elements = [];
+      let count = 0;
+      const seen = /* @__PURE__ */ new Set();
+      const formMap = { map: /* @__PURE__ */ new WeakMap(), count: 0 };
+      const labelForMap = buildLabelForMap(doc);
+      for (const el of rawEls) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        if (el.closest?.(SP_SEL)) continue;
+        const visible = isVisible(el);
+        if (!visible) continue;
+        const tag = el.tagName ? el.tagName.toLowerCase() : "div";
+        const role = getRole(el);
+        const text = clean2(el.innerText || el.textContent || "");
+        const placeholder = clean2(el.getAttribute?.("placeholder") || "");
+        const ariaLabel = resolveAccessibleName(el, doc, labelForMap);
+        const value = typeof el.value === "string" ? clean2(el.value) : "";
+        const href = clean2(el.getAttribute?.("href") || "", 120);
+        const enabled = !el.disabled;
+        const region = getRegion(el);
+        const type = tag === "input" ? clean2(el.getAttribute?.("type") || el.type || "", 20) : "";
+        const autocomplete = clean2(el.getAttribute?.("autocomplete") || "", 30);
+        const formId = resolveFormId(el, formMap);
+        const context = resolveContext(el, text, ariaLabel);
+        const required = Boolean(el.required) || el.getAttribute?.("required") != null;
+        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox" && role !== "button") continue;
+        let bbox = null;
+        if (typeof el.getBoundingClientRect === "function") {
+          const r = el.getBoundingClientRect();
+          bbox = { x: Math.round(r.x || r.left || 0), y: Math.round(r.y || r.top || 0), width: Math.round(r.width || 0), height: Math.round(r.height || 0) };
+        }
+        count += 1;
+        const id = `el_${count}`;
+        elements.push({
+          id,
+          role,
+          tag,
+          text,
+          placeholder,
+          ariaLabel,
+          value,
+          href,
+          visible,
+          enabled,
+          region,
+          bbox,
+          type,
+          autocomplete,
+          formId,
+          required,
+          context
+        });
+        if (count >= 300) break;
+      }
+      const sanitizedElements = PrivacySanitizer.sanitizeElements(elements);
+      const sensitiveRegions = PrivacySanitizer.getSensitiveRegions(elements);
+      return {
+        url,
+        title,
+        elements: sanitizedElements,
+        sensitiveRegions,
+        timestamp: Date.now()
+      };
+    }
+    return { extractPageState, clean: clean2, getRole, resolveAccessibleName };
+  })();
+  if (typeof globalThis !== "undefined" && globalThis.module) {
+    globalThis.module.exports = PageStateService;
+  }
+
+  // extension/lib/row-context.js
+  var CONTEXT_MAX_LEN = 60;
+  var CONTEXT_MAX_RAW = 400;
+  var CONTEXT_MAX_DEPTH = 8;
+  var CONTEXT_MAX_CONTROLS = 12;
+  var ROW_SELECTOR = 'li, tr, article, [role="listitem"], [role="row"], [role="option"], [role="treeitem"], [role="article"]';
+  var REGION_TAGS = /* @__PURE__ */ new Set(["BODY", "HTML", "MAIN", "NAV", "HEADER", "FOOTER", "ASIDE", "FORM", "SECTION"]);
+  var CONTROL_SELECTOR = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], summary';
+  function clean(str, maxLen) {
+    if (typeof str !== "string") return "";
+    return str.replace(/\s+/g, " ").trim().slice(0, maxLen);
+  }
+  function removeOwnLabel(text, label) {
+    const needle = (label || "").trim().toLowerCase();
+    if (!needle) return text;
+    let out = text;
+    let idx = out.toLowerCase().indexOf(needle);
+    while (idx !== -1) {
+      out = out.slice(0, idx) + " " + out.slice(idx + needle.length);
+      idx = out.toLowerCase().indexOf(needle);
+    }
+    return out;
+  }
+  function isRowLike(node) {
+    if (typeof node.matches === "function" && node.matches(ROW_SELECTOR)) return true;
+    const siblings = node.parentElement?.children;
+    if (!siblings || siblings.length < 2) return false;
+    let same = 0;
+    for (const sib of siblings) {
+      if (sib.tagName === node.tagName && (sib.className || "") === (node.className || "")) same += 1;
+      if (same >= 2) return true;
+    }
+    return false;
+  }
+  function resolveRowContext(el, ownText, ownLabel) {
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < CONTEXT_MAX_DEPTH; depth++, node = node.parentElement) {
+      if (REGION_TAGS.has(node.tagName)) return "";
+      const controls = typeof node.querySelectorAll === "function" ? node.querySelectorAll(CONTROL_SELECTOR).length : 0;
+      if (controls > CONTEXT_MAX_CONTROLS) return "";
+      if (!isRowLike(node)) continue;
+      const raw = clean(node.innerText || node.textContent || "", CONTEXT_MAX_RAW);
+      const remaining = clean(removeOwnLabel(removeOwnLabel(raw, ownText), ownLabel), CONTEXT_MAX_LEN);
+      if (remaining) return redactText(remaining);
+    }
+    return "";
+  }
+
   // extension/services/executor-engine.js
   var FILL_IDLE_MS = 600;
   function valueSatisfies(actual, requested) {
@@ -362,6 +614,32 @@
     const want = norm(requested);
     if (!want) return norm(actual).length > 0;
     return norm(actual).includes(want);
+  }
+  var IDENTITY_CONTROL_SELECTOR = 'button, a, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"]';
+  var IDENTITY_SP_SELECTOR = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
+  var IDENTITY_RECT_TOLERANCE_PX = 2;
+  function _normalizeLabel(s) {
+    return typeof s === "string" ? s.replace(/\s+/g, " ").trim().toLowerCase() : "";
+  }
+  function _isExtractable(element) {
+    if (element.offsetParent === null && element.tagName !== "BODY") return false;
+    const r = element.getBoundingClientRect?.();
+    return !r || r.width > 0 && r.height > 0;
+  }
+  function _hasLabel(element, label) {
+    const attr = (k) => element.getAttribute?.(k) ?? "";
+    const names = [
+      PageStateService.clean(element.innerText || element.textContent || ""),
+      attr("placeholder"),
+      attr("aria-label"),
+      attr("title"),
+      element.querySelector?.("img[alt]")?.getAttribute?.("alt") ?? ""
+    ];
+    const by = attr("aria-labelledby");
+    if (by && typeof document.getElementById === "function") {
+      names.push(by.split(/\s+/).map((id) => document.getElementById(id)?.innerText ?? "").join(" "));
+    }
+    return names.some((n) => _normalizeLabel(n) === label);
   }
   var ExecutorEngine = class {
     /**
@@ -653,6 +931,11 @@
         const positional = this._resolveElementByPosition(step.targetElement);
         if (positional) return positional;
       }
+      const identity = this._resolveElementByIdentity(step.targetElement);
+      if (identity?.unresolved) return null;
+      if (identity?.element) {
+        return { element: identity.element, score: 100, alternatives: [], candidates: [] };
+      }
       const primary = this._domMatcher.matchElement(step.targetElement);
       if (primary?.score >= ElementResolutionThreshold.PRIMARY) {
         this._logCandidates(step.targetElement.text, primary.candidates);
@@ -706,6 +989,93 @@
       if (typeof this._domMatcher.isVisible === "function" && !this._domMatcher.isVisible(element)) return null;
       console.log(`[SP:Exec] Resolved by position (no accessible text on target) elementId=${targetElement.elementId} bbox=${JSON.stringify(bbox)} <${element.tagName?.toLowerCase?.() ?? "?"}>`);
       return { element, score: 100, alternatives: [], candidates: [] };
+    }
+    /**
+     * Recover the live element a step's planner selected, using identity evidence
+     * that survives layout change — not merely where the element was painted.
+     *
+     * A step built from page state carries, beside its label: `context` (the row/
+     * container text page state recorded for the element), `labelIndex`/
+     * `labelCount` (its position among all controls with that same label, in DOM
+     * order, and how many there were) and `bbox` (where it was). `elementId` is a
+     * per-extraction label, not a handle on a live node, so identity has to be
+     * re-established from this evidence.
+     *
+     * Every live control carrying the label is considered — no dependence on
+     * DOMMatcher's top-5. Each piece of evidence that is AVAILABLE must agree:
+     *   - context:   the control's live row context equals the recorded one;
+     *   - ordinal:   the label still occurs `labelCount` times and this is the
+     *                `labelIndex`-th of them (a row added/removed/reordered breaks it);
+     *   - position:  required as corroboration only when duplicates exist and there
+     *                is no row context, and to break a tie between candidates the
+     *                other evidence leaves equal.
+     * Position alone is never enough among duplicates: a layout shift or a scroll
+     * by one row pitch puts a DIFFERENT same-labelled control at the old bbox.
+     *
+     * Returns
+     *   { element }               the one control every available evidence agrees on;
+     *   { unresolved: true, … }   duplicates exist and the evidence is missing,
+     *                             contradicted or ambiguous — the caller must NOT
+     *                             substitute a text match;
+     *   null                      not applicable (no identity on the step, no label,
+     *                             or the label is not on the page): legacy matching.
+     *
+     * Guide-only: reads layout and attributes only; never clicks, focuses,
+     * types or dispatches.
+     *
+     * @param {object} targetElement
+     * @returns {{element: Element}|{unresolved: true, reason: string}|null}
+     */
+    _resolveElementByIdentity(targetElement) {
+      const { elementId, bbox, text, context, labelIndex, labelCount } = targetElement ?? {};
+      if (!elementId || !bbox || !(bbox.width > 0) || !(bbox.height > 0)) return null;
+      const label = _normalizeLabel(text);
+      if (!label) return null;
+      if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return null;
+      const same = [];
+      for (const el2 of document.querySelectorAll(IDENTITY_CONTROL_SELECTOR)) {
+        if (el2.closest?.(IDENTITY_SP_SELECTOR)) continue;
+        if (!_isExtractable(el2)) continue;
+        if (_hasLabel(el2, label)) same.push(el2);
+      }
+      if (!same.length) return null;
+      const unresolved = (reason) => {
+        console.log(`[SP:Exec] identity UNRESOLVED (${reason}) candidates=${same.length} \u2014 failing closed, not guessing`);
+        return { unresolved: true, reason };
+      };
+      const wantContext = _normalizeLabel(context);
+      const hasOrdinal = Number.isInteger(labelIndex) && Number.isInteger(labelCount) && labelIndex >= 0 && labelIndex < labelCount;
+      const duplicates = same.length > 1 || hasOrdinal && labelCount > 1;
+      if (duplicates && !wantContext && !hasOrdinal) return unresolved("duplicates with no corroborating identity evidence");
+      const liveContext = (el2) => _normalizeLabel(resolveRowContext(
+        el2,
+        PageStateService.clean(el2.innerText || el2.textContent || ""),
+        PageStateService.resolveAccessibleName(el2, document)
+      ));
+      const positionMatches = (el2) => {
+        let r;
+        try {
+          r = el2.getBoundingClientRect?.();
+        } catch {
+          r = null;
+        }
+        if (!r) return false;
+        const near = (a, b) => Math.abs((a ?? 0) - (b ?? 0)) <= IDENTITY_RECT_TOLERANCE_PX;
+        return near(r.x ?? r.left, bbox.x) && near(r.y ?? r.top, bbox.y) && near(r.width, bbox.width) && near(r.height, bbox.height);
+      };
+      let agreed = same.map((el2, index) => ({ el: el2, index }));
+      if (wantContext) agreed = agreed.filter((c) => liveContext(c.el) === wantContext);
+      if (hasOrdinal) agreed = same.length === labelCount ? agreed.filter((c) => c.index === labelIndex) : [];
+      if (!agreed.length) return unresolved("recorded identity evidence no longer matches any candidate");
+      if (agreed.length > 1) {
+        agreed = agreed.filter((c) => positionMatches(c.el));
+        if (agreed.length !== 1) return unresolved("evidence leaves several candidates");
+      } else if (duplicates && !wantContext && !positionMatches(agreed[0].el)) {
+        return unresolved("ordinal alone, and the element is no longer where it was recorded");
+      }
+      const el = agreed[0].el;
+      if (el.isConnected === false || this._domMatcher.isDisabled?.(el)) return unresolved("identified element is detached or disabled");
+      return { element: el };
     }
     /**
      * Verify the element is still safe to highlight.
@@ -1195,210 +1565,6 @@ ${lines.join("\n")}`);
       };
     }
   };
-
-  // extension/services/page-state-service.js
-  var PageStateService = (() => {
-    "use strict";
-    function clean(str, maxLen = 80) {
-      if (typeof str !== "string") return "";
-      return str.replace(/\s+/g, " ").trim().slice(0, maxLen);
-    }
-    function getRole(el) {
-      const ariaRole = el.getAttribute?.("role");
-      if (ariaRole) return clean(ariaRole, 30);
-      const tag = el.tagName ? el.tagName.toLowerCase() : "";
-      if (tag === "button" || tag === "input" && ["button", "submit", "reset"].includes(el.type)) return "button";
-      if (tag === "a") return "link";
-      if (tag === "input" && ["text", "search", "email", "password", "url", "number", "tel"].includes(el.type || "text")) return "textbox";
-      if (tag === "textarea") return "textbox";
-      if (tag === "select") return "combobox";
-      if (tag === "input" && (el.type === "checkbox" || el.type === "radio")) return el.type;
-      return tag || "generic";
-    }
-    function isVisible(el) {
-      if (!el) return false;
-      if (el.offsetParent === null && el.tagName !== "BODY") return false;
-      if (typeof el.getBoundingClientRect === "function") {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      }
-      return true;
-    }
-    function resolveAriaLabelledBy(el, doc) {
-      const idList = (el.getAttribute?.("aria-labelledby") || "").trim();
-      if (!idList || typeof doc?.getElementById !== "function") return "";
-      return idList.split(/\s+/).map((id) => {
-        const ref = doc.getElementById(id);
-        return ref ? ref.innerText || ref.textContent || "" : "";
-      }).filter(Boolean).join(" ");
-    }
-    function buildLabelForMap(doc) {
-      const map = /* @__PURE__ */ new Map();
-      if (typeof doc?.querySelectorAll !== "function") return map;
-      for (const label of doc.querySelectorAll("label[for]")) {
-        const forId = label.getAttribute?.("for");
-        if (!forId || map.has(forId)) continue;
-        map.set(forId, label.innerText || label.textContent || "");
-      }
-      return map;
-    }
-    function resolveLabelFor(el, labelForMap) {
-      const id = el.id || el.getAttribute?.("id") || "";
-      if (!id || !labelForMap) return "";
-      return labelForMap.get(id) || "";
-    }
-    function resolveAncestorLabel(el) {
-      const label = typeof el.closest === "function" ? el.closest("label") : null;
-      if (!label || label === el) return "";
-      return label.innerText || label.textContent || "";
-    }
-    function resolveAccessibleName(el, doc, labelForMap = null) {
-      const direct = clean(el.getAttribute?.("aria-label") || "");
-      if (direct) return direct;
-      const labelledBy = clean(resolveAriaLabelledBy(el, doc));
-      if (labelledBy) return labelledBy;
-      const labelFor = clean(resolveLabelFor(el, labelForMap ?? buildLabelForMap(doc)));
-      if (labelFor) return labelFor;
-      const ancestorLabel = clean(resolveAncestorLabel(el));
-      if (ancestorLabel) return ancestorLabel;
-      const title = clean(el.getAttribute?.("title") || "");
-      if (title) return title;
-      return clean(el.querySelector?.("img[alt]")?.getAttribute?.("alt") || "");
-    }
-    function resolveFormId(el, formMap) {
-      const form = el.form ?? (typeof el.closest === "function" ? el.closest("form") : null);
-      if (!form) return null;
-      if (!formMap.map.has(form)) formMap.map.set(form, `form_${formMap.count++}`);
-      return formMap.map.get(form);
-    }
-    const CONTEXT_MAX_LEN = 60;
-    const CONTEXT_MAX_RAW = 400;
-    const CONTEXT_MAX_DEPTH = 8;
-    const CONTEXT_MAX_CONTROLS = 12;
-    const ROW_SELECTOR = 'li, tr, article, [role="listitem"], [role="row"], [role="option"], [role="treeitem"], [role="article"]';
-    const REGION_TAGS = /* @__PURE__ */ new Set(["BODY", "HTML", "MAIN", "NAV", "HEADER", "FOOTER", "ASIDE", "FORM", "SECTION"]);
-    const CONTROL_SELECTOR = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], summary';
-    function removeOwnLabel(text, label) {
-      const needle = (label || "").trim().toLowerCase();
-      if (!needle) return text;
-      let out = text;
-      let idx = out.toLowerCase().indexOf(needle);
-      while (idx !== -1) {
-        out = out.slice(0, idx) + " " + out.slice(idx + needle.length);
-        idx = out.toLowerCase().indexOf(needle);
-      }
-      return out;
-    }
-    function isRowLike(node) {
-      if (typeof node.matches === "function" && node.matches(ROW_SELECTOR)) return true;
-      const parent = node.parentElement;
-      const siblings = parent?.children;
-      if (!siblings || siblings.length < 2) return false;
-      let same = 0;
-      for (const sib of siblings) {
-        if (sib.tagName === node.tagName && (sib.className || "") === (node.className || "")) same += 1;
-        if (same >= 2) return true;
-      }
-      return false;
-    }
-    function resolveContext(el, ownText, ownLabel) {
-      let node = el.parentElement;
-      for (let depth = 0; node && depth < CONTEXT_MAX_DEPTH; depth++, node = node.parentElement) {
-        if (REGION_TAGS.has(node.tagName)) return "";
-        const controls = typeof node.querySelectorAll === "function" ? node.querySelectorAll(CONTROL_SELECTOR).length : 0;
-        if (controls > CONTEXT_MAX_CONTROLS) return "";
-        if (!isRowLike(node)) continue;
-        const raw = clean(node.innerText || node.textContent || "", CONTEXT_MAX_RAW);
-        const remaining = clean(removeOwnLabel(removeOwnLabel(raw, ownText), ownLabel), CONTEXT_MAX_LEN);
-        if (remaining) return redactText(remaining);
-      }
-      return "";
-    }
-    function getRegion(el) {
-      if (!el || typeof el.closest !== "function") return "main_content";
-      if (el.closest('nav, header, [role="banner"], [role="navigation"]')) return "top_navigation";
-      if (el.closest('aside, [role="complementary"], [role="navigation"].sidebar, .sidebar')) return "side_navigation";
-      if (el.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog')) return "modal";
-      if (el.closest('footer, [role="contentinfo"]')) return "footer";
-      return "main_content";
-    }
-    function extractPageState(env = {}) {
-      const doc = env.doc ?? (typeof document !== "undefined" ? document : null);
-      const loc = env.loc ?? (typeof location !== "undefined" ? location : null);
-      const url = loc?.href ?? "";
-      const title = doc?.title ?? "";
-      const selector = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="textbox"], summary';
-      const rawEls = doc && typeof doc.querySelectorAll === "function" ? Array.from(doc.querySelectorAll(selector)) : [];
-      const SP_SEL = '[id^="sp-"],[id^="screenpilot-"],[class*="sp-"],[data-screenpilot]';
-      const elements = [];
-      let count = 0;
-      const seen = /* @__PURE__ */ new Set();
-      const formMap = { map: /* @__PURE__ */ new WeakMap(), count: 0 };
-      const labelForMap = buildLabelForMap(doc);
-      for (const el of rawEls) {
-        if (seen.has(el)) continue;
-        seen.add(el);
-        if (el.closest?.(SP_SEL)) continue;
-        const visible = isVisible(el);
-        if (!visible) continue;
-        const tag = el.tagName ? el.tagName.toLowerCase() : "div";
-        const role = getRole(el);
-        const text = clean(el.innerText || el.textContent || "");
-        const placeholder = clean(el.getAttribute?.("placeholder") || "");
-        const ariaLabel = resolveAccessibleName(el, doc, labelForMap);
-        const value = typeof el.value === "string" ? clean(el.value) : "";
-        const href = clean(el.getAttribute?.("href") || "", 120);
-        const enabled = !el.disabled;
-        const region = getRegion(el);
-        const type = tag === "input" ? clean(el.getAttribute?.("type") || el.type || "", 20) : "";
-        const autocomplete = clean(el.getAttribute?.("autocomplete") || "", 30);
-        const formId = resolveFormId(el, formMap);
-        const context = resolveContext(el, text, ariaLabel);
-        const required = Boolean(el.required) || el.getAttribute?.("required") != null;
-        if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox" && role !== "button") continue;
-        let bbox = null;
-        if (typeof el.getBoundingClientRect === "function") {
-          const r = el.getBoundingClientRect();
-          bbox = { x: Math.round(r.x || r.left || 0), y: Math.round(r.y || r.top || 0), width: Math.round(r.width || 0), height: Math.round(r.height || 0) };
-        }
-        count += 1;
-        const id = `el_${count}`;
-        elements.push({
-          id,
-          role,
-          tag,
-          text,
-          placeholder,
-          ariaLabel,
-          value,
-          href,
-          visible,
-          enabled,
-          region,
-          bbox,
-          type,
-          autocomplete,
-          formId,
-          required,
-          context
-        });
-        if (count >= 300) break;
-      }
-      const sanitizedElements = PrivacySanitizer.sanitizeElements(elements);
-      const sensitiveRegions = PrivacySanitizer.getSensitiveRegions(elements);
-      return {
-        url,
-        title,
-        elements: sanitizedElements,
-        sensitiveRegions,
-        timestamp: Date.now()
-      };
-    }
-    return { extractPageState, clean, getRole, resolveAccessibleName };
-  })();
-  if (typeof globalThis !== "undefined" && globalThis.module) {
-    globalThis.module.exports = PageStateService;
-  }
 
   // extension/shared/state-machine/transitions.js
   var TaskState = Object.freeze({

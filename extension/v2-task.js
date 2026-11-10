@@ -559,6 +559,26 @@ function enrichStepFromPageState(plannerStep, pageState) {
   if (plannerStep.targetElement.region == null && resolvedEl.region) {
     plannerStep.targetElement.region = resolvedEl.region;
   }
+  // The element's identity for the executor (see
+  // ExecutorEngine._resolveElementByIdentity): where it was, which row it sits
+  // in, and which of the same-labelled controls it is. L1/L2 already attach
+  // bbox; a step a model tier built from an elementId (local Qwen) carries only
+  // the id. All of it is read from the same page-state element the step was
+  // grounded against, and never overwrites a value already on the step.
+  const target = plannerStep.targetElement;
+  if (target.bbox == null && resolvedEl.bbox) target.bbox = resolvedEl.bbox;
+  if (target.context == null && resolvedEl.context) target.context = resolvedEl.context;
+  const wanted = (target.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (wanted && target.labelIndex == null) {
+    const named = (e) => [e.text, e.placeholder, e.ariaLabel]
+      .some((v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase() === wanted);
+    const same = pageState.elements.filter(named);
+    const index = same.indexOf(resolvedEl);
+    if (index >= 0) {
+      target.labelIndex = index;
+      target.labelCount = same.length;
+    }
+  }
 }
 // Shared by the STALE_PLAN discard check and the deduplication guard below:
 // does `proposedStep` match one of the most recently completed steps, and
@@ -2243,6 +2263,7 @@ export function __setTabId(id) {
 export { computeExpectedNavigationFromElement as __computeExpectedNavigationFromElement };
 export { deriveSettledSteps as __deriveSettledSteps, stepEffectStillHolds as __stepEffectStillHolds };
 export { isGoalConsumed as __isGoalConsumed };
+export { enrichStepFromPageState as __enrichStepFromPageState };
 export {
   updateRequirementProgress as __updateRequirementProgress,
   remainingRequirementCount as __remainingRequirementCount,
