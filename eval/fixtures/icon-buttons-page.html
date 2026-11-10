@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Toolbar</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .bar { display: flex; gap: 12px; margin: 16px 0; }
+    .bar button { width: 44px; height: 44px; border: 1px solid #888; border-radius: 6px; background: #fff; cursor: pointer; }
+    svg { width: 22px; height: 22px; }
+  </style>
+</head>
+<body>
+  <h1>Toolbar</h1>
+  <p>A row of icon-only buttons. None has visible text or an accessible name.</p>
+  <div class="bar">
+    <button id="info-btn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="#06c" stroke-width="2"/><rect x="11" y="10" width="2" height="7" fill="#06c"/><rect x="11" y="7" width="2" height="2" fill="#06c"/></svg></button>
+    <button id="warning-btn"><svg viewBox="0 0 24 24"><path d="M12 3 L22 20 H2 Z" fill="#fc0" stroke="#a60" stroke-width="2"/><rect x="11" y="9" width="2" height="6" fill="#a60"/><rect x="11" y="16" width="2" height="2" fill="#a60"/></svg></button>
+    <button id="check-btn"><svg viewBox="0 0 24 24"><path d="M4 12 L10 18 L20 6" fill="none" stroke="#080" stroke-width="3"/></svg></button>
+    <button id="close-btn"><svg viewBox="0 0 24 24"><path d="M5 5 L19 19 M19 5 L5 19" fill="none" stroke="#a00" stroke-width="3"/></svg></button>
+  </div>
+</body>
+</html>

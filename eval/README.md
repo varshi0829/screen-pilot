@@ -112,3 +112,7 @@ Model inference times are ScreenPilot's own `qwenLatencyMs` and `visionLatencyMs
 - **Sampling resolution is about 1 s** (CIM queries are slow). Sub-second tasks show up only as the intervals that contain them. Model-inference windows (10–30 s) are well resolved.
 - **Cloud results depend on the cloud backend being reachable during the run.** Every run records which mechanism decided, and local-only accuracy is reported separately.
 - **Viewport and device-scale emulation are deliberately disabled.** With Playwright's `deviceScaleFactor: 1` on a 150%-scaled display, the page reports `devicePixelRatio = 1` while `captureVisibleTab` captures at 1.5×, so production redaction boxes land at ⅔ of their true position. That never happens in a normal Chrome window, including under page zoom. It is recorded as a product assumption: redaction trusts `devicePixelRatio`.
+
+## Known fixture issue
+
+Case `icon-warning-demo-page` in `ground-truth/visual-cases.json` originally pointed at `node_modules/privacy-demo.html`. That file was never committed and no longer exists, so the harness test failed. The case now loads `eval/fixtures/icon-buttons-page.html`, a new icon-only toolbar page whose target is the button with id `warning-btn`. The original page could not be recovered, so the committed results in `results/` and `docs/METRICS.md` for this case were measured on the lost page; re-run `npm run eval:visual` to measure it against the replacement.

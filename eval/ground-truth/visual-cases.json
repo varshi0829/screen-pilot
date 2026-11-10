@@ -34,7 +34,7 @@
       "category": "icon_only",
       "goal": "Click the button with the warning icon",
       "expectedTargetId": "warning-btn",
-      "htmlFile": "node_modules/privacy-demo.html"
+      "htmlFile": "eval/fixtures/icon-buttons-page.html"
     },
     {
       "id": "icon-single-svg-gear",
