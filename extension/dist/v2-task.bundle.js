@@ -1825,9 +1825,10 @@ ${lines.join("\n")}`);
   var QWEN_AVAILABILITY_TIMEOUT_MS = 2500;
   var QWEN_NUM_PREDICT = 48;
   var MAX_ELEMENT_TEXT_CHARS = 80;
+  var MAX_ELEMENT_CONTEXT_CHARS = 60;
   var QWEN_INSTRUCTIONS = `Choose the single next UI action for the goal. Reply with one-line JSON only, e.g.
 {"action":"click","elementId":"e3"}
-action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text), never invented. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
+action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text, plus |context when present), never invented. context is the row or list item the control sits in: use it to choose between controls with the same text. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
   var LocalQwenAdapter = class extends BackendAdapter {
     /**
      * @param {object} [options]
@@ -2095,7 +2096,8 @@ action is click|fill|select|navigate|finish. elementId must be copied exactly fr
       const lines = elements.slice(0, 25).map((e) => {
         const c = toCompactElement(e);
         const text = String(c.sensitive ? c.name : e.text || e.ariaLabel || e.placeholder || "").replace(/\s+/g, " ").slice(0, MAX_ELEMENT_TEXT_CHARS);
-        return `${c.id}|${c.role}|${text}${c.sensitive ? " [sensitive]" : ""}`;
+        const context = c.sensitive ? "" : String(e.context || "").replace(/[|\s]+/g, " ").trim().slice(0, MAX_ELEMENT_CONTEXT_CHARS);
+        return `${c.id}|${c.role}|${text}${context ? `|${context}` : ""}${c.sensitive ? " [sensitive]" : ""}`;
       });
       return `${QWEN_INSTRUCTIONS}
 Goal: "${request.goal}"

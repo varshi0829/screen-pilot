@@ -54,9 +54,13 @@ const QWEN_AVAILABILITY_TIMEOUT_MS  = 2_500;
 // is optional (the adapter falls back to its 0.85 default when omitted).
 const QWEN_NUM_PREDICT       = 48;
 const MAX_ELEMENT_TEXT_CHARS = 80;
+// Row/container context (see page-state-service.js's resolveContext) is already
+// capped at 60 characters at extraction; this only re-bounds it at the prompt
+// boundary so a hand-built element can never inflate the prompt.
+const MAX_ELEMENT_CONTEXT_CHARS = 60;
 const QWEN_INSTRUCTIONS = `Choose the single next UI action for the goal. Reply with one-line JSON only, e.g.
 {"action":"click","elementId":"e3"}
-action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text), never invented. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
+action is click|fill|select|navigate|finish. elementId must be copied exactly from Elements (one per line: id|role|text, plus |context when present), never invented. context is the row or list item the control sits in: use it to choose between controls with the same text. Only for "fill", add "value": the text to enter, taken from the goal's meaning (never an element's own label or the goal sentence). Elements marked [sensitive] never get a value.`;
 
 export class LocalQwenAdapter extends BackendAdapter {
   /**
@@ -402,10 +406,19 @@ export class LocalQwenAdapter extends BackendAdapter {
     // text/value) and is flagged so the model knows not to propose a value.
     // One "id|role|text" line per element: on CPU, prompt evaluation is paid per
     // token, and the JSON-object form spent ~2x the tokens on the same facts.
+    // A fourth "|context" field is appended ONLY when the element carries row/
+    // container context, so two identically-labelled controls in different rows
+    // stay distinguishable while every context-free line is byte-for-byte what
+    // it was. A sensitive element never gets one (its row text can name or
+    // contain the very value the field holds), independent of whether the
+    // input was already sanitized upstream.
     const lines = elements.slice(0, 25).map((e) => {
       const c = toCompactElement(e);
       const text = String(c.sensitive ? c.name : (e.text || e.ariaLabel || e.placeholder || '')).replace(/\s+/g, ' ').slice(0, MAX_ELEMENT_TEXT_CHARS);
-      return `${c.id}|${c.role}|${text}${c.sensitive ? ' [sensitive]' : ''}`;
+      const context = c.sensitive
+        ? ''
+        : String(e.context || '').replace(/[|\s]+/g, ' ').trim().slice(0, MAX_ELEMENT_CONTEXT_CHARS);
+      return `${c.id}|${c.role}|${text}${context ? `|${context}` : ''}${c.sensitive ? ' [sensitive]' : ''}`;
     });
 
     // The static instructions come FIRST and the per-call data LAST, so Ollama's
