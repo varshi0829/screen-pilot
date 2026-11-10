@@ -26,7 +26,7 @@ import { callOpenRouter } from './providers/openrouter';
 import { callGemini } from './providers/gemini';
 import type { CallResult, ProviderResult, RoleSelection, Screenshot } from './types';
 
-export const DEFAULT_OPENROUTER_MODEL = 'google/gemma-4-26b-a4b-it:free';
+export const DEFAULT_OPENROUTER_MODEL = 'google/gemini-2.5-flash';
 export const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 
 // 400/401/403: the request itself is broken — another attempt of the SAME
@@ -134,7 +134,7 @@ export async function runPlannerChain(chain: RoleSelection[], opts: RunChainOpti
       opts.outerSignal.addEventListener('abort', () => local.abort(), { once: true });
 
       const call: CallResult = selection.provider === 'openrouter'
-        ? await callOpenRouter({ key: selection.key, model: selection.model, prompt: opts.prompt, screenshot: opts.screenshot, signal: local.signal })
+        ? await callOpenRouter({ key: selection.key, model: selection.model, prompt: opts.prompt, screenshot: opts.screenshot, signal: local.signal, maxTokens: 2048 })
         : await callGemini({ key: selection.key, model: selection.model, prompt: opts.prompt, screenshot: opts.screenshot, signal: local.signal, temperature: 0.1, maxOutputTokens: 2048 });
       clearTimeout(localTimer);
 

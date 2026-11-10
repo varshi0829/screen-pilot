@@ -91,7 +91,7 @@ describe('/api/health — models reflects real configuration', () => {
     const { GET } = await freshRoute('health');
     await withEnv({ OPENROUTER_API_KEY: OR_KEY }, async () => {
       const b = await (await GET()).json();
-      assert.deepEqual(b.models, ['google/gemma-4-26b-a4b-it:free']);
+      assert.deepEqual(b.models, ['google/gemini-2.5-flash']);
     });
   });
 
@@ -130,7 +130,7 @@ describe('error responses reflect the provider that actually failed', () => {
       const { POST } = await freshRoute('plan');
       const b = await (await POST(post(planBody()))).json();
       assert.equal(b.providerMetadata.provider, 'openrouter');
-      assert.equal(b.providerMetadata.model, 'google/gemma-4-26b-a4b-it:free');
+      assert.equal(b.providerMetadata.model, 'google/gemini-2.5-flash');
     });
   });
 

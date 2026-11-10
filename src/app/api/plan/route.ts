@@ -304,7 +304,7 @@ export async function POST(req: NextRequest) {
     logEvent("plan_failed", { reqId, provider: failedProvider, model: failedModel, latencyMs: Date.now() - t0, upstreamStatus: chainResult.status, success: false });
 
     // Reproduces the exact pre-refactor per-provider status mapping:
-    //   OpenRouter — any failure -> 502 UPSTREAM_ERROR.
+    //   OpenRouter — 429 -> 429 QUOTA_EXCEEDED; any other failure -> 502 UPSTREAM_ERROR.
     //   Gemini     — 429 -> 429 QUOTA_EXCEEDED (never retried, handled inside
     //                the chain); a fatal 400/401/403 -> 502 UPSTREAM_ERROR;
     //                anything else (timeout/5xx, already retried once inside
@@ -319,6 +319,10 @@ export async function POST(req: NextRequest) {
           { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });
       }
       return errorResponse(reqId, "Analysis timed out — please try again.", "TIMEOUT", 504, t0, failedProvider, failedModel);
+    }
+    if (failedProvider === "openrouter" && chainResult.status === 429) {
+      return errorResponse(reqId, chainResult.message, "QUOTA_EXCEEDED", 429, t0, failedProvider, failedModel,
+        { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });
     }
     return errorResponse(reqId, chainResult.message, "UPSTREAM_ERROR", 502, t0, failedProvider, failedModel,
       { provider: failedProvider, upstreamStatus: chainResult.status, message: chainResult.message });

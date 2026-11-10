@@ -15,7 +15,7 @@ import {
 
 const OR_KEY = 'test-or-key-0123456789';
 const GEM_KEY = 'test-gem-key-0123456789';
-const OR_MODEL = 'google/gemma-4-26b-a4b-it:free';
+const OR_MODEL = 'google/gemini-2.5-flash';
 
 let con;
 let net;
@@ -123,7 +123,7 @@ describe('/api/plan — request handling', () => {
 });
 
 describe('/api/plan — provider selection and upstream request', () => {
-  test('OPENROUTER_API_KEY set → OpenRouter, gemma model, bearer auth, text+image, temp 0.1, max_tokens 768', async () => {
+  test('OPENROUTER_API_KEY set → OpenRouter, default model, bearer auth, text+image, temp 0.1, max_tokens 2048', async () => {
     await withEnv({ OPENROUTER_API_KEY: OR_KEY, GEMINI_API_KEY: GEM_KEY }, async () => {
       net = stubFetch(() => openRouterOk());
       const { POST } = await freshRoute('plan');
@@ -135,7 +135,7 @@ describe('/api/plan — provider selection and upstream request', () => {
       assert.equal(call.headers.authorization, `Bearer ${OR_KEY}`);
       assert.equal(call.body.model, OR_MODEL);
       assert.equal(call.body.temperature, 0.1);
-      assert.equal(call.body.max_tokens, 768);
+      assert.equal(call.body.max_tokens, 2048);
       const parts = call.body.messages[0].content;
       assert.deepEqual(parts.map((p) => p.type), ['text', 'image_url']);
       assert.equal(parts[1].image_url.url, 'data:image/jpeg;base64,QUJD');
@@ -283,18 +283,18 @@ describe('/api/plan — upstream failures', () => {
     });
   });
 
-  test('OpenRouter 429 (quota) → still 502 UPSTREAM_ERROR, NOT top-level 429 — only Gemini surfaces 429', async () => {
-    // Pinning a real quirk of the current implementation: 429 is not in
-    // FATAL_UPSTREAM_STATUS, so the OpenRouter models loop just exhausts (only
-    // one model configured) and falls through to the generic 502 UPSTREAM_ERROR
-    // path, with the real 429 preserved only in upstreamStatus.
+  test('OpenRouter 429 (quota) → top-level 429 QUOTA_EXCEEDED, same as Gemini, with no retry', async () => {
+    // Intentional behaviour: the planner chain now surfaces an OpenRouter quota
+    // error as 429 QUOTA_EXCEEDED so the extension can tell "rate limited" from
+    // a generic upstream failure (see src/app/api/plan/route.ts). Other
+    // OpenRouter failures remain 502 UPSTREAM_ERROR (tests above and below).
     await withEnv({ OPENROUTER_API_KEY: OR_KEY }, async () => {
       net = stubFetch(() => upstreamError(429, 'rate limited'));
       const { POST } = await freshRoute('plan');
       const res = await POST(post(planBody()));
-      assert.equal(res.status, 502);
+      assert.equal(res.status, 429);
       const b = await json(res);
-      assert.equal(b.errorCode, 'UPSTREAM_ERROR');
+      assert.equal(b.errorCode, 'QUOTA_EXCEEDED');
       assert.equal(b.upstreamStatus, 429);
       assert.equal(net.calls.length, 1, 'no retry on OpenRouter, even for 429');
     });
