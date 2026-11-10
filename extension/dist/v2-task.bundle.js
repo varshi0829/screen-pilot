@@ -89,6 +89,15 @@
   var PRIVATE_KEY_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
   var ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|(?:access|auth|refresh|id)[_-]?token|token)\b\s*[:=]\s*["']?([^\s"'&;,<>]{6,})/gid;
   var SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
+  var PASSWORD_WORD = "(?:password|passcode|passwd|pwd)";
+  var QUOTED_PASSWORD_RE = new RegExp(`\\b${PASSWORD_WORD}\\b(?:\\s*[:=]\\s*|\\s+(?:is\\s+)?)(["'\u201C\u2018])([^"'\u201D\u2019\\n]{3,}?)["'\u201D\u2019]`, "gid");
+  var CUED_PASSWORD_RE = new RegExp(`\\b(?:with|using|use|enter|entering|type|typing|input)\\s+(?:(?:the|my|your|a|this)\\s+)?${PASSWORD_WORD}\\s+(?:(?:is|of)\\s+)?([^\\s"'\u201C\u201D\u2018\u2019<>]{3,})`, "gid");
+  var NOT_A_CREDENTIAL = new Set("manager managers field fields input inputs box boxes reset page pages form forms button buttons link links recovery strength hint hints visibility toggle requirements requirement policy policies change changes setting settings protected protection authentication login logins sign screen prompt dialog text textbox label labels entry validation rules criteria generator vault only and then for the into onto that this instead when from after before again also but not are was will can has have been being than with without update confirm confirmation saved save show hide reveal check checkbox step steps flow option options method auth based less free credentials credential error errors message messages dropdown menu tab section modal popup first second next previous please".split(" "));
+  function looksLikeCredential(token) {
+    if (/[0-9]/.test(token) || /[^A-Za-z0-9]/.test(token.replace(/[.!?]+$/, "")) || /[a-z][A-Z]/.test(token)) return true;
+    const word = token.replace(/[.!?]+$/, "").toLowerCase();
+    return word.length >= 4 && !NOT_A_CREDENTIAL.has(word);
+  }
   var CARD_RE = /\b\d(?:[ -]?\d){12,18}\b/g;
   var SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
   var EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
@@ -143,8 +152,13 @@
     scan(PRIVATE_KEY_RE, T.SECRET);
     scan(JWT_RE, T.JWT);
     API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
+    scanAssignments(QUOTED_PASSWORD_RE, () => T.PASSWORD);
     scanAssignments(ASSIGNMENT_RE, assignmentType);
     scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
+    CUED_PASSWORD_RE.lastIndex = 0;
+    for (let m; (m = CUED_PASSWORD_RE.exec(text)) !== null; ) {
+      if (looksLikeCredential(m[1])) add(T.PASSWORD, m.indices[1][0], m.indices[1][1]);
+    }
     scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
     scan(SSN_RE, T.SSN);
     scan(EMAIL_RE, T.EMAIL);
@@ -192,6 +206,9 @@
       ...el,
       text: el.text ? REDACTED : el.text,
       value: el.value ? REDACTED : el.value,
+      // Surrounding-row text is dropped outright for a sensitive field — it can
+      // name or contain the very value that field holds.
+      ...el.context ? { context: "" } : {},
       sensitive: true,
       sensitiveType
     };
@@ -583,16 +600,7 @@
           lastFailureReason = `Candidate score ${score} below RECOVERY threshold \u2014 skipped as noise`;
           continue;
         }
-        {
-          const tag = element.tagName?.toLowerCase() ?? "?";
-          const text = (element.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 50);
-          const ariaLabel = element.getAttribute?.("aria-label") ?? "";
-          const id = element.id ?? "";
-          const cls = (typeof element.className === "string" ? element.className : "").slice(0, 60);
-          console.log(
-            `[SP:Exec] Candidate ${_ci + 1}/${allCandidates.length} score=${score} <${tag}> id="${id}" class="${cls}" text="${text}" aria-label="${ariaLabel}"`
-          );
-        }
+        console.log(`[SP:Exec] Candidate ${_ci + 1}/${allCandidates.length} score=${score} <${element.tagName?.toLowerCase() ?? "?"}>`);
         const check = this._selfCheck(element);
         console.log(`[SP:Exec] _selfCheck \u2192 ok=${check.ok}${check.ok ? "" : ' reason="' + check.reason + '"'}`);
         if (!check.ok) {
@@ -684,12 +692,10 @@
     _resolveElement(step) {
       if (!step.targetElement) return null;
       console.log("[SP:Target]", {
-        text: step.targetElement?.text,
         type: step.targetElement?.type,
         region: step.targetElement?.region,
-        alternatives: step.targetElement?.alternatives,
-        elementId: step.targetElement?.elementId,
-        bbox: step.targetElement?.bbox
+        hasElementId: !!step.targetElement?.elementId,
+        hasBbox: !!step.targetElement?.bbox
       });
       if (!step.targetElement.text?.trim() && step.targetElement.elementId && step.targetElement.bbox) {
         const positional = this._resolveElementByPosition(step.targetElement);
@@ -784,7 +790,7 @@
       const lines = candidates.map(
         (c, i) => `  [${i + 1}] score=${c.score} type=${c.matchType} \u2014 ${c.reason}`
       );
-      console.log(`[ExecutorEngine] ${candidates.length} candidates for "${targetText}":
+      console.log(`[ExecutorEngine] ${candidates.length} candidates:
 ${lines.join("\n")}`);
     }
     // ── Private — user action detection ──────────────────────────────────────
@@ -831,25 +837,6 @@ ${lines.join("\n")}`);
         const fieldValue = (el) => el.isContentEditable === true ? el.textContent ?? "" : el.value ?? "";
         let fillIdleTimer = null;
         const handleFieldEvent = (e, eventKind) => {
-          console.log("[SP:FILL] activeElement", {
-            tag: this._activeElement?.tagName,
-            id: this._activeElement?.id,
-            className: this._activeElement?.className
-          });
-          console.log("[SP:FILL] target", {
-            tag: e.target?.tagName,
-            id: e.target?.id,
-            className: e.target?.className
-          });
-          console.log("[SP:FILL] contains", {
-            result: this._activeElement?.contains?.(e.target)
-          });
-          console.log("[SP:FILL] isTextLikeField", {
-            result: isTextLikeField(e.target)
-          });
-          console.log("[SP:FILL] value", {
-            value: fieldValue(e.target)
-          });
           if (!this._activeElement) return;
           const field = e.target;
           if (!this._activeElement.contains(field)) return;
@@ -858,7 +845,7 @@ ${lines.join("\n")}`);
           const requested = (step.targetElement?.value ?? "").trim();
           const settle = (reason) => {
             clearTimeout(fillIdleTimer);
-            console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} value="${fieldValue(field)}"`);
+            console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} valueLen=${fieldValue(field).length}`);
             onUserAction("input", fieldValue(field));
           };
           if (requested) {
@@ -1332,6 +1319,49 @@ ${lines.join("\n")}`);
       if (!formMap.map.has(form)) formMap.map.set(form, `form_${formMap.count++}`);
       return formMap.map.get(form);
     }
+    const CONTEXT_MAX_LEN = 60;
+    const CONTEXT_MAX_RAW = 400;
+    const CONTEXT_MAX_DEPTH = 8;
+    const CONTEXT_MAX_CONTROLS = 12;
+    const ROW_SELECTOR = 'li, tr, article, [role="listitem"], [role="row"], [role="option"], [role="treeitem"], [role="article"]';
+    const REGION_TAGS = /* @__PURE__ */ new Set(["BODY", "HTML", "MAIN", "NAV", "HEADER", "FOOTER", "ASIDE", "FORM", "SECTION"]);
+    const CONTROL_SELECTOR = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], summary';
+    function removeOwnLabel(text, label) {
+      const needle = (label || "").trim().toLowerCase();
+      if (!needle) return text;
+      let out = text;
+      let idx = out.toLowerCase().indexOf(needle);
+      while (idx !== -1) {
+        out = out.slice(0, idx) + " " + out.slice(idx + needle.length);
+        idx = out.toLowerCase().indexOf(needle);
+      }
+      return out;
+    }
+    function isRowLike(node) {
+      if (typeof node.matches === "function" && node.matches(ROW_SELECTOR)) return true;
+      const parent = node.parentElement;
+      const siblings = parent?.children;
+      if (!siblings || siblings.length < 2) return false;
+      let same = 0;
+      for (const sib of siblings) {
+        if (sib.tagName === node.tagName && (sib.className || "") === (node.className || "")) same += 1;
+        if (same >= 2) return true;
+      }
+      return false;
+    }
+    function resolveContext(el, ownText, ownLabel) {
+      let node = el.parentElement;
+      for (let depth = 0; node && depth < CONTEXT_MAX_DEPTH; depth++, node = node.parentElement) {
+        if (REGION_TAGS.has(node.tagName)) return "";
+        const controls = typeof node.querySelectorAll === "function" ? node.querySelectorAll(CONTROL_SELECTOR).length : 0;
+        if (controls > CONTEXT_MAX_CONTROLS) return "";
+        if (!isRowLike(node)) continue;
+        const raw = clean(node.innerText || node.textContent || "", CONTEXT_MAX_RAW);
+        const remaining = clean(removeOwnLabel(removeOwnLabel(raw, ownText), ownLabel), CONTEXT_MAX_LEN);
+        if (remaining) return redactText(remaining);
+      }
+      return "";
+    }
     function getRegion(el) {
       if (!el || typeof el.closest !== "function") return "main_content";
       if (el.closest('nav, header, [role="banner"], [role="navigation"]')) return "top_navigation";
@@ -1371,6 +1401,7 @@ ${lines.join("\n")}`);
         const type = tag === "input" ? clean(el.getAttribute?.("type") || el.type || "", 20) : "";
         const autocomplete = clean(el.getAttribute?.("autocomplete") || "", 30);
         const formId = resolveFormId(el, formMap);
+        const context = resolveContext(el, text, ariaLabel);
         const required = Boolean(el.required) || el.getAttribute?.("required") != null;
         if (!text && !placeholder && !ariaLabel && !value && !href && role !== "textbox" && role !== "button") continue;
         let bbox = null;
@@ -1396,7 +1427,8 @@ ${lines.join("\n")}`);
           type,
           autocomplete,
           formId,
-          required
+          required,
+          context
         });
         if (count >= 300) break;
       }
@@ -1440,6 +1472,10 @@ ${lines.join("\n")}`);
       }
       return 0;
     }
+    const CONTEXT_CREDIT = 0.5;
+    function elementContextTokens(el) {
+      return new Set(tokenize(el.context || ""));
+    }
     function elementLabelTokens(el) {
       const textTokens = tokenize(el.text || "");
       const placeTokens = tokenize(el.placeholder || "");
@@ -1447,7 +1483,7 @@ ${lines.join("\n")}`);
       const valTokens = tokenize(el.value || "");
       return /* @__PURE__ */ new Set([...textTokens, ...placeTokens, ...ariaTokens, ...valTokens]);
     }
-    function computeIdf(elementTokenSets) {
+    function computeIdf(elementTokenSets, contextTokenSets = []) {
       const df = /* @__PURE__ */ new Map();
       for (const tokens of elementTokenSets) {
         for (const t of tokens) {
@@ -1459,7 +1495,17 @@ ${lines.join("\n")}`);
       for (const [t, d] of df) {
         idf.set(t, Math.log((n + 1) / (d + 1)) + 1);
       }
-      return { idf, df };
+      const ctxDf = /* @__PURE__ */ new Map();
+      for (const tokens of contextTokenSets) {
+        for (const t of tokens) {
+          ctxDf.set(t, (ctxDf.get(t) || 0) + 1);
+        }
+      }
+      const ctxIdf = /* @__PURE__ */ new Map();
+      for (const [t, d] of ctxDf) {
+        ctxIdf.set(t, Math.log((n + 1) / (d + 1)) + 1);
+      }
+      return { idf, df, ctxIdf, ctxDf };
     }
     function scoreElement(intent, el, corpus = null) {
       if (!el || !el.visible || el.enabled === false) return 0;
@@ -1467,11 +1513,16 @@ ${lines.join("\n")}`);
       if (!intentTokens.length) return 0;
       const elTokens = elementLabelTokens(el);
       if (!elTokens.size) return 0;
-      const { idf, df } = corpus || computeIdf([elTokens]);
+      const ctxTokens = elementContextTokens(el);
+      const { idf, df, ctxIdf, ctxDf } = corpus || computeIdf([elTokens], [ctxTokens]);
       const scorableTokens = [];
       for (const t of intentTokens) {
         if ((df.get(t) || 0) > 0) {
           scorableTokens.push({ token: t, weight: idf.get(t) || 1 });
+          continue;
+        }
+        if ((ctxDf.get(t) || 0) > 0) {
+          scorableTokens.push({ token: t, weight: ctxIdf.get(t) || 1 });
           continue;
         }
         let best = null;
@@ -1487,7 +1538,9 @@ ${lines.join("\n")}`);
       let matchedWeight = 0;
       for (const { token, weight } of scorableTokens) {
         totalWeight += weight;
-        matchedWeight += weight * matchStrength(token, elTokens);
+        let strength = matchStrength(token, elTokens);
+        if (strength < CONTEXT_CREDIT && ctxTokens.has(token)) strength = CONTEXT_CREDIT;
+        matchedWeight += weight * strength;
       }
       if (totalWeight <= 0) return 0;
       const coverage = matchedWeight / totalWeight;
@@ -1510,7 +1563,7 @@ ${lines.join("\n")}`);
     function rankElements(intent, elements) {
       if (!Array.isArray(elements) || !elements.length) return [];
       const elementTokenSets = elements.map((el) => elementLabelTokens(el));
-      const corpus = computeIdf(elementTokenSets);
+      const corpus = computeIdf(elementTokenSets, elements.map((el) => elementContextTokens(el)));
       const scored = elements.map((el) => ({
         element: el,
         score: scoreElement(intent, el, corpus)
@@ -1520,9 +1573,10 @@ ${lines.join("\n")}`);
     function assessGrounding(intent, elements) {
       const ranked = rankElements(intent, elements);
       const list = Array.isArray(elements) ? elements : [];
-      const { df } = computeIdf(list.map((el) => elementLabelTokens(el)));
+      const { df, ctxDf } = computeIdf(list.map((el) => elementLabelTokens(el)), list.map((el) => elementContextTokens(el)));
       const unmatchedIntentTokens = tokenize(intent).filter((t) => {
         if ((df.get(t) || 0) > 0) return false;
+        if ((ctxDf.get(t) || 0) > 0) return false;
         for (const pageToken of df.keys()) if (morphRelated(t, pageToken)) return false;
         return true;
       });
@@ -2439,6 +2493,17 @@ Return JSON ONLY:
     return `Enter your ${p.noun} in the highlighted field yourself \u2014 ScreenPilot never reads, stores, or types it.`;
   }
   var POLICY_TYPES = Object.freeze(Object.keys(POLICY));
+  function redactSecrets(text, replacement = "[REDACTED]") {
+    if (typeof text !== "string" || !text) return text;
+    let out = "";
+    let last = 0;
+    for (const span of findPII(text)) {
+      if (outboundHandling(span.type) !== Outbound.REDACT) continue;
+      out += text.slice(last, span.start) + replacement;
+      last = span.end;
+    }
+    return out + text.slice(last);
+  }
 
   // extension/lib/pii-vault.js
   var TOKEN_LABEL = { [SensitiveType.EMAIL]: "EMAIL", [SensitiveType.PHONE]: "PHONE" };
@@ -3619,7 +3684,7 @@ Return JSON ONLY:
         if (!signal?.text) continue;
         const ranked = UIGroundingService.rankElements(signal.text, unaddressed);
         if (ranked.length) {
-          console.log(`[SP:DecisionRouter] Structural continuation deferred \u2014 unsatisfied requirement "${signal.text}" matches unaddressed elementId=${ranked[0].element.id} (score=${ranked[0].score.toFixed(3)})`);
+          console.log(`[SP:DecisionRouter] Structural continuation deferred \u2014 unsatisfied requirement "${redactText(signal.text)}" matches unaddressed elementId=${ranked[0].element.id} (score=${ranked[0].score.toFixed(3)})`);
           return this._buildPlanFromElement(signal.text, ranked[0].element, ranked[0].score, "ml_grounding");
         }
       }
@@ -4624,7 +4689,7 @@ Return JSON ONLY:
       return false;
     }
     _state = to;
-    const detail = Object.entries(meta).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+    const detail = Object.entries(meta).map(([k, v]) => `${k}=${redactText(String(JSON.stringify(v)))}`).join(" ");
     console.log(`[SP:V2] [${ts()}] STATE ${from} \u2192 ${to}  event=${event}${detail ? "  " + detail : ""}`);
     return true;
   }
@@ -5534,13 +5599,11 @@ Return JSON ONLY:
       const inTokens = planResp.providerMetadata?.inputTokens ?? "?";
       const outTokens = planResp.providerMetadata?.outputTokens ?? "?";
       console.log(`[SP:V2:PERF] cycleMs=${cycleMs}ms screenshotMs=${screenshotMs}ms reqMs=${reqMs}ms model=${modelUsed} inTokens=${inTokens} outTokens=${outTokens}`);
-      console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${planResp.plannerSummary ?? ""}"`);
+      console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${redactText(planResp.plannerSummary ?? "")}"`);
       if (planResp.plan?.steps?.length) {
         const s0 = planResp.plan.steps[0];
         console.log(`[SP:V2:DIAG] Planner step[0]:`, {
           intent: s0.intent,
-          description: s0.description,
-          targetText: s0.targetElement?.text,
           completionCondition: s0.completionCondition,
           urlChanges: s0.expectedPageState?.urlChanges,
           urlPattern: s0.expectedPageState?.urlPattern
@@ -6136,7 +6199,8 @@ Return JSON ONLY:
     _state = TaskState.PAUSED;
     applyEvent(TaskEvent.CANCEL_CLICKED);
   }
-  async function _startNewTask(goal) {
+  async function _startNewTask(rawGoal) {
+    const goal = redactSecrets(rawGoal);
     if (!_tabId) {
       console.error("[SP:V2] Tab ID not resolved \u2014 cannot start task");
       return;

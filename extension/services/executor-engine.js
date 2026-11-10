@@ -309,32 +309,19 @@ export class ExecutorEngine {
         continue;
       }
 
-      // ── [DIAG] Candidate identity ──────────────────────────────────────
-      {
-        const tag       = element.tagName?.toLowerCase() ?? '?';
-        const text      = (element.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 50);
-        const ariaLabel = element.getAttribute?.('aria-label') ?? '';
-        const id        = element.id ?? '';
-        const cls       = (typeof element.className === 'string' ? element.className : '').slice(0, 60);
-        console.log(
-          `[SP:Exec] Candidate ${_ci + 1}/${allCandidates.length} score=${score}` +
-          ` <${tag}> id="${id}" class="${cls}"` +
-          ` text="${text}" aria-label="${ariaLabel}"`
-        );
-      }
+      console.log(`[SP:Exec] Candidate ${_ci + 1}/${allCandidates.length} score=${score} <${element.tagName?.toLowerCase() ?? '?'}>`);
 
       // ── 3. Pre-highlight self-check ────────────────────────────────────
       // Element may have been detached, disabled, or hidden by a React/Vue
       // re-render in the microtask(s) between resolution and this check.
       const check = this._selfCheck(element);
-      // ── [DIAG] Self-check result ───────────────────────────────────────
       console.log(`[SP:Exec] _selfCheck → ok=${check.ok}${check.ok ? '' : ' reason="' + check.reason + '"'}`);
       if (!check.ok) {
         lastFailureReason = `Self-check failed before highlight: ${check.reason}`;
         continue;
       }
 
-      // ── [DIAG] Pre-show element state ─────────────────────────────────
+      // Pre-show element state (geometry/flags only — no page content).
       {
         let rect = null;
         try { rect = element.getBoundingClientRect?.(); } catch { /* ignore */ }
@@ -351,7 +338,6 @@ export class ExecutorEngine {
 
       // ── 4. Highlight the element ───────────────────────────────────────
       const shown = await this._highlighter.show(element, step.description);
-      // ── [DIAG] Show result ────────────────────────────────────────────
       console.log(`[SP:Exec] highlighter.show() → ${shown}`);
 
       // Guard: abort() or a second start() may have changed status during the await.
@@ -440,12 +426,10 @@ export class ExecutorEngine {
     if (!step.targetElement) return null;
 
     console.log('[SP:Target]', {
-      text: step.targetElement?.text,
       type: step.targetElement?.type,
       region: step.targetElement?.region,
-      alternatives: step.targetElement?.alternatives,
-      elementId: step.targetElement?.elementId,
-      bbox: step.targetElement?.bbox
+      hasElementId: !!step.targetElement?.elementId,
+      hasBbox: !!step.targetElement?.bbox
     });
 
     // A resolved element with no accessible name at all (see
@@ -589,7 +573,7 @@ export class ExecutorEngine {
     const lines = candidates.map((c, i) =>
       `  [${i + 1}] score=${c.score} type=${c.matchType} — ${c.reason}`
     );
-    console.log(`[ExecutorEngine] ${candidates.length} candidates for "${targetText}":\n${lines.join('\n')}`);
+    console.log(`[ExecutorEngine] ${candidates.length} candidates:\n${lines.join('\n')}`);
   }
 
   // ── Private — user action detection ──────────────────────────────────────
@@ -659,30 +643,6 @@ export class ExecutorEngine {
       let fillIdleTimer = null;
 
       const handleFieldEvent = (e, eventKind) => {
-        // [SP:FILL] diagnostic instrumentation — debug-only, no logic change.
-        // Logged unconditionally, before any guard below, so every guard's inputs
-        // are visible on every input/change dispatch regardless of which guard
-        // (if any) rejects the event.
-        console.log("[SP:FILL] activeElement", {
-          tag: this._activeElement?.tagName,
-          id: this._activeElement?.id,
-          className: this._activeElement?.className
-        });
-        console.log("[SP:FILL] target", {
-          tag: e.target?.tagName,
-          id: e.target?.id,
-          className: e.target?.className
-        });
-        console.log("[SP:FILL] contains", {
-          result: this._activeElement?.contains?.(e.target)
-        });
-        console.log("[SP:FILL] isTextLikeField", {
-          result: isTextLikeField(e.target)
-        });
-        console.log("[SP:FILL] value", {
-          value: fieldValue(e.target)
-        });
-
         if (!this._activeElement) return;
         const field = e.target;
         // The event must originate at (or inside) the highlighted target, and land
@@ -705,7 +665,7 @@ export class ExecutorEngine {
         const requested = (step.targetElement?.value ?? '').trim();
         const settle = (reason) => {
           clearTimeout(fillIdleTimer);
-          console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} value="${fieldValue(field)}"`);
+          console.log(`[SP:FILL] USER_ACTION_EMITTED reason=${reason} valueLen=${fieldValue(field).length}`);
           onUserAction('input', fieldValue(field));
         };
 

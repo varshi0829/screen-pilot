@@ -452,8 +452,8 @@
 
     // Primary match: high-confidence DOM hit
     if (match?.element && match.score >= PLAN_STEP_MIN_SCORE) {
-      console.log(`[Plan] Step ${nextIdx} found: "${step.description}" (DOM score: ${match.score})`);
-      console.log(`[Transition] Chosen: "${step.expectedElement.text}", Score: ${match.score}, State: ${step.state}`);
+      console.log(`[Plan] Step ${nextIdx} found: [${String(step.description).length} chars] (DOM score: ${match.score})`);
+      console.log(`[Transition] Chosen: [${String(step.expectedElement.text).length} chars], Score: ${match.score}, State: ${step.state}`);
       _emitDebug('PLAN_STEP_PRIMARY', { stepIndex: nextIdx, score: match.score, description: step.description });
       chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED' }).catch(() => {});
       return { element: match.element, step, stepIndex: nextIdx, matchScore: match.score };
@@ -474,7 +474,7 @@
     // Recovery tier 2: semantic token search on visible interactive elements
     const recovered = findBySemanticSearch(step.description, step.expectedElement?.type);
     if (recovered) {
-      console.log(`[Plan] Step ${nextIdx} recovered via semantic search: "${recovered.textContent?.trim().slice(0, 40)}"`);
+      console.log(`[Plan] Step ${nextIdx} recovered via semantic search: [${String(recovered.textContent?.trim().slice(0, 40)).length} chars]`);
       _emitDebug('PLAN_STEP_RECOVERY_2', { stepIndex: nextIdx, score: PLAN_RECOVERY_MIN_SCORE, description: step.description });
       chrome.runtime.sendMessage({ type: 'TELEMETRY_EVENT', event: 'PLAN_STEP_RECOVERED', detail: { stepIndex: nextIdx, score: PLAN_RECOVERY_MIN_SCORE, description: step.description, recoveryTier: 'semantic' } }).catch(() => {});
       return { element: recovered, step, stepIndex: nextIdx, matchScore: PLAN_RECOVERY_MIN_SCORE };
@@ -1237,7 +1237,7 @@
         const geminiMs = Math.round(performance.now() - t0Gemini);
         PerfTracer.mark('gemini_roundtrip');
         console.log(`[Perf] Gemini+screenshot: ${geminiMs}ms`);
-        console.log(`[PostClick] Gemini RESPONSE: success=${response?.success} complete=${response?.complete} currentStep="${response?.state?.currentStep || response?.currentStep || '(none)'}" instruction="${(response?.instruction || '').slice(0, 80)}" confidence=${response?.confidence} candidates=${response?.candidates?.length ?? 0}`);
+        console.log(`[PostClick] Gemini RESPONSE: success=${response?.success} complete=${response?.complete} currentStep=[${String(response?.state?.currentStep || response?.currentStep || '(none)').length} chars] instruction=[${String((response?.instruction || '').slice(0, 80)).length} chars] confidence=${response?.confidence} candidates=${response?.candidates?.length ?? 0}`);
         console.log(
           `[SP:TRACE] ──── GEMINI_RECV #${_geminiCallSeq} ────` +
           ` latency=${geminiMs}ms` +
@@ -1295,7 +1295,7 @@
       }
 
       if (response.complete) {
-        console.log(`[PostClick] GOAL COMPLETE: instruction="${response.instruction}" — calling completeWorkflow`);
+        console.log(`[PostClick] GOAL COMPLETE: instruction=[${String(response.instruction).length} chars] — calling completeWorkflow`);
         state.currentTaskState = response?.state || state.currentTaskState;
         hideStages();
         completeWorkflow(response.instruction || 'Task complete');
@@ -1327,7 +1327,7 @@
       // Handle case where Gemini found no candidates AND no targetElement
       if (!plannerResult && !response.targetElement?.text) {
         console.log('[UniversalPlanner] No candidates and no targetElement - Gemini could not identify elements');
-        console.warn(`[PostClick] NO ELEMENT: no candidates and no targetElement — instruction="${(response?.instruction || '').slice(0, 80)}"`);
+        console.warn(`[PostClick] NO ELEMENT: no candidates and no targetElement — instruction=[${String((response?.instruction || '').slice(0, 80)).length} chars]`);
         hideStages();
         setStatus('ERROR', 'Could not identify any actionable elements on this page.');
         return;
@@ -1413,7 +1413,7 @@
 
       if (!finalElement) {
         console.log('[UniversalPlanner] No element found for:', response.targetElement?.text);
-        console.warn(`[PostClick] DOM MATCH FAILED: targetText="${response.targetElement?.text}" instruction="${(response?.instruction || '').slice(0, 80)}" source=${actionSource} — will show ERROR`);
+        console.warn(`[PostClick] DOM MATCH FAILED: targetText=[${String(response.targetElement?.text).length} chars] instruction=[${String((response?.instruction || '').slice(0, 80)).length} chars] source=${actionSource} — will show ERROR`);
         hideStages();
         setStatus('ERROR', buildMissingElementMessage(response.targetElement));
         return;
@@ -1436,7 +1436,7 @@
       state.currentAction    = response;
       state.confidenceLevel  = getConfidenceLevel(response.confidence);
 
-      console.log(`[PostClick] ADVANCED: instruction="${finalInstruction.slice(0, 80)}" source=${actionSource} completedSteps=${response?.state?.completedSteps?.length ?? 0}`);
+      console.log(`[PostClick] ADVANCED: instruction=[${String(finalInstruction.slice(0, 80)).length} chars] source=${actionSource} completedSteps=${response?.state?.completedSteps?.length ?? 0}`);
       finishAllStages();
       setTimeout(hideStages, 600);
       setStatus('HIGHLIGHTING', finalInstruction);
@@ -1523,8 +1523,8 @@
     if (reason === 'Click detected') {
       const planStep = tryPlanStep();
       if (planStep) {
-        console.log(`[Transition] SUCCESS: Next step found, executing: "${planStep.step.description}"`);
-        console.log(`[PostClick] triggerReanalysis: PLAN path — step="${planStep.step.description}" score=${planStep.matchScore}`);
+        console.log(`[Transition] SUCCESS: Next step found, executing: [${String(planStep.step.description).length} chars]`);
+        console.log(`[PostClick] triggerReanalysis: PLAN path — step=[${String(planStep.step.description).length} chars] score=${planStep.matchScore}`);
         _trace('TRIGGER', { reason, path: 'PLAN_STEP', extra: `step="${planStep.step.description}" score=${planStep.matchScore}` });
         state.awaitingUpdate     = true;
         state.requestInFlight    = true;

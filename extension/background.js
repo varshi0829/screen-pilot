@@ -8,6 +8,7 @@ import { ValidationService }   from './services/validation-service.js';
 import { NavigationPlanner }  from './services/navigation-planner.js';
 import { handleOllamaGenerate, handleOllamaCheck, handleOllamaCancel } from './services/ollama-proxy.js';
 import { sendWithRetry } from './services/message-retry.js';
+import { redactSecrets } from './lib/sensitive-policy.js';
 
 const DEBUG = false;
 
@@ -25,6 +26,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleMessage(message, sender) {
+  // Goal text can contain a typed credential; strip secrets before any storage/log/request.
+  if (typeof message?.goal === 'string') message.goal = redactSecrets(message.goal);
   await ensureInitialized();
   if (!StateManager.getState()) await StateManager.restore();
 
@@ -121,7 +124,7 @@ async function analyzeGoal(message, sender) {
 
 async function reanalyzeGoal(message, sender) {
   const taskState = StateManager.getState();
-  console.log(`[PostClick] reanalyzeGoal: status=${taskState?.status} goal="${(taskState?.goal || '').slice(0, 60)}" reason="${message.reason}"`);
+  console.log(`[PostClick] reanalyzeGoal: status=${taskState?.status} goal=[${String((taskState?.goal || '').slice(0, 60)).length} chars] reason="${message.reason}"`);
   console.log(`[SP:TRACE:BG] REANALYZE_GOAL reason="${message.reason}" status=${taskState?.status} url="${message.url||'?'}"`);
   if (!taskState?.goal || taskState.status !== 'ACTIVE') {
     console.warn(`[PostClick] reanalyzeGoal BLOCKED: status=${taskState?.status} goal=${!!taskState?.goal} — returning error to content.js`);
@@ -170,7 +173,7 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   const t0     = Date.now();
   const taskId = StateManager.getState()?.taskId;
   console.log(`[CALL #${++_bgCallSeq}] reason=${reason}`);
-  console.log(`[SP:TRACE:BG] RUN_CYCLE #${_bgCallSeq} reason=${reason} goal="${goal.slice(0,60)}" url="${pageContext.url||'?'}" taskId=${taskId||'none'}`);
+  console.log(`[SP:TRACE:BG] RUN_CYCLE #${_bgCallSeq} reason=${reason} goal=[${String(goal.slice(0,60)).length} chars] url="${pageContext.url||'?'}" taskId=${taskId||'none'}`);
   log('cycle start — reason:', reason);
 
   // Capture progress snapshot before calling Gemini so we can measure advancement.
@@ -329,13 +332,13 @@ async function runVisionCycle({ goal, sender, pageContext, enterpriseContext, re
   }
 
   if (analysis.complete) {
-    console.log(`[PostClick] GOAL COMPLETE (backend): currentStep="${analysis.raw?.currentStep}" instruction="${analysis.instruction}"`);
+    console.log(`[PostClick] GOAL COMPLETE (backend): currentStep=[${String(analysis.raw?.currentStep).length} chars] instruction=[${String(analysis.instruction).length} chars]`);
     await StateManager.complete(analysis.instruction || 'Task complete');
     if (taskId) TelemetryService.completeTask(taskId, 'completed', 'task-complete');
     return buildSuccessResponse(analysis, true);
   }
 
-  console.log(`[PostClick] NOT complete (backend): currentStep="${analysis.raw?.currentStep}" instruction="${(analysis.instruction || '').slice(0, 80)}" replan=${analysis.raw?.replan} urlChanged=${analysis.raw?.urlChanged} domChanged=${analysis.raw?.domChanged}`);
+  console.log(`[PostClick] NOT complete (backend): currentStep=[${String(analysis.raw?.currentStep).length} chars] instruction=[${String((analysis.instruction || '').slice(0, 80)).length} chars] replan=${analysis.raw?.replan} urlChanged=${analysis.raw?.urlChanged} domChanged=${analysis.raw?.domChanged}`);
   await StateManager.updateFromAnalysis(analysis, screenshot.timestamp, pageContext);
   console.log(`[PostClick] state UPDATED: completedSteps=[${StateManager.getState()?.completedSteps?.join(' → ') || 'none'}] currentInstruction="${StateManager.getState()?.currentInstruction?.slice(0, 60)}"`);
   log(`total cycle: ${Date.now() - t0}ms`);

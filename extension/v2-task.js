@@ -21,6 +21,7 @@ import { PrivacySanitizer }                       from './lib/privacy-sanitizer.
 import { SanitizingAdapter }                      from './providers/sanitizing-adapter.js';
 import { guardHighlighter }                       from './lib/sensitive-guard.js';
 import { redactText }                             from './lib/pii-detector.js';
+import { redactSecrets }                          from './lib/sensitive-policy.js';
 import { estimateCompactionSavings }              from './lib/compact-page-state.js';
 import { logEvent, logWarn, logError }            from './lib/sp-logger.js';
 import { deriveTaskProgress }                     from './lib/task-progress.js';
@@ -38,7 +39,8 @@ function applyEvent(event, meta = {}) {
     return false;
   }
   _state = to;
-  const detail = Object.entries(meta).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+  // meta can carry the user's goal text — never log it unredacted.
+  const detail = Object.entries(meta).map(([k, v]) => `${k}=${redactText(String(JSON.stringify(v)))}`).join(" ");
   console.log(`[SP:V2] [${ts()}] STATE ${from} → ${to}  event=${event}${detail ? "  " + detail : ""}`);
   return true;
 }
@@ -1351,14 +1353,12 @@ async function _runPlanLoopInternal(tabId, myGen) {
     const inTokens  = planResp.providerMetadata?.inputTokens ?? "?";
     const outTokens = planResp.providerMetadata?.outputTokens ?? "?";
     console.log(`[SP:V2:PERF] cycleMs=${cycleMs}ms screenshotMs=${screenshotMs}ms reqMs=${reqMs}ms model=${modelUsed} inTokens=${inTokens} outTokens=${outTokens}`);
-    console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${planResp.plannerSummary ?? ""}"`);
-    // Diagnostic: log full planner response step details
+    console.log(`[SP:V2] [${ts()}] result=${planResp.result} state=${planResp.state} steps=${planResp.plan?.steps?.length ?? 0}  plannerSummary="${redactText(planResp.plannerSummary ?? "")}"`);
+    // Planner step metadata (labels/descriptions omitted — they can embed user-entered values).
     if (planResp.plan?.steps?.length) {
       const s0 = planResp.plan.steps[0];
       console.log(`[SP:V2:DIAG] Planner step[0]:`, {
         intent:         s0.intent,
-        description:    s0.description,
-        targetText:     s0.targetElement?.text,
         completionCondition: s0.completionCondition,
         urlChanges:     s0.expectedPageState?.urlChanges,
         urlPattern:     s0.expectedPageState?.urlPattern,
@@ -2104,7 +2104,9 @@ async function _handleStop() {
   _state = TaskState.PAUSED;
   applyEvent(TaskEvent.CANCEL_CLICKED);
 }
-async function _startNewTask(goal) {
+async function _startNewTask(rawGoal) {
+  // A credential typed into the goal must never reach logs, storage or a model.
+  const goal = redactSecrets(rawGoal);
   if (!_tabId) {
     console.error("[SP:V2] Tab ID not resolved — cannot start task");
     return;

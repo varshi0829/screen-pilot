@@ -111,6 +111,30 @@ const ASSIGNMENT_RE = /\b(pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?
 // "my password is hunter2"
 const SPOKEN_PASSWORD_RE = /\b(password|passcode|passwd)\s+is\s+["']?([^\s"'&;,<>]{4,})/gid;
 
+// Passwords written in free text, e.g. a goal: "log in with password Hunter2-x",
+// "use password 'correct horse'". Deliberately narrow so ordinary talk about
+// passwords ("reset my password", "use password manager", "the password field")
+// is left alone:
+//   • a QUOTED value after "password" / "password is" / "password:" is always a credential;
+//   • a BARE value must follow an explicit cue (with/using/use/enter/type/input
+//     [the|my|your|a|this] password [is|of]) and either look like a credential
+//     (digit, symbol, or internal capital) or be a word outside a stoplist of
+//     common nouns/function words.
+const PASSWORD_WORD = '(?:password|passcode|passwd|pwd)';
+const QUOTED_PASSWORD_RE = new RegExp(`\\b${PASSWORD_WORD}\\b(?:\\s*[:=]\\s*|\\s+(?:is\\s+)?)(["'\u201C\u2018])([^"'\u201D\u2019\\n]{3,}?)["'\u201D\u2019]`, 'gid');
+const CUED_PASSWORD_RE = new RegExp(`\\b(?:with|using|use|enter|entering|type|typing|input)\\s+(?:(?:the|my|your|a|this)\\s+)?${PASSWORD_WORD}\\s+(?:(?:is|of)\\s+)?([^\\s"'\u201C\u201D\u2018\u2019<>]{3,})`, 'gid');
+const NOT_A_CREDENTIAL = new Set(('manager managers field fields input inputs box boxes reset page pages form forms button buttons link links ' +
+  'recovery strength hint hints visibility toggle requirements requirement policy policies change changes setting settings protected protection ' +
+  'authentication login logins sign screen prompt dialog text textbox label labels entry validation rules criteria generator vault only and then ' +
+  'for the into onto that this instead when from after before again also but not are was will can has have been being than with without ' +
+  'update confirm confirmation saved save show hide reveal check checkbox step steps flow option options method auth based less free ' +
+  'credentials credential error errors message messages dropdown menu tab section modal popup first second next previous please').split(' '));
+function looksLikeCredential(token) {
+  if (/[0-9]/.test(token) || /[^A-Za-z0-9]/.test(token.replace(/[.!?]+$/, '')) || /[a-z][A-Z]/.test(token)) return true;
+  const word = token.replace(/[.!?]+$/, '').toLowerCase();
+  return word.length >= 4 && !NOT_A_CREDENTIAL.has(word);
+}
+
 const CARD_RE  = /\b\d(?:[ -]?\d){12,18}\b/g;
 const SSN_RE   = /\b\d{3}-\d{2}-\d{4}\b/g;
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
@@ -180,8 +204,13 @@ export function findPII(text) {
   scan(PRIVATE_KEY_RE, T.SECRET);
   scan(JWT_RE, T.JWT);
   API_KEY_RES.forEach((re) => scan(re, T.API_KEY));
+  scanAssignments(QUOTED_PASSWORD_RE, () => T.PASSWORD); // before the bare forms so a quoted phrase is taken whole
   scanAssignments(ASSIGNMENT_RE, assignmentType);
   scanAssignments(SPOKEN_PASSWORD_RE, () => T.PASSWORD);
+  CUED_PASSWORD_RE.lastIndex = 0;
+  for (let m; (m = CUED_PASSWORD_RE.exec(text)) !== null;) {
+    if (looksLikeCredential(m[1])) add(T.PASSWORD, m.indices[1][0], m.indices[1][1]);
+  }
   scan(CARD_RE, T.CREDIT_CARD, isLuhnValid);
   scan(SSN_RE, T.SSN);
   scan(EMAIL_RE, T.EMAIL);

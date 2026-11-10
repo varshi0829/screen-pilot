@@ -36,7 +36,8 @@ const V3_BASE = 'c7e085f';
 //                  that does not exist yet) so the approved version is pinned
 //                  precisely and independently of when/how it is committed.
 //
-// executor-engine.js stays pinned to the original V3 base.
+// executor-engine.js carries the log-hygiene cleanup (no field values, element text
+// or labels in logs) and is pinned to that approved content.
 //
 // ui-grounding-service.js and page-state-service.js carry an INTENTIONALLY
 // NEWER baseline: the approved generic contextual-grounding extension (a
@@ -48,7 +49,7 @@ const V3_BASE = 'c7e085f';
 const V3_PINS = {
   'extension/services/ui-grounding-service.js': { blob: '96a11c07fbb9486f350134fd5687b28373285c53' },
   'extension/services/page-state-service.js':   { blob: '0030b6d4a1c03a23c50724fbbafb7c9c7c6499ff' },
-  'extension/services/executor-engine.js':      { commit: V3_BASE }
+  'extension/services/executor-engine.js':      { blob: '465fad740dae5c8c8bae20ff70ca88b42495fda6' }
 };
 
 const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();

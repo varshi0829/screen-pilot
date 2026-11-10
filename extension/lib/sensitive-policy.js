@@ -13,7 +13,7 @@
 //  • outbound 'redact'      — irreversibly replaced ([REDACTED]); never enters
 //    the vault, so it can never be restored or sent anywhere.
 
-import { SensitiveType as T } from './pii-detector.js';
+import { SensitiveType as T, findPII } from './pii-detector.js';
 
 export const Outbound = Object.freeze({
   PLACEHOLDER: 'placeholder',
@@ -68,3 +68,21 @@ export function fieldInstruction(type) {
 }
 
 export const POLICY_TYPES = Object.freeze(Object.keys(POLICY));
+
+/**
+ * Irreversibly redact only the values whose policy is REDACT (passwords, cards,
+ * tokens, keys, …), leaving email/phone for the reversible-placeholder flow.
+ * Used at the point user text first enters the extension, so a credential typed
+ * into a goal is never held in memory structures, persisted, logged or sent.
+ */
+export function redactSecrets(text, replacement = '[REDACTED]') {
+  if (typeof text !== 'string' || !text) return text;
+  let out = '';
+  let last = 0;
+  for (const span of findPII(text)) {
+    if (outboundHandling(span.type) !== Outbound.REDACT) continue;
+    out += text.slice(last, span.start) + replacement;
+    last = span.end;
+  }
+  return out + text.slice(last);
+}

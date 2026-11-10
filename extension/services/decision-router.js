@@ -43,6 +43,7 @@
 
 import { UIGroundingService }     from './ui-grounding-service.js';
 import { LocalQwenAdapter }       from '../providers/local-qwen-adapter.js';
+import { redactText }             from '../lib/pii-detector.js';
 import { LocalVisionAdapter }     from '../providers/local-vision-adapter.js';
 import { VercelBackendAdapter }   from '../providers/vercel-backend-adapter.js';
 
@@ -932,7 +933,7 @@ export class DecisionRouter {
       if (!signal?.text) continue;
       const ranked = UIGroundingService.rankElements(signal.text, unaddressed);
       if (ranked.length) {
-        console.log(`[SP:DecisionRouter] Structural continuation deferred — unsatisfied requirement "${signal.text}" matches unaddressed elementId=${ranked[0].element.id} (score=${ranked[0].score.toFixed(3)})`);
+        console.log(`[SP:DecisionRouter] Structural continuation deferred — unsatisfied requirement "${redactText(signal.text)}" matches unaddressed elementId=${ranked[0].element.id} (score=${ranked[0].score.toFixed(3)})`);
         return this._buildPlanFromElement(signal.text, ranked[0].element, ranked[0].score, 'ml_grounding');
       }
     }
